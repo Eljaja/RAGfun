@@ -1,0 +1,95 @@
+from __future__ import annotations
+
+import base64
+import logging
+from typing import Any
+
+import httpx
+
+logger = logging.getLogger("processor.clients")
+
+
+class StorageClient:
+    def __init__(self, *, base_url: str, timeout_s: float) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._timeout_s = timeout_s
+
+    async def get_metadata(self, *, doc_id: str) -> dict[str, Any] | None:
+        async with httpx.AsyncClient(timeout=self._timeout_s) as client:
+            r = await client.get(f"{self._base_url}/v1/documents/{doc_id}/metadata")
+            if r.status_code == 404:
+                return None
+            r.raise_for_status()
+            return r.json()
+
+    async def get_file(self, *, doc_id: str) -> tuple[bytes, str | None]:
+        async with httpx.AsyncClient(timeout=self._timeout_s) as client:
+            r = await client.get(f"{self._base_url}/v1/documents/{doc_id}")
+            r.raise_for_status()
+            ct = r.headers.get("content-type")
+            return (r.content, ct)
+
+
+class RetrievalClient:
+    def __init__(self, *, base_url: str, timeout_s: float) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._timeout_s = timeout_s
+
+    async def index_upsert(self, *, payload: dict[str, Any]) -> dict[str, Any]:
+        async with httpx.AsyncClient(timeout=self._timeout_s) as client:
+            r = await client.post(f"{self._base_url}/v1/index/upsert", json=payload)
+            r.raise_for_status()
+            return r.json()
+
+
+class VLMClient:
+    """
+    OpenAI-compatible chat completions client for multimodal extraction in vLLM.
+    """
+
+    def __init__(self, *, base_url: str, api_key: str | None, model: str, timeout_s: float) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._api_key = api_key
+        self._model = model
+        self._timeout_s = timeout_s
+
+    async def page_to_text(self, *, png_bytes: bytes) -> str:
+        data_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
+        headers = {}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+
+        payload = {
+            "model": self._model,
+            "temperature": 0.0,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Convert this document page to clean text. "
+                                "Preserve structure (headings, lists, tables) as Markdown. "
+                                "Do not invent content. Output ONLY the converted text."
+                            ),
+                        },
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                }
+            ],
+        }
+
+        async with httpx.AsyncClient(timeout=self._timeout_s) as client:
+            r = await client.post(f"{self._base_url}/chat/completions", json=payload, headers=headers)
+            r.raise_for_status()
+            j = r.json()
+        try:
+            return str(j["choices"][0]["message"]["content"] or "").strip()
+        except Exception:
+            logger.error("vlm_unexpected_response", extra={"extra": {"keys": list(j.keys())}})
+            raise RuntimeError("vlm_unexpected_response")
+
+
+
+

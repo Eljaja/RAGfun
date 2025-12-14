@@ -1,0 +1,15 @@
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic==2.10.4
+pydantic-settings==2.7.0
+httpx==0.28.1
+orjson==3.10.12
+python-json-logger==3.2.0
+prometheus-client==0.21.1
+
+# document handling
+lxml==5.3.0
+PyMuPDF==1.24.14
+
+
+

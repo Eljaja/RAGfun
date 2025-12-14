@@ -1,0 +1,552 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>RAG Chat</title>
+    <style>
+      :root {
+        --bg-primary: #0f172a;
+        --bg-secondary: #1e293b;
+        --bg-card: rgba(30, 41, 59, 0.8);
+        --border-color: rgba(148, 163, 184, 0.2);
+        --text-primary: #f1f5f9;
+        --text-secondary: #cbd5e1;
+        --text: #f1f5f9;
+        --accent: #3b82f6;
+        --accent-hover: #2563eb;
+        --success: #10b981;
+        --warning: #f59e0b;
+        --error: #ef4444;
+        --danger: #ef4444;
+        color-scheme: dark;
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        height: 100%;
+      }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        margin: 0;
+        background: var(--bg-primary);
+        color: var(--text-primary);
+        line-height: 1.6;
+      }
+      .app {
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+      }
+      .app-header {
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 14px 18px;
+        background: rgba(15, 23, 42, 0.92);
+        border-bottom: 1px solid var(--border-color);
+        backdrop-filter: blur(10px);
+      }
+      .brand {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+      .brand-title {
+        font-size: 16px;
+        font-weight: 700;
+        line-height: 1.2;
+      }
+      .brand-subtitle {
+        font-size: 12px;
+        color: var(--text-secondary);
+        opacity: 0.9;
+        line-height: 1.2;
+      }
+      .app-main {
+        flex: 1;
+        min-height: 0;
+        padding: 18px;
+      }
+      .card {
+        background: var(--bg-card);
+        border: 1px solid var(--border-color);
+        border-radius: 16px;
+        padding: 24px;
+        backdrop-filter: blur(10px);
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+      }
+      h1 {
+        font-size: 24px;
+        font-weight: 700;
+        margin: 0 0 8px;
+        color: var(--text-primary);
+      }
+      h2 {
+        font-size: 18px;
+        font-weight: 600;
+        margin: 0 0 16px;
+        color: var(--text-primary);
+      }
+      .subtitle {
+        font-size: 13px;
+        color: var(--text-secondary);
+        margin-bottom: 20px;
+        opacity: 0.8;
+      }
+      label {
+        display: block;
+        font-size: 13px;
+        font-weight: 500;
+        color: var(--text-secondary);
+        margin: 16px 0 8px;
+      }
+      input[type="text"],
+      input[type="file"],
+      textarea,
+      select {
+        width: 100%;
+        padding: 12px;
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        background: rgba(15, 23, 42, 0.6);
+        color: var(--text-primary);
+        font-size: 14px;
+        font-family: inherit;
+        transition: border-color 0.2s, background 0.2s;
+      }
+      input:focus,
+      textarea:focus,
+      select:focus {
+        outline: none;
+        border-color: var(--accent);
+        background: rgba(15, 23, 42, 0.8);
+      }
+      textarea {
+        min-height: 120px;
+        resize: vertical;
+      }
+      .grid-2 {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+      }
+      @media (max-width: 640px) {
+        .grid-2 { grid-template-columns: 1fr; }
+      }
+      button {
+        padding: 12px 24px;
+        border: none;
+        border-radius: 8px;
+        background: var(--accent);
+        color: white;
+        font-weight: 600;
+        font-size: 14px;
+        cursor: pointer;
+        transition: background 0.2s, transform 0.1s;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+      }
+      button:hover:not(:disabled) {
+        background: var(--accent-hover);
+        transform: translateY(-1px);
+      }
+      button:active:not(:disabled) {
+        transform: translateY(0);
+      }
+      button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+      .btn-secondary {
+        background: var(--bg-secondary);
+        border: 1px solid var(--border-color);
+      }
+      .btn-secondary:hover:not(:disabled) {
+        background: rgba(30, 41, 59, 0.9);
+      }
+      .status {
+        font-size: 13px;
+        color: var(--text-secondary);
+        margin-left: 12px;
+      }
+      .status.success { color: var(--success); }
+      .status.error { color: var(--error); }
+      .status.warning { color: var(--warning); }
+      pre {
+        white-space: pre-wrap;
+        word-break: break-word;
+        background: rgba(15, 23, 42, 0.6);
+        padding: 16px;
+        border-radius: 8px;
+        border: 1px solid var(--border-color);
+        font-size: 13px;
+        line-height: 1.5;
+        max-height: 400px;
+        overflow-y: auto;
+        margin: 0;
+      }
+      .doc-list {
+        max-height: 600px;
+        overflow-y: auto;
+      }
+      .doc-item {
+        padding: 16px;
+        background: rgba(15, 23, 59, 0.4);
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        margin-bottom: 12px;
+        transition: background 0.2s, border-color 0.2s;
+      }
+      .doc-item:hover {
+        background: rgba(15, 23, 59, 0.6);
+        border-color: var(--accent);
+      }
+      .doc-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        margin-bottom: 8px;
+      }
+      .doc-title {
+        font-weight: 600;
+        font-size: 15px;
+        color: var(--text-primary);
+        margin: 0;
+      }
+      .doc-id {
+        font-size: 12px;
+        color: var(--text-secondary);
+        font-family: monospace;
+        margin: 4px 0;
+      }
+      .doc-meta {
+        font-size: 12px;
+        color: var(--text-secondary);
+        margin: 8px 0;
+      }
+      .badge {
+        display: inline-block;
+        padding: 4px 10px;
+        border-radius: 12px;
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+      .badge.stored {
+        background: rgba(16, 185, 129, 0.2);
+        color: var(--success);
+        border: 1px solid rgba(16, 185, 129, 0.3);
+      }
+      .badge.indexed {
+        background: rgba(59, 130, 246, 0.2);
+        color: var(--accent);
+        border: 1px solid rgba(59, 130, 246, 0.3);
+      }
+      .badge.not-indexed {
+        background: rgba(148, 163, 184, 0.2);
+        color: var(--text-secondary);
+        border: 1px solid var(--border-color);
+      }
+      .btn {
+        border: 1px solid rgba(255,255,255,0.14);
+        background: rgba(255,255,255,0.06);
+        color: var(--text);
+        padding: 8px 12px;
+        border-radius: 10px;
+        cursor: pointer;
+      }
+      .btn:hover { background: rgba(255,255,255,0.10); }
+      .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+      .btn-danger {
+        border-color: rgba(255, 107, 107, 0.35);
+        background: rgba(255, 107, 107, 0.12);
+        color: var(--danger);
+      }
+      .btn-danger:hover { background: rgba(255, 107, 107, 0.18); }
+      .badges {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .tabs {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+      .tab {
+        padding: 8px 12px;
+        background: rgba(255,255,255,0.06);
+        border: 1px solid rgba(255,255,255,0.12);
+        color: var(--text-secondary);
+        cursor: pointer;
+        font-weight: 500;
+        border-radius: 10px;
+      }
+      .tab.active {
+        color: var(--text-primary);
+        border-color: rgba(59, 130, 246, 0.55);
+        background: rgba(59, 130, 246, 0.14);
+      }
+      .tab-content {
+        display: none;
+        height: 100%;
+      }
+      .tab-content.active {
+        display: block;
+      }
+      .source-item {
+        padding: 12px;
+        background: rgba(15, 23, 42, 0.4);
+        border-left: 3px solid var(--accent);
+        border-radius: 4px;
+        margin-bottom: 8px;
+      }
+      .source-title {
+        font-weight: 600;
+        margin-bottom: 4px;
+      }
+      .source-uri {
+        font-size: 12px;
+        color: var(--text-secondary);
+        word-break: break-all;
+      }
+      .loading {
+        display: inline-block;
+        width: 16px;
+        height: 16px;
+        border: 2px solid var(--border-color);
+        border-top-color: var(--accent);
+        border-radius: 50%;
+        animation: spin 0.6s linear infinite;
+      }
+      @keyframes spin {
+        to { transform: rotate(360deg); }
+      }
+      .answer-streaming {
+        border-left: 3px solid var(--accent);
+        padding-left: 12px;
+      }
+
+      .hint {
+        font-size: 12px;
+        color: var(--text-secondary);
+        margin-top: 8px;
+        opacity: 0.85;
+      }
+
+      /* Chat app layout */
+      .chat-shell {
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .messages {
+        flex: 1;
+        min-height: 0;
+        overflow-y: auto;
+        padding: 10px 4px 14px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      .msg {
+        display: flex;
+        gap: 10px;
+      }
+      .msg.user { justify-content: flex-end; }
+      .msg.assistant { justify-content: flex-start; }
+      .bubble {
+        max-width: min(880px, 92vw);
+        border: 1px solid var(--border-color);
+        background: rgba(15, 23, 42, 0.55);
+        border-radius: 14px;
+        padding: 12px 14px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      .bubble-text {
+        white-space: pre-wrap;
+        word-break: break-word;
+        line-height: 1.55;
+      }
+      .msg.user .bubble {
+        background: rgba(59, 130, 246, 0.18);
+        border-color: rgba(59, 130, 246, 0.35);
+      }
+      .bubble-meta {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      details {
+        border: 1px solid var(--border-color);
+        border-radius: 12px;
+        padding: 10px 12px;
+        background: rgba(15, 23, 42, 0.35);
+      }
+      details > summary {
+        cursor: pointer;
+        color: var(--text-secondary);
+        font-weight: 600;
+      }
+      .composer {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 10px;
+        align-items: end;
+        padding-top: 10px;
+        border-top: 1px solid var(--border-color);
+      }
+      .composer textarea {
+        min-height: 44px;
+        max-height: 180px;
+        resize: none;
+      }
+      .composer-actions {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        align-items: flex-end;
+      }
+      .composer-status {
+        font-size: 12px;
+        color: var(--text-secondary);
+        min-height: 16px;
+      }
+
+      /* Files tab layout */
+      .files-grid {
+        max-width: 1400px;
+        margin: 0 auto;
+        display: grid;
+        grid-template-columns: 480px 1fr;
+        gap: 18px;
+        align-items: start;
+      }
+      @media (max-width: 1100px) {
+        .files-grid { grid-template-columns: 1fr; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <header class="app-header">
+        <div class="brand">
+          <div class="brand-title">RAG Chat</div>
+          <div class="brand-subtitle">чат поверх загруженных документов</div>
+        </div>
+        <nav class="tabs" aria-label="Навигация">
+          <button class="tab active" id="tab_btn_chat" data-tab="chat" type="button">Чат</button>
+          <button class="tab" id="tab_btn_files" data-tab="files" type="button">Файлы</button>
+        </nav>
+      </header>
+
+      <main class="app-main">
+        <!-- Chat tab (full screen) -->
+        <section class="tab-content active" id="tab_chat" data-tab="chat">
+          <div class="card" style="height: calc(100vh - 36px - 58px);">
+            <div class="chat-shell">
+              <div id="messages" class="messages" aria-label="Сообщения"></div>
+
+              <div class="composer" aria-label="Ввод сообщения">
+                <div>
+                  <label for="q" style="margin-top: 0;">Сообщение</label>
+                  <textarea id="q" placeholder="Напишите сообщение… (Enter — отправить, Shift+Enter — новая строка)"></textarea>
+                  <div class="hint">Подсказка: Ctrl/⌘+Enter — тоже отправляет</div>
+                </div>
+                <div class="composer-actions">
+                  <button id="ask_stream" type="button">
+                    <span id="ask_stream_spinner" class="loading" style="display:none;"></span>
+                    <span id="ask_stream_label">Отправить</span>
+                  </button>
+                  <div id="status" class="composer-status"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Files tab -->
+        <section class="tab-content" id="tab_files" data-tab="files">
+          <div class="files-grid">
+            <!-- Upload Document -->
+            <div class="card">
+              <h1>Загрузка документа</h1>
+              <div class="subtitle">Загрузите документ в хранилище и проиндексируйте его</div>
+
+              <label for="file">Файл</label>
+              <input id="file" type="file" accept=".txt,.md,.pdf,.docx" />
+
+              <div class="grid-2">
+                <div>
+                  <label for="doc_id">doc_id</label>
+                  <input id="doc_id" type="text" placeholder="например: kb:doc-001" />
+                  <div style="margin-top: 6px; font-size: 12px; color: var(--text-secondary);">
+                    Примечание: <b>doc_id уникален</b>. Если загрузить снова с тем же doc_id — запись в списке будет обновлена (это не баг).
+                  </div>
+                </div>
+                <div>
+                  <label for="title">title (опционально)</label>
+                  <input id="title" type="text" placeholder="заголовок" />
+                </div>
+              </div>
+
+              <div class="grid-2">
+                <div>
+                  <label for="source">source (опционально)</label>
+                  <input id="source" type="text" placeholder="например: wiki" />
+                </div>
+                <div>
+                  <label for="uri">uri (опционально)</label>
+                  <input id="uri" type="text" placeholder="https://..." />
+                </div>
+              </div>
+
+              <div class="grid-2">
+                <div>
+                  <label for="tags">tags (через запятую)</label>
+                  <input id="tags" type="text" placeholder="rag, llm, policies" />
+                </div>
+                <div>
+                  <label for="lang">lang (опционально)</label>
+                  <input id="lang" type="text" placeholder="ru/en" />
+                </div>
+              </div>
+
+              <div style="margin-top: 20px;">
+                <button id="upload" type="button">Загрузить</button>
+                <span class="status" id="upload_status"></span>
+              </div>
+            </div>
+
+            <!-- Documents List -->
+            <div class="card">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; gap: 12px;">
+                <h2 style="margin: 0;">Загруженные документы</h2>
+                <div style="display:flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: flex-end;">
+                  <span id="docs_meta" style="color: var(--text-secondary); font-size: 12px;"></span>
+                  <button id="load_more_docs" class="btn-secondary" type="button">Загрузить ещё</button>
+                  <button id="refresh_docs" class="btn-secondary" type="button">Обновить</button>
+                </div>
+              </div>
+              <div id="doc_list" class="doc-list">
+                <div style="color: var(--text-secondary); text-align: center; padding: 40px;">
+                  Загрузка...
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+    <script src="main.js?v=20251213-1"></script>
+  </body>
+</html>

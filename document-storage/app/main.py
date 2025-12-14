@@ -1,0 +1,363 @@
+from __future__ import annotations
+
+import json
+import logging
+import time
+from contextlib import asynccontextmanager
+from datetime import datetime
+
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi.responses import StreamingResponse
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+
+from app.config import Settings, load_settings
+from app.database import DatabaseClient
+from app.metrics import ERRS, LAT, REQS
+from app.models import DocumentMetadata, DocumentSearchRequest, DocumentSearchResponse, StoreDocumentResponse
+from app.observability import TraceContextFilter, setup_json_logging
+from app.storage import StorageBackend, create_storage_backend
+
+logger = logging.getLogger("storage")
+
+
+class AppState:
+    settings: Settings
+    config_error: str | None = None
+    db: DatabaseClient | None = None
+    storage: StorageBackend | None = None
+
+
+state = AppState()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # config + logging
+    try:
+        state.settings = load_settings()
+    except Exception as e:
+        state.config_error = str(e)
+        setup_json_logging("INFO")
+        logging.getLogger().addFilter(TraceContextFilter())
+        logger.error("config_error", extra={"error": state.config_error})
+        yield
+        return
+
+    setup_json_logging(state.settings.log_level)
+    logging.getLogger().addFilter(TraceContextFilter())
+
+    # Initialize database
+    try:
+        state.db = DatabaseClient(state.settings.db_url)
+        state.db.ensure_schema()
+        logger.info("database_initialized")
+    except Exception as e:
+        logger.error("database_init_error", extra={"error": str(e)})
+        state.db = None
+
+    # Initialize storage backend
+    try:
+        state.storage = create_storage_backend(state.settings)
+        logger.info("storage_backend_initialized", extra={"backend": state.settings.storage_backend})
+    except Exception as e:
+        logger.error("storage_init_error", extra={"error": str(e)})
+        state.storage = None
+
+    yield
+
+    # Cleanup
+    if state.db:
+        state.db.close()
+
+
+app = FastAPI(title="Document Storage", version="0.1.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def access_log(request: Request, call_next):
+    start = time.time()
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        dur_ms = (time.time() - start) * 1000.0
+        logger.info(
+            "http_request",
+            extra={
+                "method": request.method,
+                "path": request.url.path,
+                "query": request.url.query,
+                "duration_ms": dur_ms,
+            },
+        )
+
+
+@app.get("/v1/healthz")
+async def healthz():
+    return {"ok": True}
+
+
+@app.get("/v1/readyz")
+async def readyz(response: Response):
+    if state.config_error:
+        response.status_code = 503
+        return {"ready": False, "config_error": state.config_error}
+
+    db_ok = state.db is not None and state.db.health() if state.db else False
+    storage_ok = state.storage is not None and state.storage.health() if state.storage else False
+    ready = db_ok and storage_ok
+
+    if not ready:
+        response.status_code = 503
+    return {"ready": ready, "db": db_ok, "storage": storage_ok}
+
+
+@app.get("/v1/version")
+async def version():
+    if getattr(state, "settings", None) is None:
+        return {"service": {"name": "document-storage"}, "config_error": state.config_error}
+    return {"service": {"name": state.settings.service_name}, "config": state.settings.safe_summary()}
+
+
+@app.get("/v1/metrics")
+async def metrics():
+    data = generate_latest()
+    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
+
+
+@app.post("/v1/documents/store", response_model=StoreDocumentResponse)
+async def store_document(
+    file: UploadFile = File(...),
+    doc_id: str = Form(...),
+    title: str | None = Form(None),
+    uri: str | None = Form(None),
+    source: str | None = Form(None),
+    lang: str | None = Form(None),
+    tags: str | None = Form(None),  # comma-separated
+    tenant_id: str | None = Form(None),
+    project_id: str | None = Form(None),
+    acl: str | None = Form(None),  # comma-separated
+    metadata: str | None = Form(None),  # JSON string for extra fields
+):
+    """Store document file and metadata."""
+    if state.config_error:
+        REQS.labels(endpoint="/v1/documents/store", status="503").inc()
+        return StoreDocumentResponse(ok=False, doc_id=doc_id, error="config_error")
+
+    if not state.db or not state.storage:
+        REQS.labels(endpoint="/v1/documents/store", status="503").inc()
+        return StoreDocumentResponse(ok=False, doc_id=doc_id, error="service_unavailable")
+
+    try:
+        with LAT.labels(stage="read_file").time():
+            content = await file.read()
+
+        # Validate file size
+        max_size_bytes = state.settings.max_file_size_mb * 1024 * 1024
+        if len(content) > max_size_bytes:
+            REQS.labels(endpoint="/v1/documents/store", status="413").inc()
+            ERRS.labels(stage="store", kind="file_too_large").inc()
+            return StoreDocumentResponse(
+                ok=False, doc_id=doc_id, error=f"File size exceeds {state.settings.max_file_size_mb}MB"
+            )
+
+        # Validate content type
+        content_type = file.content_type or "application/octet-stream"
+        if content_type not in state.settings.allowed_content_types_list:
+            logger.warning("content_type_not_allowed", extra={"content_type": content_type, "doc_id": doc_id})
+
+        # Parse metadata
+        metadata_dict: dict = {}
+        if metadata:
+            try:
+                metadata_dict = json.loads(metadata)
+            except json.JSONDecodeError:
+                logger.warning("invalid_metadata_json", extra={"doc_id": doc_id})
+
+        # Build full metadata
+        full_metadata = {
+            "title": title,
+            "uri": uri,
+            "source": source,
+            "lang": lang,
+            "tags": [t.strip() for t in tags.split(",")] if tags else [],
+            "tenant_id": tenant_id,
+            "project_id": project_id,
+            "acl": [a.strip() for a in acl.split(",")] if acl else [],
+            **metadata_dict,
+        }
+
+        # Store file
+        with LAT.labels(stage="store_file").time():
+            storage_id = state.storage.store(doc_id, content, content_type)
+
+        # Store metadata
+        with LAT.labels(stage="store_metadata").time():
+            doc_meta = state.db.store_metadata(
+                doc_id=doc_id,
+                storage_id=storage_id,
+                metadata=full_metadata,
+                content_type=content_type,
+                size=len(content),
+            )
+
+        REQS.labels(endpoint="/v1/documents/store", status="200").inc()
+        return StoreDocumentResponse(
+            ok=True,
+            storage_id=storage_id,
+            doc_id=doc_id,
+            size=len(content),
+            content_type=content_type,
+            stored_at=doc_meta.stored_at or datetime.utcnow(),
+        )
+
+    except Exception as e:
+        logger.error("store_document_error", extra={"doc_id": doc_id, "error": str(e)})
+        REQS.labels(endpoint="/v1/documents/store", status="500").inc()
+        ERRS.labels(stage="store", kind="exception").inc()
+        return StoreDocumentResponse(ok=False, doc_id=doc_id, error=str(e))
+
+
+@app.get("/v1/documents/{doc_id}")
+async def get_document(doc_id: str):
+    """Retrieve document file by doc_id."""
+    if state.config_error:
+        REQS.labels(endpoint="/v1/documents/{doc_id}", status="503").inc()
+        raise HTTPException(status_code=503, detail="config_error")
+
+    if not state.db or not state.storage:
+        REQS.labels(endpoint="/v1/documents/{doc_id}", status="503").inc()
+        raise HTTPException(status_code=503, detail="service_unavailable")
+
+    try:
+        # Get metadata
+        meta = state.db.get_metadata(doc_id)
+        if not meta:
+            REQS.labels(endpoint="/v1/documents/{doc_id}", status="404").inc()
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        # Get file
+        if not meta.storage_id:
+            REQS.labels(endpoint="/v1/documents/{doc_id}", status="404").inc()
+            raise HTTPException(status_code=404, detail="Storage ID not found")
+
+        content = state.storage.retrieve(meta.storage_id)
+        if not content:
+            REQS.labels(endpoint="/v1/documents/{doc_id}", status="404").inc()
+            raise HTTPException(status_code=404, detail="File not found in storage")
+
+        # Return file with proper headers
+        headers = {}
+        if meta.content_type:
+            headers["Content-Type"] = meta.content_type
+        if meta.title:
+            filename = meta.title
+        else:
+            filename = doc_id
+
+        REQS.labels(endpoint="/v1/documents/{doc_id}", status="200").inc()
+        return Response(
+            content=content,
+            headers=headers,
+            media_type=meta.content_type or "application/octet-stream",
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("get_document_error", extra={"doc_id": doc_id, "error": str(e)})
+        REQS.labels(endpoint="/v1/documents/{doc_id}", status="500").inc()
+        ERRS.labels(stage="get", kind="exception").inc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/v1/documents/{doc_id}")
+async def delete_document(doc_id: str):
+    """Delete document and its metadata."""
+    if state.config_error:
+        REQS.labels(endpoint="/v1/documents/{doc_id}", status="503").inc()
+        raise HTTPException(status_code=503, detail="config_error")
+
+    if not state.db or not state.storage:
+        REQS.labels(endpoint="/v1/documents/{doc_id}", status="503").inc()
+        raise HTTPException(status_code=503, detail="service_unavailable")
+
+    try:
+        # Get metadata to find storage_id
+        meta = state.db.get_metadata(doc_id)
+        if not meta:
+            REQS.labels(endpoint="/v1/documents/{doc_id}", status="404").inc()
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        # Delete file (best effort)
+        if meta.storage_id:
+            state.storage.delete(meta.storage_id)
+
+        # Delete metadata
+        deleted = state.db.delete_metadata(doc_id)
+
+        REQS.labels(endpoint="/v1/documents/{doc_id}", status="200").inc()
+        return {"ok": True, "deleted": deleted}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("delete_document_error", extra={"doc_id": doc_id, "error": str(e)})
+        REQS.labels(endpoint="/v1/documents/{doc_id}", status="500").inc()
+        ERRS.labels(stage="delete", kind="exception").inc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/documents/{doc_id}/metadata", response_model=DocumentMetadata)
+async def get_metadata(doc_id: str):
+    """Get document metadata only."""
+    if state.config_error:
+        REQS.labels(endpoint="/v1/documents/{doc_id}/metadata", status="503").inc()
+        raise HTTPException(status_code=503, detail="config_error")
+
+    if not state.db:
+        REQS.labels(endpoint="/v1/documents/{doc_id}/metadata", status="503").inc()
+        raise HTTPException(status_code=503, detail="service_unavailable")
+
+    try:
+        meta = state.db.get_metadata(doc_id)
+        if not meta:
+            REQS.labels(endpoint="/v1/documents/{doc_id}/metadata", status="404").inc()
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        REQS.labels(endpoint="/v1/documents/{doc_id}/metadata", status="200").inc()
+        return meta
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("get_metadata_error", extra={"doc_id": doc_id, "error": str(e)})
+        REQS.labels(endpoint="/v1/documents/{doc_id}/metadata", status="500").inc()
+        ERRS.labels(stage="get_metadata", kind="exception").inc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/documents/search", response_model=DocumentSearchResponse)
+async def search_documents(req: DocumentSearchRequest):
+    """Search documents by metadata filters."""
+    if state.config_error:
+        REQS.labels(endpoint="/v1/documents/search", status="503").inc()
+        return DocumentSearchResponse(ok=False, error="config_error")
+
+    if not state.db:
+        REQS.labels(endpoint="/v1/documents/search", status="503").inc()
+        return DocumentSearchResponse(ok=False, error="service_unavailable")
+
+    try:
+        with LAT.labels(stage="search").time():
+            docs, total = state.db.search_metadata(req)
+
+        REQS.labels(endpoint="/v1/documents/search", status="200").inc()
+        return DocumentSearchResponse(ok=True, documents=docs, total=total)
+
+    except Exception as e:
+        logger.error("search_documents_error", extra={"error": str(e)})
+        REQS.labels(endpoint="/v1/documents/search", status="500").inc()
+        ERRS.labels(stage="search", kind="exception").inc()
+        return DocumentSearchResponse(ok=False, error=str(e))
+
