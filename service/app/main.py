@@ -187,16 +187,35 @@ async def index_upsert(payload: IndexUpsertRequest):
         REQS.labels(endpoint="/v1/index/upsert", status="503").inc()
         return {"ok": False, "error": "config_error", "detail": state.config_error}
     assert state.embedder is not None
-    r = await upsert_logic(
-        req=payload,
-        os_client=state.os,
-        qdrant=state.qdrant,
-        embedder=state.embedder,
-        max_tokens=state.settings.chunk_max_tokens,
-        overlap_tokens=state.settings.chunk_overlap_tokens,
-    )
-    REQS.labels(endpoint="/v1/index/upsert", status="200" if r.ok else "207").inc()
-    return r
+    
+    # Add timeout wrapper for large documents (15 minutes max)
+    try:
+        r = await asyncio.wait_for(
+            upsert_logic(
+                req=payload,
+                os_client=state.os,
+                qdrant=state.qdrant,
+                embedder=state.embedder,
+                max_tokens=state.settings.chunk_max_tokens,
+                overlap_tokens=state.settings.chunk_overlap_tokens,
+            ),
+            timeout=900.0  # 15 minutes for very large documents
+        )
+        REQS.labels(endpoint="/v1/index/upsert", status="200" if r.ok else "207").inc()
+        return r
+    except asyncio.TimeoutError:
+        doc_id = payload.document.doc_id if payload.document else "unknown"
+        text_size = len(payload.text) if payload.text else 0
+        logging.error(
+            "index_upsert_timeout",
+            extra={"extra": {"doc_id": doc_id, "text_size_chars": text_size, "text_size_mb": text_size / (1024 * 1024)}}
+        )
+        REQS.labels(endpoint="/v1/index/upsert", status="504").inc()
+        return {
+            "ok": False,
+            "partial": True,
+            "errors": [{"error": "timeout", "detail": f"Indexing timeout for doc_id={doc_id} (text_size={text_size} chars)"}]
+        }
 
 
 @app.post("/v1/index/delete")

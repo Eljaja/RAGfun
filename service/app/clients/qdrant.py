@@ -25,7 +25,7 @@ class QdrantFacade:
         self.collection = collection
         self.vector_size = vector_size
         self.distance = distance
-        self.client = QdrantClient(url=url, api_key=api_key, timeout=10.0)
+        self.client = QdrantClient(url=url, api_key=api_key, timeout=120.0)  # Increased timeout for large operations
 
     def health(self) -> bool:
         # qdrant-client API differs between versions; simplest liveness probe is listing collections.

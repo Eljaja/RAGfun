@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import AnyHttpUrl, Field, SecretStr
+from pydantic import AnyHttpUrl, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -40,6 +40,16 @@ class Settings(BaseSettings):
 
     # HTTP / UI
     cors_allow_origins: str = "*"  # for dev, can be narrowed
+
+    @field_validator("storage_url", "doc_processor_url", "llm_base_url", mode="before")
+    @classmethod
+    def _empty_string_to_none(cls, v):
+        # Common in docker-compose env: VAR= (empty) should behave like unset.
+        if v is None:
+            return None
+        if isinstance(v, str) and v.strip() == "":
+            return None
+        return v
 
     def safe_summary(self) -> dict:
         return {

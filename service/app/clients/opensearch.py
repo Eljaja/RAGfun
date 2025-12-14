@@ -16,7 +16,7 @@ def _build_os_client(url: str, username: str | None, password: str | None) -> Op
         use_ssl=url.startswith("https://"),
         verify_certs=False,
         ssl_show_warn=False,
-        timeout=10,
+        timeout=120,  # Increased timeout for large bulk operations
     )
 
 
