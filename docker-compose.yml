@@ -1,0 +1,251 @@
+services:
+  opensearch:
+    image: opensearchproject/opensearch:latest
+    container_name: opensearch
+    environment:
+      - discovery.type=single-node
+      - plugins.security.disabled=true
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_INITIAL_ADMIN_PASSWORD:-StrongPassword123!}
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    networks:
+      - rag-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:latest
+    container_name: opensearch-dashboards
+    ports:
+      - "5601:5601"
+    environment:
+      - 'OPENSEARCH_HOSTS=["http://opensearch:9200"]'
+      - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    networks:
+      - rag-network
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    networks:
+      - rag-network
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "bash",
+          "-lc",
+          "exec 3<>/dev/tcp/localhost/6333; printf 'GET /healthz HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3; head -n 1 <&3 | grep -q '200'"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_DB=document_storage
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - rag-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Stateless Hybrid Retrieval microservice (scale this one for multiple replicas)
+  retrieval:
+    build:
+      context: ./service
+    ports:
+      - "8080:8080"
+    environment:
+      - RAG_OS_URL=http://opensearch:9200
+      - RAG_QDRANT_URL=http://qdrant:6333
+      # Use a separate collection because the host Infinity embedding model is 512-dim
+      # (existing 'rag_chunks' may already be created with a different vector size).
+      - RAG_QDRANT_COLLECTION=rag_chunks_512
+      # Embeddings (use already running Infinity on the host:7997)
+      - RAG_EMBEDDING_PROVIDER=http
+      - RAG_EMBEDDING_URL=http://host.docker.internal:7997/embeddings
+      - RAG_EMBEDDING_MODEL=sentence-transformers/distiluse-base-multilingual-cased
+      - RAG_VECTOR_SIZE=512
+      # Rerank (Infinity rerank service started by this compose)
+      - RAG_RERANK_MODE=auto
+      - RAG_RERANK_URL=http://infinity-rerank:7998/rerank
+      - RAG_RERANK_MODEL=BAAI/bge-reranker-v2-m3
+      - RAG_LOG_LEVEL=INFO
+      # - RAG_ENABLE_PAGE_DEDUPLICATION=true
+      # - RAG_ENABLE_PARENT_PAGE_RETRIEVAL=true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      opensearch:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      infinity-rerank:
+        condition: service_started
+    networks:
+      - rag-network
+
+  # Document Storage Service
+  document-storage:
+    build:
+      context: ./document-storage
+    ports:
+      - "8081:8081"
+    environment:
+      - STORAGE_STORAGE_BACKEND=local
+      - STORAGE_STORAGE_PATH=/data/documents
+      - STORAGE_DB_URL=postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/document_storage
+      - STORAGE_MAX_FILE_SIZE_MB=100
+      - STORAGE_LOG_LEVEL=INFO
+    volumes:
+      - document-storage-data:/data/documents
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - rag-network
+
+  # vLLM (OpenAI-compatible) hosting Granite-Docling VLM for document-to-text extraction.
+  # NOTE: requires NVIDIA GPU + drivers on the host.
+  vllm-docling:
+    image: vllm/vllm-openai:latest
+    container_name: vllm-docling
+    command: ["--model", "ibm-granite/granite-docling-258M", "--port", "8123"]
+    ports:
+      - "8123:8123"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      - HF_HOME=/root/.cache/huggingface
+    networks:
+      - rag-network
+    #If your Docker supports it, uncomment GPU settings below:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+
+  # Document Processor Service (pulls files from document-storage, uses Granite-Docling via vLLM, indexes into retrieval)
+  doc-processor:
+    build:
+      context: ./doc-processor
+    ports:
+      - "8082:8082"
+    environment:
+      - PROCESSOR_STORAGE_URL=http://document-storage:8081
+      - PROCESSOR_RETRIEVAL_URL=http://retrieval:8080
+      - PROCESSOR_VLM_BASE_URL=http://vllm-docling:8123/v1
+      - PROCESSOR_VLM_MODEL=ibm-granite/granite-docling-258M
+      - PROCESSOR_LOG_LEVEL=INFO
+      - PROCESSOR_MAX_PAGES=25
+    depends_on:
+      document-storage:
+        condition: service_started
+      retrieval:
+        condition: service_started
+      vllm-docling:
+        condition: service_started
+    networks:
+      - rag-network
+
+  # RAG LLM gate (calls retrieval + LLM)
+  rag-gate:
+    build:
+      context: ./gate
+    ports:
+      - "8090:8090"
+    environment:
+      # Use host-published retrieval port to avoid docker-network response issues
+      - GATE_RETRIEVAL_URL=http://host.docker.internal:8080
+      - GATE_RETRIEVAL_TIMEOUT_S=60
+      - GATE_RETRIEVAL_MODE=hybrid
+      - GATE_TOP_K=8
+      - GATE_MAX_CONTEXT_CHARS=18000
+      # Document Storage
+      - GATE_STORAGE_URL=http://document-storage:8081
+      - GATE_STORAGE_TIMEOUT_S=60
+      # Document Processor
+      - GATE_DOC_PROCESSOR_URL=http://doc-processor:8082
+      - GATE_DOC_PROCESSOR_TIMEOUT_S=300
+      # LLM (OpenAI-compatible). Keep mock as default to avoid requiring a key by default.
+      - GATE_LLM_PROVIDER=${GATE_LLM_PROVIDER:-openai_compat}
+      - GATE_LLM_BASE_URL=${GATE_LLM_BASE_URL:-https://inference.asicloud.cudos.org/v1}
+      - GATE_LLM_MODEL=${GATE_LLM_MODEL:-meta-llama/llama-3.3-70b-instruct}
+      - GATE_LLM_API_KEY=${GATE_LLM_API_KEY:-}
+      - GATE_LOG_LEVEL=INFO
+    depends_on:
+      retrieval:
+        condition: service_started
+      document-storage:
+        condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - rag-network
+
+  # Simple frontend (nginx static + proxy /api to rag-gate)
+  ui:
+    build:
+      context: ./ui
+    ports:
+      - "3300:80"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      rag-gate:
+        condition: service_started
+    networks:
+      - rag-network
+
+  # Rerank service (Infinity). Kept in the same docker network for stable DNS (infinity-rerank).
+  infinity-rerank:
+    image: michaelf34/infinity:latest
+    container_name: infinity-rerank
+    command: ["v2", "--model-id", "BAAI/bge-reranker-v2-m3", "--port", "7998"]
+    networks:
+      - rag-network
+
+volumes:
+  opensearch-data:
+    driver: local
+  qdrant-data:
+    driver: local
+  postgres-data:
+    driver: local
+  document-storage-data:
+    driver: local
+
+networks:
+  rag-network:
+    driver: bridge
+
