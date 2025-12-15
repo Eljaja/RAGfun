@@ -13,6 +13,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_
 
 from app.clients import DocProcessorClient, DocumentStorageClient, LLMClient, RetrievalClient
 from app.config import Settings, load_settings
+from app.html_text import html_to_text
 from app.logging_setup import setup_json_logging
 from app.models import ChatRequest, ChatResponse, ContextChunk, Source
 from app.rag import build_context_blocks, build_messages
@@ -305,7 +306,14 @@ async def upload_document(
                 r = await state.doc_processor.process(payload={"document": doc_meta, "refresh": bool(refresh)})
         else:
             # Legacy path: decode bytes as UTF-8 and index as one document text.
-            text = raw.decode("utf-8", errors="replace").strip()
+            decoded = raw.decode("utf-8", errors="replace")
+            ct = (file.content_type or "").split(";")[0].strip().lower()
+            name = (file.filename or "").lower()
+            if ct in {"text/html", "application/xhtml+xml"} or name.endswith(".html") or name.endswith(".htm") or name.endswith(".xhtml"):
+                text = html_to_text(decoded)
+            else:
+                text = decoded
+            text = text.strip()
             if not text:
                 REQS.labels(endpoint="/v1/documents/upload", status="400").inc()
                 logger.warning(

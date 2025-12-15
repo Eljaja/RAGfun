@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 import fitz  # PyMuPDF
 from lxml import etree
+from lxml import html as lxml_html
 
 logger = logging.getLogger("processor.extraction")
 
@@ -24,6 +25,33 @@ def _xml_to_text(raw: bytes) -> str:
     root = etree.fromstring(raw, parser=parser)
     text = " ".join(t.strip() for t in root.itertext() if t and t.strip())
     return text.strip()
+
+
+def _html_to_text(raw: bytes) -> str:
+    """
+    Best-effort: parse HTML/XHTML and extract visible text.
+    - Drops <script>/<style>/<noscript>
+    - Collapses whitespace
+    """
+    try:
+        doc = lxml_html.document_fromstring(raw)
+    except Exception:
+        # Fallback: try generic HTML parser
+        parser = etree.HTMLParser(recover=True, huge_tree=True)
+        root = etree.fromstring(raw, parser=parser)
+        text = " ".join(t.strip() for t in root.itertext() if t and t.strip())
+        return " ".join(text.split()).strip()
+
+    # Remove non-text content
+    for bad in doc.xpath("//script|//style|//noscript"):
+        try:
+            bad.drop_tree()
+        except Exception:
+            # best-effort
+            pass
+
+    text = " ".join(t.strip() for t in doc.itertext() if t and t.strip())
+    return " ".join(text.split()).strip()
 
 
 def _convert_office_to_pdf(raw: bytes, ext: str) -> bytes:
@@ -93,6 +121,9 @@ def extract_text_non_vlm(raw: bytes, content_type: str | None, filename: str | N
     if ct in {"application/xml", "text/xml"} or name.endswith(".xml"):
         return ExtractedDocument(content_type=ct, pages_text=[_xml_to_text(raw)])
 
+    if ct in {"text/html", "application/xhtml+xml"} or name.endswith(".html") or name.endswith(".htm") or name.endswith(".xhtml"):
+        return ExtractedDocument(content_type=ct or "text/html", pages_text=[_html_to_text(raw)])
+
     # Plain-ish text fallback
     try:
         text = raw.decode("utf-8", errors="replace").strip()
@@ -120,6 +151,7 @@ def normalize_to_pdf(raw: bytes, content_type: str | None, filename: str | None)
         return (_convert_office_to_pdf(raw, ext), "application/pdf")
 
     return (None, ct)
+
 
 
 
