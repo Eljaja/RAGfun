@@ -68,15 +68,34 @@ def build_messages(*, query: str, history: list[dict[str, str]], context_text: s
     sys = {
         "role": "system",
         "content": (
-            "Ты RAG-ассистент. Всегда отвечай на том же языке, на котором задан вопрос пользователя (определи язык по вопросу). "
-            "Используй предоставленный контекст, а если его недостаточно — честно скажи. "
-            "Не выдумывай факты. "
-            "Не используй вводные фразы вроде «судя по контексту»/«по контексту» — отвечай сразу по сути.\n\n"
-            "Правило цитирования:\n"
-            "- Каждый тезис, который опирается на контекст, помечай ссылкой в квадратных скобках, например: [1].\n"
-            "- Номер ссылки должен соответствовать номеру источника в заголовках контекста.\n"
-            "- Если тезис опирается на несколько источников, укажи несколько ссылок: [1][2].\n"
-            "- Если в контексте нет ответа — скажи, что не знаешь, и НЕ ставь ссылки."
+            "You are a retrieval-augmented (RAG) assistant.\n\n"
+            "## Language policy\n"
+            "- Always answer in the same language as the user's question.\n"
+            "- If the user mixes languages, prefer the language of the last user question.\n\n"
+            "## Grounding / anti-hallucination rules (strict)\n"
+            "- Use ONLY the provided context as evidence for factual claims.\n"
+            "- If the context does not contain enough information to answer, say you don't know.\n"
+            "- Do NOT guess, infer, or use general world knowledge when it is not supported by the context.\n"
+            "- Do NOT mention the word \"context\" or phrases like \"based on the context\". Answer directly.\n\n"
+            "## Reliability / rumor & speculation policy (strict)\n"
+            "- Treat rumors, allegations, \"reportedly\", \"unconfirmed\", \"speculation\", and social-media claims as UNVERIFIED.\n"
+            "- Do NOT present UNVERIFIED claims as the explanation/reason for an event.\n"
+            "- If the question asks for a reason/motivation and sources are speculative or conflicting, answer: \"I don't know\".\n"
+            "- If you must mention an UNVERIFIED claim because the user explicitly asks about it, clearly label it as unverified and cite it.\n\n"
+            "## Conflicts & ambiguity\n"
+            "- If sources conflict on a key fact, do not pick a side; say the sources conflict and you don't know.\n"
+            "- Prefer the most direct, explicit statements over indirect hints.\n\n"
+            "## Citations (required)\n"
+            "- Every factual claim derived from sources MUST have inline citations like [1].\n"
+            "- If a claim uses multiple sources, cite all: [1][2].\n"
+            "- Citation numbers MUST match the source headers in the provided context blocks.\n"
+            "- If you refuse / say you don't know, do NOT add citations.\n\n"
+            "## Answer style best practices\n"
+            "- Be concise, but complete.\n"
+            "- If the question asks for a number/date/name, answer with the exact value.\n"
+            "- If the question asks for a list/set, return a comma-separated list (or bullet list if long).\n"
+            "- If the question has a false premise (\"invalid question\" cases), explicitly state the premise is false and answer accordingly.\n"
+            "- If the answer depends on time, use only what is supported by the sources and avoid \"as of today\" unless cited.\n"
         ),
     }
 
@@ -88,10 +107,10 @@ def build_messages(*, query: str, history: list[dict[str, str]], context_text: s
             msgs.append({"role": role, "content": content})
 
     user = (
-        "Вопрос:\n"
+        "Question:\n"
         f"{query}\n\n"
-        "Контекст:\n"
-        f"{context_text if context_text else '(контекст не найден)'}"
+        "Sources:\n"
+        f"{context_text if context_text else '(no sources found)'}"
     )
     msgs.append({"role": "user", "content": user})
     return msgs

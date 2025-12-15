@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from contextlib import asynccontextmanager
@@ -476,6 +477,137 @@ async def delete_document(doc_id: str):
         "degraded": degraded,
         "storage": storage_resp,
         "retrieval": retrieval_resp,
+    }
+
+
+@app.delete("/v1/documents")
+async def delete_all_documents(
+    confirm: bool = False,
+    batch_size: int = 200,
+    concurrency: int = 10,
+    max_batches: int = 10_000,
+):
+    """
+    Deletes ALL documents from storage (if configured) and removes their chunks from retrieval index.
+    Safety: requires `confirm=true` query param.
+
+    Implementation note: document-storage doesn't expose "delete all", so we iterate pages and delete by doc_id.
+    """
+    if not confirm:
+        raise HTTPException(status_code=400, detail="confirm=true is required")
+
+    if state.config_error:
+        REQS.labels(endpoint="/v1/documents", status="503").inc()
+        return {"ok": False, "error": "config_error", "detail": state.config_error}
+    if not state.storage:
+        REQS.labels(endpoint="/v1/documents", status="503").inc()
+        return {"ok": False, "error": "storage_unavailable"}
+    if not state.retrieval:
+        REQS.labels(endpoint="/v1/documents", status="503").inc()
+        return {"ok": False, "error": "retrieval_unavailable"}
+
+    # Clamp params to keep the API safe.
+    batch_size = max(1, min(int(batch_size), 1000))
+    concurrency = max(1, min(int(concurrency), 50))
+    max_batches = max(1, min(int(max_batches), 1_000_000))
+
+    sem = asyncio.Semaphore(concurrency)
+
+    deleted = 0
+    partial_count = 0
+    degraded: set[str] = set()
+    errors: list[dict[str, str]] = []
+
+    async def _delete_one(*, doc_id: str, refresh: bool) -> dict[str, object]:
+        async with sem:
+            storage_resp = None
+            retrieval_resp = None
+            partial = False
+
+            # 1) Delete from storage
+            try:
+                with LAT.labels("storage_delete_all").time():
+                    storage_resp = await state.storage.delete_document(doc_id=doc_id)
+            except httpx.HTTPStatusError as e:
+                partial = True
+                degraded.add("storage_delete_failed")
+                storage_resp = {"ok": False, "status_code": e.response.status_code, "detail": (e.response.text or "")[:500]}
+            except Exception as e:
+                partial = True
+                degraded.add("storage_delete_failed")
+                storage_resp = {"ok": False, "error": f"{type(e).__name__}: {str(e)}"}
+
+            # 2) Delete from retrieval index
+            try:
+                with LAT.labels("retrieval_delete_all").time():
+                    retrieval_resp = await state.retrieval.index_delete(payload={"doc_id": doc_id, "refresh": bool(refresh)})
+            except httpx.HTTPStatusError as e:
+                partial = True
+                degraded.add("retrieval_delete_failed")
+                retrieval_resp = {"ok": False, "status_code": e.response.status_code, "detail": (e.response.text or "")[:500]}
+            except Exception as e:
+                partial = True
+                degraded.add("retrieval_delete_failed")
+                retrieval_resp = {"ok": False, "error": f"{type(e).__name__}: {str(e)}"}
+
+            ok = bool((retrieval_resp or {}).get("ok"))
+            return {"ok": ok, "doc_id": doc_id, "partial": partial, "storage": storage_resp, "retrieval": retrieval_resp}
+
+    batches = 0
+    try:
+        while True:
+            batches += 1
+            if batches > max_batches:
+                degraded.add("max_batches_reached")
+                errors.append({"error": "max_batches_reached", "detail": f"max_batches={max_batches}"})
+                break
+
+            # Always fetch from offset=0 because deletion changes pagination.
+            with LAT.labels("storage_list_for_delete_all").time():
+                page = await state.storage.search_documents(limit=batch_size, offset=0)
+
+            docs = page.get("documents", []) or []
+            if not docs:
+                break
+
+            total = int(page.get("total") or len(docs))
+            refresh_last_in_batch = total <= len(docs)
+
+            doc_ids: list[str] = [d.get("doc_id") for d in docs if d.get("doc_id")]
+            if not doc_ids:
+                # Unexpected but prevents infinite loops.
+                degraded.add("no_doc_ids_in_page")
+                errors.append({"error": "no_doc_ids_in_page"})
+                break
+
+            tasks = []
+            for i, doc_id in enumerate(doc_ids):
+                refresh = bool(refresh_last_in_batch and i == len(doc_ids) - 1)
+                tasks.append(_delete_one(doc_id=doc_id, refresh=refresh))
+
+            results = await asyncio.gather(*tasks)
+            deleted += len(results)
+            for r in results:
+                if r.get("partial"):
+                    partial_count += 1
+                if r.get("ok") is not True:
+                    # Keep only a small sample to avoid huge responses.
+                    if len(errors) < 50:
+                        errors.append({"doc_id": str(r.get("doc_id")), "error": "delete_failed_or_partial"})
+    except Exception as e:
+        degraded.add("delete_all_failed")
+        errors.append({"error": f"{type(e).__name__}: {str(e)}"})
+
+    partial = bool(partial_count) or bool(degraded) or bool(errors)
+    status = "200" if not partial else "207"
+    REQS.labels(endpoint="/v1/documents", status=status).inc()
+    return {
+        "ok": True,
+        "deleted": deleted,
+        "partial": partial,
+        "partial_count": partial_count,
+        "degraded": sorted(degraded),
+        "errors": errors,
     }
 
 
