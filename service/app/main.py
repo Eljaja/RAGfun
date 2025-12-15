@@ -274,6 +274,7 @@ async def search(payload: SearchRequest):
         rrf_k=state.settings.rrf_k,
         weight_bm25=state.settings.weight_bm25,
         weight_vector=state.settings.weight_vector,
+        fusion_alpha=state.settings.fusion_alpha,
         max_chunks_per_doc=state.settings.max_chunks_per_doc,
         redact_uri_mode=state.settings.redact_uri_mode,
         enable_page_deduplication=state.settings.enable_page_deduplication,

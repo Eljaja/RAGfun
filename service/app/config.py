@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     weight_bm25: float = 1.0
     weight_vector: float = 1.0
     max_chunks_per_doc: int = 3
+    fusion_alpha: float = 0.75  # 1.0=rank-only (RRF), 0.0=score-only (normalized)
 
     # Rerank
     rerank_mode: str = "disabled"  # disabled|always|auto

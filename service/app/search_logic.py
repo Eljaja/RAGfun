@@ -12,7 +12,7 @@ from app.clients.embeddings import EmbeddingsClient
 from app.clients.opensearch import OpenSearchClient
 from app.clients.qdrant import QdrantFacade
 from app.clients.rerank import RerankClient
-from app.fusion import rrf_fusion
+from app.fusion import hybrid_fusion, rrf_fusion
 from app.metrics import CAND, DEP_DEGRADED, ERRS, LAT
 from app.models import SearchFilters, SearchHit, SearchRequest, SearchResponse, SourceObj
 from app.utils import redact_uri
@@ -190,6 +190,7 @@ async def search(
     rrf_k: int,
     weight_bm25: float,
     weight_vector: float,
+    fusion_alpha: float,
     max_chunks_per_doc: int,
     redact_uri_mode: str,
     enable_page_deduplication: bool = False,
@@ -311,7 +312,17 @@ async def search(
     else:
         with tracer.start_as_current_span("fusion"):
             with LAT.labels("fusion").time():
-                fused_scores = rrf_fusion(src_lists, {"bm25": weight_bm25, "vector": weight_vector}, rrf_k)
+                # Hybrid fusion: combine rank-based RRF with normalized per-source scores.
+                fused_scores = hybrid_fusion(
+                    ranked_lists=src_lists,
+                    scored_lists={
+                        "bm25": {h.chunk_id: float(h.score) for h in bm25_hits},
+                        "vector": {h.chunk_id: float(h.score) for h in vec_hits},
+                    },
+                    weights={"bm25": weight_bm25, "vector": weight_vector},
+                    rrf_k=rrf_k,
+                    alpha=fusion_alpha,
+                )
         fused_order = sorted(fused_scores.keys(), key=lambda cid: fused_scores[cid], reverse=True)[:top_k]
 
     # Merge payloads: prefer OS for highlight, fallback to Qdrant
