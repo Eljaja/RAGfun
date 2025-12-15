@@ -78,6 +78,13 @@ services:
       retries: 5
       start_period: 10s
 
+  infinity-embed:
+    image: michaelf34/infinity:latest
+    container_name: infinity-embed
+    command: ["v2", "--model-id", "sentence-transformers/distiluse-base-multilingual-cased", "--port", "7997"]
+    networks:
+      - rag-network
+
   # Stateless Hybrid Retrieval microservice (scale this one for multiple replicas)
   retrieval:
     build:
@@ -90,9 +97,9 @@ services:
       # Use a separate collection because the host Infinity embedding model is 512-dim
       # (existing 'rag_chunks' may already be created with a different vector size).
       - RAG_QDRANT_COLLECTION=rag_chunks_512
-      # Embeddings (use already running Infinity on the host:7997)
+      # Embeddings (Infinity inside docker network)
       - RAG_EMBEDDING_PROVIDER=http
-      - RAG_EMBEDDING_URL=http://host.docker.internal:7997/embeddings
+      - RAG_EMBEDDING_URL=http://infinity-embed:7997/embeddings
       - RAG_EMBEDDING_MODEL=sentence-transformers/distiluse-base-multilingual-cased
       - RAG_VECTOR_SIZE=512
       # Rerank (Infinity rerank service started by this compose)
@@ -109,6 +116,8 @@ services:
         condition: service_healthy
       qdrant:
         condition: service_healthy
+      infinity-embed:
+        condition: service_started
       infinity-rerank:
         condition: service_started
     networks:
@@ -235,6 +244,37 @@ services:
     networks:
       - rag-network
 
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    container_name: prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+    ports:
+      - "9090:9090"
+    volumes:
+      - prometheus-data:/prometheus
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - rag-network
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    container_name: grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - rag-network
+
 volumes:
   opensearch-data:
     driver: local
@@ -243,6 +283,10 @@ volumes:
   postgres-data:
     driver: local
   document-storage-data:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
     driver: local
 
 networks:

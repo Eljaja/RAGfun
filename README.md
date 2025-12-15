@@ -1,34 +1,49 @@
 # RAG Experiments Playground
 
 Some short and fun experiments with SOTA-style RAG pipelines, combined with hands-on learning and architectural exploration.
-This repository is focused on reproducing large-scale RAG architectures in a simplified and experimental form. The main goal is to explore how modern retrieval techniques, stateless services, and composable pipelines behave when combined together.
-The project is intentionally a work in progress and serves as a sandbox for testing ideas, patterns, and benchmarks rather than a production-ready system.
 
-## Scope
+## Run the pipeline (Docker Compose)
 
-- Stateless RAG-oriented architecture inspired by large-scale systems
-- Experiments with modern retrieval combinations such as vector search, BM25, and structured document ingestion
-- Focus on composability, reproducibility, and architectural clarity
+### Prerequisites
 
-## Current Direction
+- Docker + Docker Compose v2 (`docker compose ...`)
+- (Optional but recommended) NVIDIA GPU for `vllm-docling` (document-to-text via VLM)
+- (Optional) Embeddings service on the host at `http://localhost:7997/embeddings` (the default `docker-compose.yml` expects it)
 
-- Implement and test SOTA-style RAG pipelines
-- Explore hybrid retrieval strategies combining dense and sparse methods
-- Keep services stateless where possible to reflect scalable production patterns
+### Start
 
-## Planned Work
+```bash
+cp env.example .env
+# edit .env if you want a real LLM key/provider
 
-- Add and evaluate benchmarks such as T^2-RAGBench
-- Introduce an optional continuous GraphRAG workflow inspired by tools like zepgraph
-- Add deep research style pipelines and agentic search approaches
-- Compare different pipeline compositions and retrieval strategies
+docker compose up -d --build
+```
 
-## Status
+### Open
 
-- Work in progress
-- Experimental by design
-- Architecture and components may change frequently
+- UI: `http://localhost:3300`
+- Gateway API: `http://localhost:8090`
 
-## Disclaimer
+### Stop
 
-This repository is primarily for research, learning, and experimentation. Expect incomplete features, refactors, and breaking changes as new ideas are tested.
+```bash
+docker compose down
+```
+
+### Reset state (delete volumes)
+
+```bash
+docker compose down -v
+```
+
+## CPU-only deterministic e2e stack
+
+```bash
+make e2e-up
+make e2e-test
+make e2e-down
+```
+
+## Documentation
+
+See [`docs/README.md`](./docs/README.md).
