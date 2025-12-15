@@ -95,6 +95,9 @@ class SearchFilters(BaseModel):
     doc_ids: list[str] | None = None
     tenant_id: str | None = None
     project_id: str | None = None
+    # "Collections" support: allow selecting multiple project_ids at query time.
+    # UI/backend treat project_id as "collection id".
+    project_ids: list[str] | None = None
 
 
 class SearchRequest(BaseModel):

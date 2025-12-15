@@ -7,13 +7,14 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import StreamingResponse, JSONResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from app.config import Settings, load_settings
 from app.database import DatabaseClient
 from app.metrics import ERRS, LAT, REQS
-from app.models import DocumentMetadata, DocumentSearchRequest, DocumentSearchResponse, StoreDocumentResponse
+from app.models import DocumentMetadata, DocumentSearchRequest, DocumentSearchResponse, PatchExtraRequest, PatchExtraByIdRequest, StoreDocumentResponse
 from app.observability import TraceContextFilter, setup_json_logging
 from app.storage import StorageBackend, create_storage_backend
 
@@ -73,6 +74,14 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Document Storage", version="0.1.0", lifespan=lifespan)
 
 
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Log validation errors."""
+    if request.url.path == "/v1/documents/by-id/extra":
+        logger.error("by_id_extra_validation_error", extra={"errors": exc.errors(), "body": await request.body()})
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+
 @app.middleware("http")
 async def access_log(request: Request, call_next):
     start = time.time()
@@ -81,15 +90,28 @@ async def access_log(request: Request, call_next):
         return response
     finally:
         dur_ms = (time.time() - start) * 1000.0
-        logger.info(
-            "http_request",
-            extra={
-                "method": request.method,
-                "path": request.url.path,
-                "query": request.url.query,
-                "duration_ms": dur_ms,
-            },
-        )
+        # Don't log DELETE requests that return 404 - documents may already be deleted
+        if request.method == "DELETE" and response.status_code == 404:
+            logger.debug(
+                "http_request",
+                extra={
+                    "method": request.method,
+                    "path": request.url.path,
+                    "query": request.url.query,
+                    "duration_ms": dur_ms,
+                    "status": response.status_code,
+                },
+            )
+        else:
+            logger.info(
+                "http_request",
+                extra={
+                    "method": request.method,
+                    "path": request.url.path,
+                    "query": request.url.query,
+                    "duration_ms": dur_ms,
+                },
+            )
 
 
 @app.get("/v1/healthz")
@@ -218,6 +240,50 @@ async def store_document(
         return StoreDocumentResponse(ok=False, doc_id=doc_id, error=str(e))
 
 
+# NOTE: doc_id can contain "/" (e.g. repo:path/to/file). FastAPI path params won't match encoded slashes reliably.
+# Provide "safe" endpoints under /by-id/ using query params (must be defined BEFORE /{doc_id} routes).
+@app.get("/v1/documents/by-id")
+async def get_document_by_id(doc_id: str):
+    """Retrieve document file by doc_id (supports slashy doc_ids via query param)."""
+    if state.config_error:
+        REQS.labels(endpoint="/v1/documents/by-id", status="503").inc()
+        raise HTTPException(status_code=503, detail="config_error")
+
+    if not state.db or not state.storage:
+        REQS.labels(endpoint="/v1/documents/by-id", status="503").inc()
+        raise HTTPException(status_code=503, detail="service_unavailable")
+
+    try:
+        logger.info("get_document_by_id_request", extra={"doc_id": doc_id, "doc_id_repr": repr(doc_id), "endpoint": "by-id"})
+        meta = state.db.get_metadata(doc_id)
+        if not meta:
+            logger.warning("get_document_by_id_not_found", extra={"doc_id": doc_id, "endpoint": "by-id"})
+            REQS.labels(endpoint="/v1/documents/by-id", status="404").inc()
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        if not meta.storage_id:
+            REQS.labels(endpoint="/v1/documents/by-id", status="404").inc()
+            raise HTTPException(status_code=404, detail="Storage ID not found")
+
+        content = state.storage.retrieve(meta.storage_id)
+        if not content:
+            REQS.labels(endpoint="/v1/documents/by-id", status="404").inc()
+            raise HTTPException(status_code=404, detail="File not found in storage")
+
+        headers = {}
+        if meta.content_type:
+            headers["Content-Type"] = meta.content_type
+        REQS.labels(endpoint="/v1/documents/by-id", status="200").inc()
+        return Response(content=content, headers=headers, media_type=meta.content_type or "application/octet-stream")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("get_document_by_id_error", extra={"doc_id": doc_id, "error": str(e)})
+        REQS.labels(endpoint="/v1/documents/by-id", status="500").inc()
+        ERRS.labels(stage="get", kind="exception").inc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/v1/documents/{doc_id}")
 async def get_document(doc_id: str):
     """Retrieve document file by doc_id."""
@@ -308,6 +374,79 @@ async def delete_document(doc_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.delete("/v1/documents/by-id")
+async def delete_document_by_id(doc_id: str):
+    """Delete document and its metadata (supports slashy doc_ids via query param)."""
+    if state.config_error:
+        REQS.labels(endpoint="/v1/documents/by-id", status="503").inc()
+        raise HTTPException(status_code=503, detail="config_error")
+
+    if not state.db or not state.storage:
+        REQS.labels(endpoint="/v1/documents/by-id", status="503").inc()
+        raise HTTPException(status_code=503, detail="service_unavailable")
+
+    try:
+        meta = state.db.get_metadata(doc_id)
+        if not meta:
+            # Don't log 404 for DELETE requests - documents may already be deleted
+            if request.method != "DELETE":
+                logger.debug("delete_document_by_id_not_found", extra={"doc_id": doc_id})
+            REQS.labels(endpoint="/v1/documents/by-id", status="404").inc()
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        if meta.storage_id:
+            state.storage.delete(meta.storage_id)
+
+        deleted = state.db.delete_metadata(doc_id)
+        REQS.labels(endpoint="/v1/documents/by-id", status="200").inc()
+        return {"ok": True, "deleted": deleted}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("delete_document_by_id_error", extra={"doc_id": doc_id, "error": str(e)})
+        REQS.labels(endpoint="/v1/documents/by-id", status="500").inc()
+        ERRS.labels(stage="delete", kind="exception").inc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/documents/by-id/metadata", response_model=DocumentMetadata)
+async def get_metadata_by_id(doc_id: str):
+    """Get document metadata only (supports slashy doc_ids via query param)."""
+    if state.config_error:
+        REQS.labels(endpoint="/v1/documents/by-id/metadata", status="503").inc()
+        raise HTTPException(status_code=503, detail="config_error")
+
+    if not state.db:
+        REQS.labels(endpoint="/v1/documents/by-id/metadata", status="503").inc()
+        raise HTTPException(status_code=503, detail="service_unavailable")
+
+    try:
+        logger.info("get_metadata_by_id_request", extra={"doc_id": doc_id, "doc_id_repr": repr(doc_id), "doc_id_len": len(doc_id)})
+        # Try to find the document
+        meta = state.db.get_metadata(doc_id)
+        if not meta:
+            # Log what we searched for and try a few variations
+            logger.warning("get_metadata_by_id_not_found", extra={"doc_id": doc_id, "doc_id_bytes": doc_id.encode('utf-8').hex()})
+            # Try URL-decoded version if it contains %XX
+            import urllib.parse
+            decoded = urllib.parse.unquote(doc_id)
+            if decoded != doc_id:
+                logger.info("get_metadata_by_id_trying_decoded", extra={"decoded": decoded})
+                meta = state.db.get_metadata(decoded)
+            if not meta:
+                REQS.labels(endpoint="/v1/documents/by-id/metadata", status="404").inc()
+                raise HTTPException(status_code=404, detail="Document not found")
+        REQS.labels(endpoint="/v1/documents/by-id/metadata", status="200").inc()
+        return meta
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("get_metadata_by_id_error", extra={"doc_id": doc_id, "error": str(e)})
+        REQS.labels(endpoint="/v1/documents/by-id/metadata", status="500").inc()
+        ERRS.labels(stage="get_metadata", kind="exception").inc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/v1/documents/{doc_id}/metadata", response_model=DocumentMetadata)
 async def get_metadata(doc_id: str):
     """Get document metadata only."""
@@ -337,6 +476,65 @@ async def get_metadata(doc_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/v1/documents/by-id/extra", response_model=DocumentMetadata)
+async def patch_extra_by_id(req: PatchExtraByIdRequest):
+    """Merge-patch `extra` JSON for a document (supports slashy doc_ids via body param)."""
+    logger.info("patch_extra_by_id_called", extra={"req_doc_id": getattr(req, 'doc_id', 'MISSING'), "req_type": type(req).__name__})
+    if state.config_error:
+        REQS.labels(endpoint="/v1/documents/by-id/extra", status="503").inc()
+        raise HTTPException(status_code=503, detail="config_error")
+
+    if not state.db:
+        REQS.labels(endpoint="/v1/documents/by-id/extra", status="503").inc()
+        raise HTTPException(status_code=503, detail="service_unavailable")
+
+    try:
+        logger.info("patch_extra_by_id_request", extra={"doc_id": req.doc_id, "doc_id_repr": repr(req.doc_id), "patch_keys": list(req.patch.keys())})
+        with LAT.labels(stage="patch_extra").time():
+            meta = state.db.patch_extra(doc_id=req.doc_id, patch=req.patch)
+        if not meta:
+            logger.warning("patch_extra_by_id_not_found", extra={"doc_id": req.doc_id})
+            REQS.labels(endpoint="/v1/documents/by-id/extra", status="404").inc()
+            raise HTTPException(status_code=404, detail="Document not found")
+        REQS.labels(endpoint="/v1/documents/by-id/extra", status="200").inc()
+        return meta
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("patch_extra_by_id_error", extra={"doc_id": req.doc_id, "error": str(e)})
+        REQS.labels(endpoint="/v1/documents/by-id/extra", status="500").inc()
+        ERRS.labels(stage="patch_extra", kind="exception").inc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/documents/{doc_id}/extra", response_model=DocumentMetadata)
+async def patch_extra(doc_id: str, req: PatchExtraRequest):
+    """Merge-patch `extra` JSON for a document."""
+    if state.config_error:
+        REQS.labels(endpoint="/v1/documents/{doc_id}/extra", status="503").inc()
+        raise HTTPException(status_code=503, detail="config_error")
+
+    if not state.db:
+        REQS.labels(endpoint="/v1/documents/{doc_id}/extra", status="503").inc()
+        raise HTTPException(status_code=503, detail="service_unavailable")
+
+    try:
+        with LAT.labels(stage="patch_extra").time():
+            meta = state.db.patch_extra(doc_id=doc_id, patch=req.patch)
+        if not meta:
+            REQS.labels(endpoint="/v1/documents/{doc_id}/extra", status="404").inc()
+            raise HTTPException(status_code=404, detail="Document not found")
+        REQS.labels(endpoint="/v1/documents/{doc_id}/extra", status="200").inc()
+        return meta
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("patch_extra_error", extra={"doc_id": doc_id, "error": str(e)})
+        REQS.labels(endpoint="/v1/documents/{doc_id}/extra", status="500").inc()
+        ERRS.labels(stage="patch_extra", kind="exception").inc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/v1/documents/search", response_model=DocumentSearchResponse)
 async def search_documents(req: DocumentSearchRequest):
     """Search documents by metadata filters."""
@@ -360,4 +558,27 @@ async def search_documents(req: DocumentSearchRequest):
         REQS.labels(endpoint="/v1/documents/search", status="500").inc()
         ERRS.labels(stage="search", kind="exception").inc()
         return DocumentSearchResponse(ok=False, error=str(e))
+
+
+@app.get("/v1/collections")
+async def list_collections(tenant_id: str | None = None, limit: int = 1000):
+    """List distinct project_id values (aka "collections") with counts."""
+    if state.config_error:
+        REQS.labels(endpoint="/v1/collections", status="503").inc()
+        return {"ok": False, "error": "config_error"}
+
+    if not state.db:
+        REQS.labels(endpoint="/v1/collections", status="503").inc()
+        return {"ok": False, "error": "service_unavailable", "collections": []}
+
+    try:
+        with LAT.labels(stage="collections").time():
+            cols = state.db.list_collections(tenant_id=tenant_id, limit=limit)
+        REQS.labels(endpoint="/v1/collections", status="200").inc()
+        return {"ok": True, "collections": cols}
+    except Exception as e:
+        logger.error("list_collections_error", extra={"error": str(e)})
+        REQS.labels(endpoint="/v1/collections", status="500").inc()
+        ERRS.labels(stage="collections", kind="exception").inc()
+        return {"ok": False, "error": str(e), "collections": []}
 

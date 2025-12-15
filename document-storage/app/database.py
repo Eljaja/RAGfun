@@ -173,6 +173,38 @@ class DatabaseClient:
         finally:
             self.pool.putconn(conn)
 
+    def patch_extra(self, *, doc_id: str, patch: dict[str, Any]) -> DocumentMetadata | None:
+        """
+        Merge-patch JSONB `extra` field for a document.
+        Top-level keys in `patch` overwrite existing keys.
+        Returns updated metadata or None if doc_id not found.
+        """
+        conn = self.pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE document_metadata
+                    SET
+                        extra = COALESCE(extra, '{}'::jsonb) || %s::jsonb,
+                        updated_at = NOW()
+                    WHERE doc_id = %s
+                    RETURNING *
+                    """,
+                    (json.dumps(patch), doc_id),
+                )
+                row = cur.fetchone()
+                conn.commit()
+                if not row:
+                    return None
+                return self._row_to_metadata(row)
+        except Exception as e:
+            conn.rollback()
+            logger.error("database_patch_extra_error", extra={"doc_id": doc_id, "error": str(e)})
+            raise
+        finally:
+            self.pool.putconn(conn)
+
     def search_metadata(self, req: DocumentSearchRequest) -> tuple[list[DocumentMetadata], int]:
         """Search documents by metadata filters."""
         conn = self.pool.getconn()
@@ -192,9 +224,27 @@ class DatabaseClient:
                 conditions.append("tenant_id = %(tenant_id)s")
                 params["tenant_id"] = req.tenant_id
 
+            # Collections: support both project_id (single) and project_ids (multi).
+            proj_ids: list[str] = []
             if req.project_id:
-                conditions.append("project_id = %(project_id)s")
-                params["project_id"] = req.project_id
+                proj_ids.append(req.project_id)
+            if getattr(req, "project_ids", None):
+                proj_ids.extend([x for x in (req.project_ids or []) if x])
+            # de-dup while preserving order
+            seen: set[str] = set()
+            proj_ids_norm: list[str] = []
+            for x in proj_ids:
+                if x in seen:
+                    continue
+                seen.add(x)
+                proj_ids_norm.append(x)
+            if proj_ids_norm:
+                if len(proj_ids_norm) == 1:
+                    conditions.append("project_id = %(project_id)s")
+                    params["project_id"] = proj_ids_norm[0]
+                else:
+                    conditions.append("project_id = ANY(%(project_ids)s)")
+                    params["project_ids"] = proj_ids_norm
 
             if req.tags:
                 conditions.append("tags && %(tags)s")
@@ -233,6 +283,39 @@ class DatabaseClient:
         except Exception as e:
             logger.error("database_search_metadata_error", extra={"error": str(e)})
             raise
+        finally:
+            self.pool.putconn(conn)
+
+    def list_collections(self, *, tenant_id: str | None = None, limit: int = 1000) -> list[dict[str, Any]]:
+        """
+        Returns distinct project_id values with counts. Used by UI as "collections".
+        """
+        conn = self.pool.getconn()
+        try:
+            where = ["project_id IS NOT NULL", "project_id <> ''"]
+            params: dict[str, Any] = {"limit": max(1, min(int(limit), 5000))}
+            if tenant_id:
+                where.append("tenant_id = %(tenant_id)s")
+                params["tenant_id"] = tenant_id
+            where_clause = " AND ".join(where)
+            sql = f"""
+                SELECT project_id as id, COUNT(*)::bigint as count
+                FROM document_metadata
+                WHERE {where_clause}
+                GROUP BY project_id
+                ORDER BY count DESC, project_id ASC
+                LIMIT %(limit)s
+            """
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall() or []
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                try:
+                    out.append({"id": str(r.get("id")), "count": int(r.get("count") or 0)})
+                except Exception:
+                    continue
+            return out
         finally:
             self.pool.putconn(conn)
 

@@ -1,10 +1,12 @@
 async function callChatStream(query, onToken, onComplete, onError, onRetrieval) {
+  const filters = buildChatFilters();
   const r = await fetch("/api/v1/chat/stream", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       query,
       include_sources: true,
+      filters,
     }),
   });
 
@@ -58,7 +60,7 @@ async function callChatStream(query, onToken, onComplete, onError, onRetrieval) 
   }
 }
 
-async function uploadDoc({ file, doc_id, title, uri, source, lang, tags }) {
+async function uploadDoc({ file, doc_id, title, uri, source, lang, tags, project_id }) {
   const fd = new FormData();
   fd.append("file", file);
   fd.append("doc_id", doc_id);
@@ -67,6 +69,7 @@ async function uploadDoc({ file, doc_id, title, uri, source, lang, tags }) {
   if (source) fd.append("source", source);
   if (lang) fd.append("lang", lang);
   if (tags) fd.append("tags", tags);
+  if (project_id) fd.append("project_id", project_id);
   fd.append("refresh", "false");
 
   const r = await fetch("/api/v1/documents/upload", { method: "POST", body: fd });
@@ -81,7 +84,12 @@ async function uploadDoc({ file, doc_id, title, uri, source, lang, tags }) {
 async function listDocuments() {
   const limit = docsState.limit;
   const offset = docsState.offset;
-  const r = await fetch(`/api/v1/documents?limit=${encodeURIComponent(limit)}&offset=${encodeURIComponent(offset)}`);
+  const collections = getSelectedValues("files_collections");
+  const q = new URLSearchParams();
+  q.set("limit", String(limit));
+  q.set("offset", String(offset));
+  if (collections.length) q.set("collections", collections.join(","));
+  const r = await fetch(`/api/v1/documents?${q.toString()}`);
   const data = await r.json();
   if (!r.ok) {
     throw new Error(data.error || `HTTP ${r.status}`);
@@ -115,6 +123,25 @@ const docsState = {
   limit: 100,
   offset: 0,
 };
+
+const collectionsState = {
+  items: [], // [{id, count}]
+  loaded: false,
+};
+
+function getSelectedValues(selectId) {
+  const el = document.getElementById(selectId);
+  if (!el) return [];
+  return Array.from(el.selectedOptions || [])
+    .map(o => (o && o.value ? o.value : ""))
+    .filter(Boolean);
+}
+
+function buildChatFilters() {
+  const project_ids = getSelectedValues("chat_collections");
+  if (!project_ids.length) return null;
+  return { project_ids };
+}
 
 function updateDocsMeta() {
   const el = document.getElementById("docs_meta");
@@ -230,12 +257,21 @@ function renderDocuments(docs) {
           <div class="doc-id">ID: ${escapeHtml(doc.doc_id)}</div>
         </div>
         <div class="badges">
-          ${doc.stored !== false ? '<span class="badge stored">Сохранен</span>' : ""}
-          ${doc.indexed ? '<span class="badge indexed">Проиндексирован</span>' : '<span class="badge not-indexed">Не проиндексирован</span>'}
+          ${doc.storage_id ? '<span class="badge stored">Сохранен</span>' : ""}
+          ${(() => {
+            const ing = doc && doc.extra && doc.extra.ingestion ? doc.extra.ingestion : null;
+            const st = ing && ing.state ? String(ing.state) : "";
+            if (st === "queued") return '<span class="badge queued">В очереди</span>';
+            if (st === "processing") return '<span class="badge processing">Обрабатывается</span>';
+            if (st === "retrying") return '<span class="badge queued">Повтор</span>';
+            if (st === "failed") return '<span class="badge failed">Ошибка</span>';
+            return doc.indexed ? '<span class="badge indexed">Проиндексирован</span>' : '<span class="badge not-indexed">Не проиндексирован</span>';
+          })()}
         </div>
       </div>
       <div class="doc-meta">
         ${doc.source ? `<span>Источник: ${escapeHtml(doc.source)}</span>` : ""}
+        ${doc.project_id ? `<span style="margin-left: 12px;">Коллекция: ${escapeHtml(doc.project_id)}</span>` : ""}
         ${doc.lang ? `<span style="margin-left: 12px;">Язык: ${escapeHtml(doc.lang)}</span>` : ""}
         ${doc.size ? `<span style="margin-left: 12px;">Размер: ${formatBytes(doc.size)}</span>` : ""}
         ${doc.stored_at ? `<span style="margin-left: 12px;">Загружен: ${new Date(doc.stored_at).toLocaleString("ru")}</span>` : ""}
@@ -258,8 +294,11 @@ function renderDocuments(docs) {
       if (!ok) return;
       try {
         e.currentTarget.disabled = true;
-        await deleteDoc(docId);
+        const res = await deleteDoc(docId);
         await loadDocuments();
+        if (res && res.accepted && res.task_id) {
+          alert(`Удаление поставлено в очередь.\n\ntask_id=${res.task_id}`);
+        }
       } catch (err) {
         e.currentTarget.disabled = false;
         alert(`Ошибка удаления: ${err.message}`);
@@ -274,12 +313,98 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
+function formatMessageText(text) {
+  if (!text) return "";
+  
+  // First, escape HTML to prevent XSS
+  let escaped = escapeHtml(text);
+  
+  // Process code blocks (```language\ncode\n``` or ```\ncode\n```)
+  // Use a placeholder to mark code blocks
+  const codeBlockPlaceholders = [];
+  let placeholderIndex = 0;
+  
+  const codeBlockPattern = /```(\w+)?\s*\n([\s\S]*?)```/g;
+  escaped = escaped.replace(codeBlockPattern, (match, lang, code) => {
+    const placeholder = `__CODE_BLOCK_${placeholderIndex}__`;
+    const language = lang ? ` data-lang="${lang.trim()}"` : "";
+    codeBlockPlaceholders.push(`<pre><code${language}>${code.trim()}</code></pre>`);
+    placeholderIndex++;
+    return placeholder;
+  });
+  
+  // Process inline code (`code`) - but not inside code block placeholders
+  escaped = escaped.replace(/`([^`\n]+)`/g, (match, code) => {
+    // Skip if this is inside a placeholder
+    if (match.includes('__CODE_BLOCK_')) return match;
+    return `<code>${code}</code>`;
+  });
+  
+  // Replace placeholders with actual code blocks
+  codeBlockPlaceholders.forEach((codeBlock, index) => {
+    escaped = escaped.replace(`__CODE_BLOCK_${index}__`, codeBlock);
+  });
+  
+  // Convert line breaks to <br> (but preserve code blocks)
+  const parts = escaped.split(/(<pre>[\s\S]*?<\/pre>)/g);
+  return parts.map((part) => {
+    if (part.startsWith('<pre>')) {
+      return part; // Don't process code blocks
+    }
+    return part.replace(/\n/g, '<br>');
+  }).join('');
+}
+
 function formatBytes(bytes) {
   if (!bytes) return "0 B";
   const k = 1024;
   const sizes = ["B", "KB", "MB", "GB"];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return Math.round(bytes / Math.pow(k, i) * 100) / 100 + " " + sizes[i];
+}
+
+async function fetchCollections() {
+  const r = await fetch("/api/v1/collections");
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const msg = (data && (data.detail || data.error)) || `HTTP ${r.status}`;
+    throw new Error(msg);
+  }
+  return data;
+}
+
+function populateCollectionsUI(items) {
+  const list = items || [];
+
+  const datalist = document.getElementById("collections_datalist");
+  if (datalist) {
+    datalist.innerHTML = list.map(c => `<option value="${escapeHtml(c.id)}"></option>`).join("");
+  }
+
+  const mkOptions = list
+    .map(
+      c =>
+        `<option value="${escapeHtml(c.id)}">${escapeHtml(c.id)}${typeof c.count === "number" ? ` (${c.count})` : ""}</option>`
+    )
+    .join("");
+
+  const filesSel = document.getElementById("files_collections");
+  if (filesSel) filesSel.innerHTML = mkOptions;
+
+  const chatSel = document.getElementById("chat_collections");
+  if (chatSel) chatSel.innerHTML = mkOptions;
+}
+
+async function loadCollections() {
+  try {
+    const data = await fetchCollections();
+    const items = (data && data.collections) || [];
+    collectionsState.items = items;
+    collectionsState.loaded = true;
+    populateCollectionsUI(items);
+  } catch (e) {
+    console.warn("Failed to load collections:", e);
+  }
 }
 
 function getMessagesEl() {
@@ -303,7 +428,15 @@ function addMessage({ role, text }) {
   bubble.className = "bubble";
   const bubbleText = document.createElement("div");
   bubbleText.className = "bubble-text";
-  bubbleText.textContent = text || "";
+  
+  if (role === "assistant") {
+    // Format assistant messages with markdown support
+    bubbleText.innerHTML = formatMessageText(text || "");
+  } else {
+    // User messages - plain text with line breaks
+    bubbleText.innerHTML = escapeHtml(text || "").replace(/\n/g, '<br>');
+  }
+  
   bubble.appendChild(bubbleText);
 
   wrapper.appendChild(bubble);
@@ -355,19 +488,32 @@ if (uploadBtn) uploadBtn.addEventListener("click", async () => {
     return;
   }
 
-  const doc_id = document.getElementById("doc_id").value.trim() || randId();
+  const docIdEl = document.getElementById("doc_id");
+  const doc_id = (docIdEl && docIdEl.value ? docIdEl.value.trim() : "") || randId();
   const title = document.getElementById("title").value.trim();
   const uri = document.getElementById("uri").value.trim();
   const source = document.getElementById("source").value.trim();
   const lang = document.getElementById("lang").value.trim();
   const tags = document.getElementById("tags").value.trim();
+  const project_id = document.getElementById("upload_collection").value.trim();
 
   setUploadBusy(true, "Загрузка…");
   try {
-    const data = await uploadDoc({ file, doc_id, title, uri, source, lang, tags });
-    setUploadBusy(false, "OK");
+    const data = await uploadDoc({ file, doc_id, title, uri, source, lang, tags, project_id });
+    // Show the actually used doc_id (useful when input was empty and we auto-generated it)
+    if (data && data.accepted && data.task_id) {
+      setUploadBusy(false, `Принято в очередь · task_id=${data.task_id} · doc_id=${doc_id}`);
+    } else {
+      setUploadBusy(false, `OK · doc_id=${doc_id}`);
+    }
+    // After each successful upload, generate a new doc_id in UI to avoid accidental overwrite
+    if (docIdEl) docIdEl.value = randId();
+    // Optional UX: clear file input so the next upload is explicit
+    if (fileEl) fileEl.value = "";
     // Refresh document list
     loadDocuments();
+    // Refresh collections list (new collection might appear)
+    loadCollections();
   } catch (e) {
     setUploadBusy(false, "Ошибка");
     alert(`Ошибка загрузки: ${e.message}`);
@@ -399,13 +545,13 @@ async function askStream() {
       token => {
         answerText += token;
         if (assistant && assistant.bubbleText) {
-          assistant.bubbleText.textContent = answerText;
+          assistant.bubbleText.innerHTML = formatMessageText(answerText);
           scrollMessagesToBottom();
         }
       },
       data => {
         // done
-        if (assistant && assistant.bubbleText) assistant.bubbleText.textContent = answerText;
+        if (assistant && assistant.bubbleText) assistant.bubbleText.innerHTML = formatMessageText(answerText);
         if (assistant && assistant.wrapper && data) {
           setAssistantExtras(assistant.wrapper, { sources: data.sources, context: data.context || latestContext });
         }
@@ -415,7 +561,7 @@ async function askStream() {
         setBusy(false, flags.length ? flags.join(" · ") : "OK");
       },
       error => {
-        if (assistant && assistant.bubbleText) assistant.bubbleText.textContent = `Ошибка: ${error.message}`;
+        if (assistant && assistant.bubbleText) assistant.bubbleText.innerHTML = escapeHtml(`Ошибка: ${error.message}`).replace(/\n/g, '<br>');
         setBusy(false, "Ошибка");
       },
       data => {
@@ -429,7 +575,7 @@ async function askStream() {
       }
     );
   } catch (e) {
-    if (assistant && assistant.bubbleText) assistant.bubbleText.textContent = `Ошибка: ${e.message}`;
+    if (assistant && assistant.bubbleText) assistant.bubbleText.innerHTML = escapeHtml(`Ошибка: ${e.message}`).replace(/\n/g, '<br>');
     setBusy(false, "Ошибка");
   }
 }
@@ -478,6 +624,13 @@ async function loadDocuments() {
 const refreshBtn = document.getElementById("refresh_docs");
 if (refreshBtn) refreshBtn.addEventListener("click", () => {
   docsState.offset = 0;
+  loadDocuments();
+});
+
+const applyFilesFiltersBtn = document.getElementById("apply_files_filters");
+if (applyFilesFiltersBtn) applyFilesFiltersBtn.addEventListener("click", () => {
+  docsState.offset = 0;
+  docsState.items = [];
   loadDocuments();
 });
 
@@ -552,6 +705,7 @@ const docIdEl = document.getElementById("doc_id");
 if (docIdEl) docIdEl.value = randId();
 docsState.offset = 0;
 loadDocuments();
+loadCollections();
 
 // Auto-refresh document list every 30 seconds
 setInterval(() => {

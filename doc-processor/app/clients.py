@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import logging
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -16,7 +17,8 @@ class StorageClient:
 
     async def get_metadata(self, *, doc_id: str) -> dict[str, Any] | None:
         async with httpx.AsyncClient(timeout=self._timeout_s) as client:
-            r = await client.get(f"{self._base_url}/v1/documents/{doc_id}/metadata")
+            # Use query param to avoid FastAPI path parsing issues with colons
+            r = await client.get(f"{self._base_url}/v1/documents/by-id/metadata", params={"doc_id": doc_id})
             if r.status_code == 404:
                 return None
             r.raise_for_status()
@@ -24,10 +26,22 @@ class StorageClient:
 
     async def get_file(self, *, doc_id: str) -> tuple[bytes, str | None]:
         async with httpx.AsyncClient(timeout=self._timeout_s) as client:
-            r = await client.get(f"{self._base_url}/v1/documents/{doc_id}")
+            r = await client.get(f"{self._base_url}/v1/documents/by-id", params={"doc_id": doc_id})
             r.raise_for_status()
             ct = r.headers.get("content-type")
             return (r.content, ct)
+
+    async def patch_extra(self, *, doc_id: str, patch: dict[str, Any]) -> dict[str, Any]:
+        async with httpx.AsyncClient(timeout=self._timeout_s) as client:
+            r = await client.post(f"{self._base_url}/v1/documents/by-id/extra", json={"doc_id": doc_id, "patch": patch})
+            r.raise_for_status()
+            return r.json()
+
+    async def delete_document(self, *, doc_id: str) -> dict[str, Any]:
+        async with httpx.AsyncClient(timeout=self._timeout_s) as client:
+            r = await client.delete(f"{self._base_url}/v1/documents/by-id", params={"doc_id": doc_id})
+            r.raise_for_status()
+            return r.json()
 
 
 class RetrievalClient:
@@ -38,6 +52,12 @@ class RetrievalClient:
     async def index_upsert(self, *, payload: dict[str, Any]) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=self._timeout_s) as client:
             r = await client.post(f"{self._base_url}/v1/index/upsert", json=payload)
+            r.raise_for_status()
+            return r.json()
+
+    async def index_delete(self, *, payload: dict[str, Any]) -> dict[str, Any]:
+        async with httpx.AsyncClient(timeout=self._timeout_s) as client:
+            r = await client.post(f"{self._base_url}/v1/index/delete", json=payload)
             r.raise_for_status()
             return r.json()
 

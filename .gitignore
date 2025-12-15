@@ -205,3 +205,24 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+        .env.bak.20251215_091743
+        .env.bak.fixfmt.20251215_091808
+        COMPARISON_AND_IMPROVEMENTS.md
+        DATAFLOW.md
+        Makefile
+        R2R/
+        TZ.txt
+        _ui_index_from_container.html
+        agent_service_rag.md
+        current_agent.md
+        data/
+        docker-compose.e2e.yml
+        docs/
+        monitoring/
+        out/
+        pipeline-tests/
+        run_dataset_evals.sh
+        run_t2_ragbench.sh
+        test/
+        test2/
+        upload_repo_docs.py

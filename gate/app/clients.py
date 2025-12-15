@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 from typing import Any, AsyncIterator, Literal
+from urllib.parse import quote
 
 import httpx
 
@@ -182,7 +183,9 @@ class DocumentStorageClient:
 
     async def get_metadata(self, doc_id: str) -> dict[str, Any] | None:
         async with httpx.AsyncClient(timeout=self._timeout_s) as client:
-            r = await client.get(f"{self._base_url}/v1/documents/{doc_id}/metadata")
+            # Use query param to avoid FastAPI path parsing issues with colons
+            did = quote(str(doc_id), safe="")
+            r = await client.get(f"{self._base_url}/v1/documents/by-id/metadata", params={"doc_id": doc_id})
             if r.status_code == 404:
                 return None
             r.raise_for_status()
@@ -190,7 +193,13 @@ class DocumentStorageClient:
 
     async def delete_document(self, *, doc_id: str) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=self._timeout_s) as client:
-            r = await client.delete(f"{self._base_url}/v1/documents/{doc_id}")
+            r = await client.delete(f"{self._base_url}/v1/documents/by-id", params={"doc_id": doc_id})
+            r.raise_for_status()
+            return r.json()
+
+    async def patch_extra(self, *, doc_id: str, patch: dict[str, Any]) -> dict[str, Any]:
+        async with httpx.AsyncClient(timeout=self._timeout_s) as client:
+            r = await client.post(f"{self._base_url}/v1/documents/by-id/extra", json={"doc_id": doc_id, "patch": patch})
             r.raise_for_status()
             return r.json()
 
@@ -202,6 +211,7 @@ class DocumentStorageClient:
         lang: str | None = None,
         tenant_id: str | None = None,
         project_id: str | None = None,
+        project_ids: list[str] | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> dict[str, Any]:
@@ -216,9 +226,20 @@ class DocumentStorageClient:
             payload["tenant_id"] = tenant_id
         if project_id:
             payload["project_id"] = project_id
+        if project_ids:
+            payload["project_ids"] = project_ids
 
         async with httpx.AsyncClient(timeout=self._timeout_s) as client:
             r = await client.post(f"{self._base_url}/v1/documents/search", json=payload)
+            r.raise_for_status()
+            return r.json()
+
+    async def list_collections(self, *, tenant_id: str | None = None, limit: int = 1000) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": limit}
+        if tenant_id:
+            params["tenant_id"] = tenant_id
+        async with httpx.AsyncClient(timeout=self._timeout_s) as client:
+            r = await client.get(f"{self._base_url}/v1/collections", params=params)
             r.raise_for_status()
             return r.json()
 

@@ -69,15 +69,15 @@
       .app-main {
         flex: 1;
         min-height: 0;
-        padding: 18px;
+        padding: 20px;
       }
       .card {
         background: var(--bg-card);
         border: 1px solid var(--border-color);
-        border-radius: 16px;
-        padding: 24px;
+        border-radius: 20px;
+        padding: 28px;
         backdrop-filter: blur(10px);
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
       }
       h1 {
         font-size: 24px;
@@ -248,6 +248,21 @@
         color: var(--accent);
         border: 1px solid rgba(59, 130, 246, 0.3);
       }
+      .badge.queued {
+        background: rgba(245, 158, 11, 0.2);
+        color: var(--warning);
+        border: 1px solid rgba(245, 158, 11, 0.3);
+      }
+      .badge.processing {
+        background: rgba(59, 130, 246, 0.2);
+        color: var(--accent);
+        border: 1px solid rgba(59, 130, 246, 0.3);
+      }
+      .badge.failed {
+        background: rgba(239, 68, 68, 0.2);
+        color: var(--error);
+        border: 1px solid rgba(239, 68, 68, 0.3);
+      }
       .badge.not-indexed {
         background: rgba(148, 163, 184, 0.2);
         color: var(--text-secondary);
@@ -334,10 +349,11 @@
       }
 
       .hint {
-        font-size: 12px;
+        font-size: 13px;
         color: var(--text-secondary);
         margin-top: 8px;
-        opacity: 0.85;
+        opacity: 0.75;
+        font-style: italic;
       }
 
       /* Chat app layout */
@@ -345,41 +361,150 @@
         height: 100%;
         display: flex;
         flex-direction: column;
+        gap: 16px;
+      }
+      .chat-header {
+        display: flex;
+        flex-direction: column;
         gap: 12px;
+        padding-bottom: 12px;
+        border-bottom: 1px solid var(--border-color);
+      }
+      .chat-header-label {
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--text-primary);
+      }
+      .chat-collections-select {
+        width: 100%;
+        padding: 10px;
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        background: rgba(15, 23, 42, 0.6);
+        color: var(--text-primary);
+        font-size: 14px;
+        font-family: inherit;
+        transition: border-color 0.2s, background 0.2s;
+      }
+      .chat-collections-select:focus {
+        outline: none;
+        border-color: var(--accent);
+        background: rgba(15, 23, 42, 0.8);
       }
       .messages {
         flex: 1;
         min-height: 0;
         overflow-y: auto;
-        padding: 10px 4px 14px;
+        padding: 16px 8px;
         display: flex;
         flex-direction: column;
-        gap: 10px;
+        gap: 16px;
+      }
+      .messages::-webkit-scrollbar {
+        width: 8px;
+      }
+      .messages::-webkit-scrollbar-track {
+        background: rgba(15, 23, 42, 0.3);
+        border-radius: 4px;
+      }
+      .messages::-webkit-scrollbar-thumb {
+        background: rgba(148, 163, 184, 0.4);
+        border-radius: 4px;
+      }
+      .messages::-webkit-scrollbar-thumb:hover {
+        background: rgba(148, 163, 184, 0.6);
       }
       .msg {
         display: flex;
-        gap: 10px;
+        gap: 12px;
+        align-items: flex-start;
       }
       .msg.user { justify-content: flex-end; }
       .msg.assistant { justify-content: flex-start; }
       .bubble {
-        max-width: min(880px, 92vw);
+        max-width: min(900px, 95vw);
         border: 1px solid var(--border-color);
-        background: rgba(15, 23, 42, 0.55);
-        border-radius: 14px;
-        padding: 12px 14px;
+        background: rgba(15, 23, 42, 0.65);
+        border-radius: 16px;
+        padding: 16px 18px;
         display: flex;
         flex-direction: column;
-        gap: 10px;
+        gap: 12px;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+        transition: box-shadow 0.2s;
+      }
+      .bubble:hover {
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
       }
       .bubble-text {
         white-space: pre-wrap;
         word-break: break-word;
-        line-height: 1.55;
+        line-height: 1.7;
+        font-size: 15px;
+      }
+      .bubble-text code {
+        background: rgba(0, 0, 0, 0.4);
+        padding: 3px 7px;
+        border-radius: 5px;
+        font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Roboto Mono', 'Source Code Pro', 'Courier New', monospace;
+        font-size: 0.9em;
+        color: #fbbf24;
+        border: 1px solid rgba(251, 191, 36, 0.2);
+        font-weight: 500;
+      }
+      .bubble-text pre {
+        background: rgba(0, 0, 0, 0.5);
+        border: 1px solid rgba(148, 163, 184, 0.3);
+        border-radius: 10px;
+        padding: 18px 20px;
+        margin: 16px 0;
+        overflow-x: auto;
+        font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Roboto Mono', 'Source Code Pro', 'Courier New', monospace;
+        font-size: 13.5px;
+        line-height: 1.65;
+        white-space: pre;
+        word-break: normal;
+        box-shadow: inset 0 2px 10px rgba(0, 0, 0, 0.4), 0 1px 3px rgba(0, 0, 0, 0.2);
+        position: relative;
+      }
+      .bubble-text pre code {
+        background: none;
+        padding: 0;
+        border: none;
+        color: #e2e8f0;
+        font-size: inherit;
+        font-weight: normal;
+        display: block;
+      }
+      .bubble-text pre[data-lang]::before {
+        content: attr(data-lang);
+        position: absolute;
+        top: 8px;
+        right: 12px;
+        font-size: 11px;
+        color: var(--text-secondary);
+        opacity: 0.6;
+        text-transform: uppercase;
+        font-weight: 600;
+        letter-spacing: 0.5px;
+      }
+      .bubble-text pre::-webkit-scrollbar {
+        height: 8px;
+      }
+      .bubble-text pre::-webkit-scrollbar-track {
+        background: rgba(15, 23, 42, 0.3);
+        border-radius: 4px;
+      }
+      .bubble-text pre::-webkit-scrollbar-thumb {
+        background: rgba(148, 163, 184, 0.4);
+        border-radius: 4px;
+      }
+      .bubble-text pre::-webkit-scrollbar-thumb:hover {
+        background: rgba(148, 163, 184, 0.6);
       }
       .msg.user .bubble {
-        background: rgba(59, 130, 246, 0.18);
-        border-color: rgba(59, 130, 246, 0.35);
+        background: linear-gradient(135deg, rgba(59, 130, 246, 0.22), rgba(59, 130, 246, 0.16));
+        border-color: rgba(59, 130, 246, 0.4);
       }
       .bubble-meta {
         display: flex;
@@ -389,26 +514,38 @@
       details {
         border: 1px solid var(--border-color);
         border-radius: 12px;
-        padding: 10px 12px;
-        background: rgba(15, 23, 42, 0.35);
+        padding: 12px 14px;
+        background: rgba(15, 23, 42, 0.4);
+        transition: background 0.2s;
+      }
+      details:hover {
+        background: rgba(15, 23, 42, 0.5);
       }
       details > summary {
         cursor: pointer;
         color: var(--text-secondary);
         font-weight: 600;
+        font-size: 14px;
+        user-select: none;
+      }
+      details > summary:hover {
+        color: var(--text-primary);
       }
       .composer {
         display: grid;
         grid-template-columns: 1fr auto;
-        gap: 10px;
+        gap: 12px;
         align-items: end;
-        padding-top: 10px;
+        padding-top: 16px;
         border-top: 1px solid var(--border-color);
       }
       .composer textarea {
-        min-height: 44px;
-        max-height: 180px;
+        min-height: 52px;
+        max-height: 200px;
         resize: none;
+        padding: 14px 16px;
+        font-size: 15px;
+        line-height: 1.5;
       }
       .composer-actions {
         display: flex;
@@ -420,6 +557,12 @@
         font-size: 12px;
         color: var(--text-secondary);
         min-height: 16px;
+      }
+      .composer-status.success {
+        color: var(--success);
+      }
+      .composer-status.error {
+        color: var(--error);
       }
 
       /* Files tab layout */
@@ -454,6 +597,14 @@
         <section class="tab-content active" id="tab_chat" data-tab="chat">
           <div class="card" style="height: calc(100vh - 36px - 58px);">
             <div class="chat-shell">
+              <div class="chat-header">
+                <div>
+                  <label for="chat_collections" class="chat-header-label">Коллекции (опционально)</label>
+                  <select id="chat_collections" multiple class="chat-collections-select" style="height: 100px;"></select>
+                  <div class="hint" style="margin-top: 8px;">Если не выбрано — поиск по всем данным</div>
+                </div>
+              </div>
+
               <div id="messages" class="messages" aria-label="Сообщения"></div>
 
               <div class="composer" aria-label="Ввод сообщения">
@@ -463,7 +614,7 @@
                   <div class="hint">Подсказка: Ctrl/⌘+Enter — тоже отправляет</div>
                 </div>
                 <div class="composer-actions">
-                  <button id="ask_stream" type="button">
+                  <button id="ask_stream" type="button" style="padding: 14px 28px; font-size: 15px;">
                     <span id="ask_stream_spinner" class="loading" style="display:none;"></span>
                     <span id="ask_stream_label">Отправить</span>
                   </button>
@@ -521,6 +672,15 @@
                 </div>
               </div>
 
+              <div class="grid-2">
+                <div>
+                  <label for="upload_collection">Коллекция</label>
+                  <input id="upload_collection" type="text" placeholder="например: itmo" list="collections_datalist" />
+                  <datalist id="collections_datalist"></datalist>
+                </div>
+                <div></div>
+              </div>
+
               <div style="margin-top: 20px;">
                 <button id="upload" type="button">Загрузить</button>
                 <span class="status" id="upload_status"></span>
@@ -538,6 +698,15 @@
                   <button id="refresh_docs" class="btn-secondary" type="button">Обновить</button>
                 </div>
               </div>
+              <div style="display:flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 14px;">
+                <div style="min-width: 280px; flex: 1;">
+                  <label for="files_collections">Коллекции (фильтр)</label>
+                  <select id="files_collections" multiple style="height: 84px;"></select>
+                </div>
+                <div>
+                  <button id="apply_files_filters" class="btn-secondary" type="button">Применить фильтр</button>
+                </div>
+              </div>
               <div id="doc_list" class="doc-list">
                 <div style="color: var(--text-secondary); text-align: center; padding: 40px;">
                   Загрузка...
@@ -548,6 +717,6 @@
         </section>
       </main>
     </div>
-    <script src="main.js?v=20251215-1"></script>
+    <script src="main.js?v=20251215-collections-3"></script>
   </body>
 </html>

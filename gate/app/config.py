@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     doc_processor_url: AnyHttpUrl | None = Field(default=None)
     doc_processor_timeout_s: float = 300.0
 
+    # Async ingestion (RabbitMQ)
+    rabbit_url: str | None = Field(default=None)
+    rabbit_queue: str = "ingestion.tasks"
+
     # LLM
     llm_provider: Literal["mock", "openai_compat"] = "openai_compat"
     llm_base_url: AnyHttpUrl | None = Field(default="https://api.openai.com/v1")
@@ -41,7 +45,7 @@ class Settings(BaseSettings):
     # HTTP / UI
     cors_allow_origins: str = "*"  # for dev, can be narrowed
 
-    @field_validator("storage_url", "doc_processor_url", "llm_base_url", mode="before")
+    @field_validator("storage_url", "doc_processor_url", "llm_base_url", "rabbit_url", mode="before")
     @classmethod
     def _empty_string_to_none(cls, v):
         # Common in docker-compose env: VAR= (empty) should behave like unset.
@@ -77,6 +81,10 @@ class Settings(BaseSettings):
             "doc_processor": {
                 "url": str(self.doc_processor_url) if self.doc_processor_url else None,
                 "timeout_s": self.doc_processor_timeout_s,
+            },
+            "async_ingestion": {
+                "enabled": bool(self.rabbit_url),
+                "queue": self.rabbit_queue,
             },
         }
 

@@ -44,6 +44,8 @@ class DocumentSearchRequest(BaseModel):
     lang: str | None = None
     tenant_id: str | None = None
     project_id: str | None = None
+    # "Collections" support: allow selecting multiple project_ids at query time.
+    project_ids: list[str] = Field(default_factory=list)
     date_range: dict[str, datetime] | None = None  # {"from": ..., "to": ...}
     limit: int = 100
     offset: int = 0
@@ -54,4 +56,19 @@ class DocumentSearchResponse(BaseModel):
     documents: list[DocumentMetadata] = Field(default_factory=list)
     total: int = 0
     error: str | None = None
+
+
+class PatchExtraRequest(BaseModel):
+    """
+    Patch (merge) the `extra` JSON field for a document.
+    Top-level keys in `patch` overwrite existing keys.
+    """
+
+    patch: dict[str, Any] = Field(default_factory=dict)
+
+
+class PatchExtraByIdRequest(BaseModel):
+    """Request body for /by-id/extra endpoint (doc_id in body to avoid query param issues)."""
+    doc_id: str
+    patch: dict[str, Any] = Field(default_factory=dict)
 

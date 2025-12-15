@@ -21,6 +21,23 @@ logger = logging.getLogger("rag.search")
 tracer = trace.get_tracer("rag.search")
 
 
+def _normalize_project_ids(filters: SearchFilters) -> list[str]:
+    ids: list[str] = []
+    if filters.project_id:
+        ids.append(filters.project_id)
+    if filters.project_ids:
+        ids.extend([x for x in filters.project_ids if x])
+    # de-dup while preserving order
+    seen: set[str] = set()
+    out: list[str] = []
+    for x in ids:
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
+
+
 def _os_filters(filters: SearchFilters | None, acl: list[str]) -> list[dict[str, Any]]:
     f: list[dict[str, Any]] = []
     if filters is None:
@@ -31,8 +48,12 @@ def _os_filters(filters: SearchFilters | None, acl: list[str]) -> list[dict[str,
         f.append({"term": {"lang": filters.lang}})
     if filters.tenant_id:
         f.append({"term": {"tenant_id": filters.tenant_id}})
-    if filters.project_id:
-        f.append({"term": {"project_id": filters.project_id}})
+    proj_ids = _normalize_project_ids(filters)
+    if proj_ids:
+        if len(proj_ids) == 1:
+            f.append({"term": {"project_id": proj_ids[0]}})
+        else:
+            f.append({"terms": {"project_id": proj_ids}})
     if filters.doc_ids:
         f.append({"terms": {"doc_id": filters.doc_ids}})
     if filters.tags:
@@ -52,8 +73,12 @@ def _qdrant_filter(filters: SearchFilters | None, acl: list[str]) -> qm.Filter |
         must.append(qm.FieldCondition(key="lang", match=qm.MatchValue(value=filters.lang)))
     if filters.tenant_id:
         must.append(qm.FieldCondition(key="tenant_id", match=qm.MatchValue(value=filters.tenant_id)))
-    if filters.project_id:
-        must.append(qm.FieldCondition(key="project_id", match=qm.MatchValue(value=filters.project_id)))
+    proj_ids = _normalize_project_ids(filters)
+    if proj_ids:
+        if len(proj_ids) == 1:
+            must.append(qm.FieldCondition(key="project_id", match=qm.MatchValue(value=proj_ids[0])))
+        else:
+            must.append(qm.FieldCondition(key="project_id", match=qm.MatchAny(any=proj_ids)))
     if filters.doc_ids:
         must.append(qm.FieldCondition(key="doc_id", match=qm.MatchAny(any=filters.doc_ids)))
     if filters.tags:

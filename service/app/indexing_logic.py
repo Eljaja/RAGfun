@@ -166,7 +166,15 @@ async def upsert(
                     bulk = await asyncio.to_thread(os_client.bulk_upsert, docs, req.refresh)
                     if bulk.get("errors"):
                         partial = True
-                        errors.append({"stage": "opensearch", "bulk_errors": True})
+                        bulk_errors = []
+                        for item in bulk.get("items", []):
+                            for op_type, op_data in item.items():
+                                if "error" in op_data:
+                                    bulk_errors.append({"op": op_type, "error": op_data["error"]})
+                        logger.error("opensearch_bulk_errors", extra={"errors": bulk_errors, "doc_ids": list(set(c.doc_id for c in chunks))})
+                        errors.append({"stage": "opensearch", "bulk_errors": bulk_errors})
+                    else:
+                        logger.info("opensearch_bulk_success", extra={"docs_count": len(docs), "doc_ids": list(set(c.doc_id for c in chunks))})
                 except Exception as e:
                     ERRS.labels("os_upsert", type(e).__name__).inc()
                     partial = True

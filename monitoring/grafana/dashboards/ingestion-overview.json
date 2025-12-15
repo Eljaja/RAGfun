@@ -1,0 +1,102 @@
+{
+  "uid": "ingestion-overview",
+  "title": "Ingestion Overview (RabbitMQ)",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "tags": ["rag", "ingestion", "rabbitmq", "prometheus"],
+  "time": { "from": "now-1h", "to": "now" },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Tasks published (rag-gate) — rate",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(gate_ingestion_tasks_published_total[1m])) by (type, status)",
+          "legendFormat": "{{type}}/{{status}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Tasks consumed (ingestion-worker) — rate",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(ingestion_tasks_consumed_total[1m])) by (type, status)",
+          "legendFormat": "{{type}}/{{status}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Inflight tasks (current)",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(ingestion_tasks_inflight) by (type)",
+          "legendFormat": "{{type}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Retries / Failures — rate",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(ingestion_tasks_retried_total[5m])) by (type)",
+          "legendFormat": "retry {{type}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(ingestion_tasks_failed_total[5m])) by (type)",
+          "legendFormat": "fail {{type}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Task duration p95 (by type+stage)",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum(rate(ingestion_task_duration_seconds_bucket[5m])) by (le, type, stage))",
+          "legendFormat": "{{type}}/{{stage}}"
+        }
+      ]
+    }
+  ]
+}
+
+

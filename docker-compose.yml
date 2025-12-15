@@ -38,6 +38,9 @@ services:
   qdrant:
     image: qdrant/qdrant:latest
     container_name: qdrant
+    environment:
+      # Reduce noisy per-request access logs from actix_web middleware logger.
+      - RUST_LOG=warn,actix_web=warn
     ports:
       - "6333:6333"
       - "6334:6334"
@@ -78,6 +81,24 @@ services:
       retries: 5
       start_period: 10s
 
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      - RABBITMQ_DEFAULT_USER=${RABBITMQ_DEFAULT_USER:-guest}
+      - RABBITMQ_DEFAULT_PASS=${RABBITMQ_DEFAULT_PASS:-guest}
+    networks:
+      - rag-network
+    healthcheck:
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
   infinity-embed:
     image: michaelf34/infinity:latest
     container_name: infinity-embed
@@ -107,8 +128,8 @@ services:
       - RAG_RERANK_URL=http://infinity-rerank:7998/rerank
       - RAG_RERANK_MODEL=BAAI/bge-reranker-v2-m3
       - RAG_LOG_LEVEL=INFO
-      # - RAG_ENABLE_PAGE_DEDUPLICATION=true
-      # - RAG_ENABLE_PARENT_PAGE_RETRIEVAL=true
+      - RAG_ENABLE_PAGE_DEDUPLICATION=true
+      - RAG_ENABLE_PARENT_PAGE_RETRIEVAL=true
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -187,6 +208,34 @@ services:
     networks:
       - rag-network
 
+  ingestion-worker:
+    build:
+      context: ./doc-processor
+    command: ["python", "-m", "app.worker"]
+    environment:
+      - WORKER_RABBIT_URL=amqp://${RABBITMQ_DEFAULT_USER:-guest}:${RABBITMQ_DEFAULT_PASS:-guest}@rabbitmq:5672/
+      - WORKER_QUEUE=ingestion.tasks
+      - WORKER_RETRY_QUEUE=ingestion.tasks.retry
+      - WORKER_DLQ_QUEUE=ingestion.tasks.dlq
+      - WORKER_MAX_ATTEMPTS=5
+      - WORKER_PREFETCH=5
+      - WORKER_METRICS_PORT=8083
+      - WORKER_STORAGE_URL=http://document-storage:8081
+      - WORKER_RETRIEVAL_URL=http://retrieval:8080
+      - WORKER_DOC_PROCESSOR_URL=http://doc-processor:8082
+      - WORKER_LOG_LEVEL=INFO
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      document-storage:
+        condition: service_started
+      retrieval:
+        condition: service_started
+      doc-processor:
+        condition: service_started
+    networks:
+      - rag-network
+
   # RAG LLM gate (calls retrieval + LLM)
   rag-gate:
     build:
@@ -206,6 +255,9 @@ services:
       # Document Processor
       - GATE_DOC_PROCESSOR_URL=http://doc-processor:8082
       - GATE_DOC_PROCESSOR_TIMEOUT_S=300
+      # Async ingestion queue
+      - GATE_RABBIT_URL=amqp://${RABBITMQ_DEFAULT_USER:-guest}:${RABBITMQ_DEFAULT_PASS:-guest}@rabbitmq:5672/
+      - GATE_RABBIT_QUEUE=ingestion.tasks
       # LLM (OpenAI-compatible). Keep mock as default to avoid requiring a key by default.
       - GATE_LLM_PROVIDER=${GATE_LLM_PROVIDER:-openai_compat}
       - GATE_LLM_BASE_URL=${GATE_LLM_BASE_URL:-https://inference.asicloud.cudos.org/v1}
@@ -217,6 +269,8 @@ services:
         condition: service_started
       document-storage:
         condition: service_started
+      rabbitmq:
+        condition: service_healthy
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:

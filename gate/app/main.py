@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
+import uuid
 from contextlib import asynccontextmanager
 
 import httpx
@@ -17,12 +19,16 @@ from app.config import Settings, load_settings
 from app.html_text import html_to_text
 from app.logging_setup import setup_json_logging
 from app.models import ChatRequest, ChatResponse, ContextChunk, Source
+from app.queue import RabbitPublisher
 from app.rag import build_context_blocks, build_messages
 
 logger = logging.getLogger("gate")
 
 REQS = Counter("gate_requests_total", "Requests", ["endpoint", "status"])
 LAT = Histogram("gate_latency_seconds", "Latency", ["stage"])
+
+ING_PUB = Counter("gate_ingestion_tasks_published_total", "Ingestion tasks published", ["type", "status"])
+ING_PUB_LAT = Histogram("gate_ingestion_publish_latency_seconds", "Publish latency", ["type"])
 
 
 _CIT_RE = re.compile(r"\[\d+\]")
@@ -54,6 +60,7 @@ class AppState:
     llm: LLMClient | None = None
     storage: DocumentStorageClient | None = None
     doc_processor: DocProcessorClient | None = None
+    publisher: RabbitPublisher | None = None
 
 
 state = AppState()
@@ -86,7 +93,17 @@ async def lifespan(app: FastAPI):
             base_url=str(state.settings.doc_processor_url),
             timeout_s=state.settings.doc_processor_timeout_s,
         )
+    if state.settings.rabbit_url:
+        state.publisher = RabbitPublisher(url=str(state.settings.rabbit_url), queue_name=state.settings.rabbit_queue)
+        try:
+            await state.publisher.start()
+        except Exception as e:
+            # Degrade gracefully: still allow sync indexing path.
+            logger.error("rabbit_publisher_init_failed", extra={"extra": {"error": str(e)}})
+            state.publisher = None
     yield
+    if state.publisher:
+        await state.publisher.close()
 
 
 app = FastAPI(title="RAG Gate", version="0.1.0", lifespan=lifespan)
@@ -215,6 +232,7 @@ async def chat(payload: ChatRequest):
 
 @app.post("/v1/documents/upload")
 async def upload_document(
+    response: Response,
     file: UploadFile = File(...),
     doc_id: str = Form(...),
     title: str | None = Form(None),
@@ -258,6 +276,7 @@ async def upload_document(
 
     # Step 1: Store in document-storage if available
     storage_result = None
+    storage_ok = False
     if state.storage:
         try:
             with LAT.labels("storage_store").time():
@@ -276,6 +295,7 @@ async def upload_document(
                     project_id=project_id,
                 )
             logger.info("document_stored", extra={"extra": {"doc_id": doc_id, "storage_id": storage_result.get("storage_id")}})
+            storage_ok = True
         except httpx.TimeoutException as e:
             logger.warning("storage_store_timeout", extra={"extra": {"doc_id": doc_id, "error": str(e)}})
             # Continue with indexing even if storage fails
@@ -301,20 +321,75 @@ async def upload_document(
         "project_id": project_id,
     }
 
+    def _legacy_extract_text(*, raw_bytes: bytes) -> str:
+        decoded = raw_bytes.decode("utf-8", errors="replace")
+        ct = (file.content_type or "").split(";")[0].strip().lower()
+        name = (file.filename or "").lower()
+        if ct in {"text/html", "application/xhtml+xml"} or name.endswith(".html") or name.endswith(".htm") or name.endswith(".xhtml"):
+            text = html_to_text(decoded)
+        else:
+            text = decoded
+        return text.strip()
+
     try:
-        if state.doc_processor and state.storage:
-            with LAT.labels("doc_process").time():
-                r = await state.doc_processor.process(payload={"document": doc_meta, "refresh": bool(refresh)})
+        # Async ingestion path: store first, enqueue, return immediately.
+        if state.publisher and state.storage and storage_ok:
+            task_id = str(uuid.uuid4())
+            now = time.time()
+            try:
+                # Mark queued in storage metadata (best-effort)
+                await state.storage.patch_extra(
+                    doc_id=doc_id,
+                    patch={
+                        "ingestion": {
+                            "state": "queued",
+                            "type": "index",
+                            "task_id": task_id,
+                            "doc_id": doc_id,
+                            "queued_at": now,
+                            "updated_at": now,
+                            "attempt": 0,
+                        }
+                    },
+                )
+            except Exception as e:
+                logger.warning("ingestion_patch_queued_failed", extra={"extra": {"doc_id": doc_id, "error": str(e)}})
+
+            payload = {
+                "task_id": task_id,
+                "type": "index",
+                "doc_id": doc_id,
+                "document": doc_meta,
+                "refresh": bool(refresh),
+                "attempt": 0,
+                "queued_at": now,
+            }
+            with ING_PUB_LAT.labels("index").time():
+                try:
+                    await state.publisher.publish(payload=payload)
+                    ING_PUB.labels(type="index", status="ok").inc()
+                except Exception as e:
+                    ING_PUB.labels(type="index", status="error").inc()
+                    logger.error("ingestion_publish_failed", extra={"extra": {"doc_id": doc_id, "error": str(e)}})
+                    REQS.labels(endpoint="/v1/documents/upload", status="502").inc()
+                    return {"ok": False, "error": "ingestion_enqueue_failed", "detail": str(e), "storage": storage_result}
+
+            REQS.labels(endpoint="/v1/documents/upload", status="202").inc()
+            response.status_code = 202
+            return {
+                "ok": True,
+                "accepted": True,
+                "task_id": task_id,
+                "doc_id": doc_id,
+                "storage": storage_result,
+                "filename": file.filename,
+                "bytes": len(raw),
+            }
         else:
             # Legacy path: decode bytes as UTF-8 and index as one document text.
-            decoded = raw.decode("utf-8", errors="replace")
-            ct = (file.content_type or "").split(";")[0].strip().lower()
-            name = (file.filename or "").lower()
-            if ct in {"text/html", "application/xhtml+xml"} or name.endswith(".html") or name.endswith(".htm") or name.endswith(".xhtml"):
-                text = html_to_text(decoded)
-            else:
-                text = decoded
-            text = text.strip()
+            # If doc-processor is configured but storage didn't confirm the upload, we cannot use doc-processor
+            # (it pulls bytes from storage). Fall back to direct indexing.
+            text = _legacy_extract_text(raw_bytes=raw)
             if not text:
                 REQS.labels(endpoint="/v1/documents/upload", status="400").inc()
                 logger.warning(
@@ -379,6 +454,7 @@ async def list_documents(
     source: str | None = None,
     tags: str | None = None,
     lang: str | None = None,
+    collections: str | None = None,  # comma-separated project_ids ("collections")
     limit: int = 100,
     offset: int = 0,
 ):
@@ -391,12 +467,14 @@ async def list_documents(
         return {"ok": False, "error": "storage_unavailable", "documents": [], "total": 0}
 
     tags_list = [t.strip() for t in (tags or "").split(",") if t.strip()] if tags else None
+    collection_ids = [c.strip() for c in (collections or "").split(",") if c.strip()] if collections else None
 
     try:
         result = await state.storage.search_documents(
             source=source,
             tags=tags_list,
             lang=lang,
+            project_ids=collection_ids,
             limit=limit,
             offset=offset,
         )
@@ -423,8 +501,27 @@ async def list_documents(
         return {"ok": False, "error": str(e), "documents": [], "total": 0}
 
 
-@app.delete("/v1/documents/{doc_id}")
-async def delete_document(doc_id: str):
+@app.get("/v1/collections")
+async def collections(tenant_id: str | None = None, limit: int = 1000):
+    """Proxy: list distinct collections (project_id) from document-storage."""
+    if state.config_error:
+        REQS.labels(endpoint="/v1/collections", status="503").inc()
+        return {"ok": False, "error": "config_error", "detail": state.config_error, "collections": []}
+    if not state.storage:
+        REQS.labels(endpoint="/v1/collections", status="503").inc()
+        return {"ok": False, "error": "storage_unavailable", "collections": []}
+    try:
+        r = await state.storage.list_collections(tenant_id=tenant_id, limit=limit)
+        REQS.labels(endpoint="/v1/collections", status="200").inc()
+        return r
+    except Exception as e:
+        REQS.labels(endpoint="/v1/collections", status="500").inc()
+        logger.error("collections_error", extra={"extra": {"error": str(e)}})
+        return {"ok": False, "error": str(e), "collections": []}
+
+
+@app.delete("/v1/documents/{doc_id:path}")
+async def delete_document(doc_id: str, response: Response):
     """
     Deletes document from storage (if configured) and removes its chunks from retrieval index.
     Best-effort: tries both, returns partial=true if one side fails.
@@ -435,6 +532,43 @@ async def delete_document(doc_id: str):
     if not state.retrieval:
         REQS.labels(endpoint="/v1/documents/{doc_id}", status="503").inc()
         return {"ok": False, "error": "retrieval_unavailable"}
+
+    # Async delete: enqueue and return immediately.
+    if state.publisher and state.storage:
+        task_id = str(uuid.uuid4())
+        now = time.time()
+        try:
+            await state.storage.patch_extra(
+                doc_id=doc_id,
+                patch={
+                    "ingestion": {
+                        "state": "queued",
+                        "type": "delete",
+                        "task_id": task_id,
+                        "doc_id": doc_id,
+                        "queued_at": now,
+                        "updated_at": now,
+                        "attempt": 0,
+                    }
+                },
+            )
+        except Exception:
+            # might be already deleted or not in storage; still enqueue to clear retrieval
+            pass
+
+        payload = {"task_id": task_id, "type": "delete", "doc_id": doc_id, "attempt": 0, "queued_at": now}
+        with ING_PUB_LAT.labels("delete").time():
+            try:
+                await state.publisher.publish(payload=payload)
+                ING_PUB.labels(type="delete", status="ok").inc()
+            except Exception as e:
+                ING_PUB.labels(type="delete", status="error").inc()
+                REQS.labels(endpoint="/v1/documents/{doc_id}", status="502").inc()
+                return {"ok": False, "error": "ingestion_enqueue_failed", "detail": str(e)}
+
+        REQS.labels(endpoint="/v1/documents/{doc_id}", status="202").inc()
+        response.status_code = 202
+        return {"ok": True, "accepted": True, "task_id": task_id, "doc_id": doc_id}
 
     storage_resp = None
     retrieval_resp = None
@@ -611,14 +745,14 @@ async def delete_all_documents(
     }
 
 
-@app.get("/v1/documents/{doc_id}/status")
+@app.get("/v1/documents/{doc_id:path}/status")
 async def get_document_status(doc_id: str):
     """Get document status including storage and indexing status."""
     if state.config_error:
         REQS.labels(endpoint="/v1/documents/{doc_id}/status", status="503").inc()
         return {"ok": False, "error": "config_error", "detail": state.config_error}
 
-    result = {"doc_id": doc_id, "stored": False, "indexed": False, "metadata": None}
+    result = {"doc_id": doc_id, "stored": False, "indexed": False, "metadata": None, "ingestion": None}
 
     # Check storage
     if state.storage:
@@ -627,6 +761,7 @@ async def get_document_status(doc_id: str):
             if meta:
                 result["stored"] = True
                 result["metadata"] = meta
+                result["ingestion"] = (meta.get("extra") or {}).get("ingestion")
         except Exception as e:
             logger.warning("get_metadata_error", extra={"extra": {"doc_id": doc_id, "error": str(e)}})
 

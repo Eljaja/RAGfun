@@ -17,6 +17,8 @@ class GateFilters(BaseModel):
     doc_ids: list[str] | None = None
     tenant_id: str | None = None
     project_id: str | None = None
+    # "Collections" support: allow selecting multiple project_ids at query time.
+    project_ids: list[str] | None = None
 
 
 class ChatRequest(BaseModel):
