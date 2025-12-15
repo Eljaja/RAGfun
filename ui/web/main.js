@@ -99,6 +99,16 @@ async function deleteDoc(doc_id) {
   return data;
 }
 
+async function deleteAllDocs() {
+  const r = await fetch(`/api/v1/documents?confirm=true`, { method: "DELETE" });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const msg = (data && (data.detail || data.error)) || `HTTP ${r.status}`;
+    throw new Error(msg);
+  }
+  return data;
+}
+
 const docsState = {
   items: [],
   total: 0,
@@ -469,6 +479,33 @@ const refreshBtn = document.getElementById("refresh_docs");
 if (refreshBtn) refreshBtn.addEventListener("click", () => {
   docsState.offset = 0;
   loadDocuments();
+});
+
+const deleteAllBtn = document.getElementById("delete_all_docs");
+if (deleteAllBtn) deleteAllBtn.addEventListener("click", async () => {
+  const ok = confirm(
+    "Удалить ВСЕ документы?\n\n" +
+      "- удалит файлы из document-storage\n" +
+      "- удалит чанки из retrieval индекса\n\n" +
+      "Операция необратима."
+  );
+  if (!ok) return;
+
+  deleteAllBtn.disabled = true;
+  try {
+    const res = await deleteAllDocs();
+    // Reset pagination and reload
+    docsState.offset = 0;
+    docsState.items = [];
+    await loadDocuments();
+    const partial = res && res.partial;
+    const deleted = (res && res.deleted) || 0;
+    alert(partial ? `Удалено: ${deleted}. Есть деградации/ошибки — см. ответ API.` : `Удалено: ${deleted}.`);
+  } catch (e) {
+    alert(`Ошибка удаления всех документов: ${e.message}`);
+  } finally {
+    deleteAllBtn.disabled = false;
+  }
 });
 
 const loadMoreBtn = document.getElementById("load_more_docs");
