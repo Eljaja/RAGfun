@@ -120,7 +120,9 @@ def _html_to_markdown_with_tables(doc: lxml_html.HtmlElement) -> str:
     parts: list[str] = []
 
     def walk(node: etree._Element) -> None:
-        tag = (getattr(node, "tag", "") or "").lower()
+        tag_obj = getattr(node, "tag", "") or ""
+        # lxml can expose non-string tag objects for some node types (e.g. comments / PIs).
+        tag = tag_obj.lower() if isinstance(tag_obj, str) else ""
 
         if tag == "table":
             md = render_table(node)
