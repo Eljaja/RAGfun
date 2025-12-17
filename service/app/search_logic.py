@@ -228,6 +228,25 @@ async def search(
     partial = False
     partial_rerank = False
 
+    # Decide rerank intent as early as possible; rerank is only applied if a client exists and we have candidates.
+    def want_rerank(*, bm25_hits: list[SearchHit], vec_hits: list[SearchHit]) -> bool:
+        if req.rerank is not None:
+            return bool(req.rerank)
+        if rerank_mode == "disabled":
+            return False
+        if rerank_mode == "always":
+            return True
+        if rerank_mode == "auto":
+            qtoks = len(req.query.split())
+            if qtoks < rerank_auto_min_query_tokens:
+                return False
+            if bm25_hits and vec_hits:
+                inter = len({h.chunk_id for h in bm25_hits}.intersection({h.chunk_id for h in vec_hits}))
+                return inter <= rerank_auto_min_intersection
+            # Even if only one backend returned hits, a cross-encoder reranker can still improve ordering.
+            return bool(bm25_hits or vec_hits)
+        return False
+
     async def do_bm25() -> tuple[list[SearchHit], dict[str, float]]:
         if os_client is None:
             raise RuntimeError("opensearch_not_configured")
@@ -321,6 +340,10 @@ async def search(
         else:
             vec_hits, vec_rank = res[1]
 
+    # If rerank is enabled, build a larger candidate pool before truncating to final top_k.
+    do_rerank = want_rerank(bm25_hits=bm25_hits, vec_hits=vec_hits) and reranker is not None
+    pre_k = max(top_k, int(rerank_max_candidates)) if do_rerank else top_k
+
     # Build fused ranks
     src_lists: dict[str, list[str]] = {}
     if bm25_hits:
@@ -329,10 +352,10 @@ async def search(
         src_lists["vector"] = [h.chunk_id for h in vec_hits]
 
     if req.mode == "bm25":
-        fused_order = [h.chunk_id for h in bm25_hits][:top_k]
+        fused_order = [h.chunk_id for h in bm25_hits][:pre_k]
         fused_scores = {h.chunk_id: h.score for h in bm25_hits}
     elif req.mode == "vector":
-        fused_order = [h.chunk_id for h in vec_hits][:top_k]
+        fused_order = [h.chunk_id for h in vec_hits][:pre_k]
         fused_scores = {h.chunk_id: h.score for h in vec_hits}
     else:
         with tracer.start_as_current_span("fusion"):
@@ -348,7 +371,7 @@ async def search(
                     rrf_k=rrf_k,
                     alpha=fusion_alpha,
                 )
-        fused_order = sorted(fused_scores.keys(), key=lambda cid: fused_scores[cid], reverse=True)[:top_k]
+        fused_order = sorted(fused_scores.keys(), key=lambda cid: fused_scores[cid], reverse=True)[:pre_k]
 
     # Merge payloads: prefer OS for highlight, fallback to Qdrant
     by_id: dict[str, SearchHit] = {}
@@ -371,25 +394,7 @@ async def search(
         out.append(h)
 
     # Optional rerank
-    def want_rerank() -> bool:
-        if req.rerank is not None:
-            return bool(req.rerank)
-        if rerank_mode == "disabled":
-            return False
-        if rerank_mode == "always":
-            return True
-        if rerank_mode == "auto":
-            qtoks = len(req.query.split())
-            if qtoks < rerank_auto_min_query_tokens:
-                return False
-            if bm25_hits and vec_hits:
-                inter = len({h.chunk_id for h in bm25_hits}.intersection({h.chunk_id for h in vec_hits}))
-                return inter <= rerank_auto_min_intersection
-            # if only one backend returned results, rerank usually doesn't help
-            return False
-        return False
-
-    if want_rerank() and reranker is not None and out:
+    if do_rerank and out:
         with tracer.start_as_current_span("rerank"):
             with LAT.labels("rerank").time():
                 try:
@@ -414,7 +419,7 @@ async def search(
                 except Exception as e:
                     ERRS.labels("rerank", type(e).__name__).inc()
                     partial_rerank = True
-    elif want_rerank() and reranker is None:
+    elif want_rerank(bm25_hits=bm25_hits, vec_hits=vec_hits) and reranker is None:
         # configured request wants rerank but no client available
         partial_rerank = True
 
@@ -450,6 +455,10 @@ async def search(
     # grouping per doc if requested
     if req.group_by_doc:
         out = _group_by_doc(out, max_per_doc)
+
+    # Final truncate (after rerank and grouping/dedup improvements).
+    if len(out) > top_k:
+        out = out[:top_k]
 
     with tracer.start_as_current_span("assemble_response"):
         # sources

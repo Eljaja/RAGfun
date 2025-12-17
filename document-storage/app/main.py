@@ -6,6 +6,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 
+import anyio
 from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -19,6 +20,9 @@ from app.observability import TraceContextFilter, setup_json_logging
 from app.storage import StorageBackend, create_storage_backend
 
 logger = logging.getLogger("storage")
+
+async def _run_sync(fn, *args, **kwargs):
+    return await anyio.to_thread.run_sync(lambda: fn(*args, **kwargs))
 
 
 class AppState:
@@ -85,13 +89,15 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 @app.middleware("http")
 async def access_log(request: Request, call_next):
     start = time.time()
+    response: Response | None = None
     try:
         response = await call_next(request)
         return response
     finally:
         dur_ms = (time.time() - start) * 1000.0
+        status = response.status_code if response is not None else 500
         # Don't log DELETE requests that return 404 - documents may already be deleted
-        if request.method == "DELETE" and response.status_code == 404:
+        if request.method == "DELETE" and status == 404:
             logger.debug(
                 "http_request",
                 extra={
@@ -99,7 +105,7 @@ async def access_log(request: Request, call_next):
                     "path": request.url.path,
                     "query": request.url.query,
                     "duration_ms": dur_ms,
-                    "status": response.status_code,
+                    "status": status,
                 },
             )
         else:
@@ -110,6 +116,7 @@ async def access_log(request: Request, call_next):
                     "path": request.url.path,
                     "query": request.url.query,
                     "duration_ms": dur_ms,
+                    "status": status,
                 },
             )
 
@@ -125,8 +132,12 @@ async def readyz(response: Response):
         response.status_code = 503
         return {"ready": False, "config_error": state.config_error}
 
-    db_ok = state.db is not None and state.db.health() if state.db else False
-    storage_ok = state.storage is not None and state.storage.health() if state.storage else False
+    db_ok = False
+    storage_ok = False
+    if state.db:
+        db_ok = bool(await _run_sync(state.db.health))
+    if state.storage:
+        storage_ok = bool(await _run_sync(state.storage.health))
     ready = db_ok and storage_ok
 
     if not ready:
@@ -211,11 +222,12 @@ async def store_document(
 
         # Store file
         with LAT.labels(stage="store_file").time():
-            storage_id = state.storage.store(doc_id, content, content_type)
+            storage_id = await _run_sync(state.storage.store, doc_id, content, content_type)
 
         # Store metadata
         with LAT.labels(stage="store_metadata").time():
-            doc_meta = state.db.store_metadata(
+            doc_meta = await _run_sync(
+                state.db.store_metadata,
                 doc_id=doc_id,
                 storage_id=storage_id,
                 metadata=full_metadata,
@@ -255,7 +267,7 @@ async def get_document_by_id(doc_id: str):
 
     try:
         logger.info("get_document_by_id_request", extra={"doc_id": doc_id, "doc_id_repr": repr(doc_id), "endpoint": "by-id"})
-        meta = state.db.get_metadata(doc_id)
+        meta = await _run_sync(state.db.get_metadata, doc_id)
         if not meta:
             logger.warning("get_document_by_id_not_found", extra={"doc_id": doc_id, "endpoint": "by-id"})
             REQS.labels(endpoint="/v1/documents/by-id", status="404").inc()
@@ -265,7 +277,7 @@ async def get_document_by_id(doc_id: str):
             REQS.labels(endpoint="/v1/documents/by-id", status="404").inc()
             raise HTTPException(status_code=404, detail="Storage ID not found")
 
-        content = state.storage.retrieve(meta.storage_id)
+        content = await _run_sync(state.storage.retrieve, meta.storage_id)
         if not content:
             REQS.labels(endpoint="/v1/documents/by-id", status="404").inc()
             raise HTTPException(status_code=404, detail="File not found in storage")
@@ -297,7 +309,7 @@ async def get_document(doc_id: str):
 
     try:
         # Get metadata
-        meta = state.db.get_metadata(doc_id)
+        meta = await _run_sync(state.db.get_metadata, doc_id)
         if not meta:
             REQS.labels(endpoint="/v1/documents/{doc_id}", status="404").inc()
             raise HTTPException(status_code=404, detail="Document not found")
@@ -307,7 +319,7 @@ async def get_document(doc_id: str):
             REQS.labels(endpoint="/v1/documents/{doc_id}", status="404").inc()
             raise HTTPException(status_code=404, detail="Storage ID not found")
 
-        content = state.storage.retrieve(meta.storage_id)
+        content = await _run_sync(state.storage.retrieve, meta.storage_id)
         if not content:
             REQS.labels(endpoint="/v1/documents/{doc_id}", status="404").inc()
             raise HTTPException(status_code=404, detail="File not found in storage")
@@ -337,6 +349,40 @@ async def get_document(doc_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.delete("/v1/documents/by-id")
+async def delete_document_by_id(doc_id: str):
+    """Delete document and its metadata (supports slashy doc_ids via query param)."""
+    if state.config_error:
+        REQS.labels(endpoint="/v1/documents/by-id", status="503").inc()
+        raise HTTPException(status_code=503, detail="config_error")
+
+    if not state.db or not state.storage:
+        REQS.labels(endpoint="/v1/documents/by-id", status="503").inc()
+        raise HTTPException(status_code=503, detail="service_unavailable")
+
+    try:
+        meta = await _run_sync(state.db.get_metadata, doc_id)
+        if not meta:
+            # Don't log 404 for DELETE requests - documents may already be deleted
+            logger.debug("delete_document_by_id_not_found", extra={"doc_id": doc_id})
+            REQS.labels(endpoint="/v1/documents/by-id", status="404").inc()
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        if meta.storage_id:
+            await _run_sync(state.storage.delete, meta.storage_id)
+
+        deleted = await _run_sync(state.db.delete_metadata, doc_id)
+        REQS.labels(endpoint="/v1/documents/by-id", status="200").inc()
+        return {"ok": True, "deleted": deleted}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("delete_document_by_id_error", extra={"doc_id": doc_id, "error": str(e)})
+        REQS.labels(endpoint="/v1/documents/by-id", status="500").inc()
+        ERRS.labels(stage="delete", kind="exception").inc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.delete("/v1/documents/{doc_id}")
 async def delete_document(doc_id: str):
     """Delete document and its metadata."""
@@ -350,17 +396,17 @@ async def delete_document(doc_id: str):
 
     try:
         # Get metadata to find storage_id
-        meta = state.db.get_metadata(doc_id)
+        meta = await _run_sync(state.db.get_metadata, doc_id)
         if not meta:
             REQS.labels(endpoint="/v1/documents/{doc_id}", status="404").inc()
             raise HTTPException(status_code=404, detail="Document not found")
 
         # Delete file (best effort)
         if meta.storage_id:
-            state.storage.delete(meta.storage_id)
+            await _run_sync(state.storage.delete, meta.storage_id)
 
         # Delete metadata
-        deleted = state.db.delete_metadata(doc_id)
+        deleted = await _run_sync(state.db.delete_metadata, doc_id)
 
         REQS.labels(endpoint="/v1/documents/{doc_id}", status="200").inc()
         return {"ok": True, "deleted": deleted}
@@ -370,41 +416,6 @@ async def delete_document(doc_id: str):
     except Exception as e:
         logger.error("delete_document_error", extra={"doc_id": doc_id, "error": str(e)})
         REQS.labels(endpoint="/v1/documents/{doc_id}", status="500").inc()
-        ERRS.labels(stage="delete", kind="exception").inc()
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.delete("/v1/documents/by-id")
-async def delete_document_by_id(doc_id: str):
-    """Delete document and its metadata (supports slashy doc_ids via query param)."""
-    if state.config_error:
-        REQS.labels(endpoint="/v1/documents/by-id", status="503").inc()
-        raise HTTPException(status_code=503, detail="config_error")
-
-    if not state.db or not state.storage:
-        REQS.labels(endpoint="/v1/documents/by-id", status="503").inc()
-        raise HTTPException(status_code=503, detail="service_unavailable")
-
-    try:
-        meta = state.db.get_metadata(doc_id)
-        if not meta:
-            # Don't log 404 for DELETE requests - documents may already be deleted
-            if request.method != "DELETE":
-                logger.debug("delete_document_by_id_not_found", extra={"doc_id": doc_id})
-            REQS.labels(endpoint="/v1/documents/by-id", status="404").inc()
-            raise HTTPException(status_code=404, detail="Document not found")
-
-        if meta.storage_id:
-            state.storage.delete(meta.storage_id)
-
-        deleted = state.db.delete_metadata(doc_id)
-        REQS.labels(endpoint="/v1/documents/by-id", status="200").inc()
-        return {"ok": True, "deleted": deleted}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("delete_document_by_id_error", extra={"doc_id": doc_id, "error": str(e)})
-        REQS.labels(endpoint="/v1/documents/by-id", status="500").inc()
         ERRS.labels(stage="delete", kind="exception").inc()
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -423,7 +434,7 @@ async def get_metadata_by_id(doc_id: str):
     try:
         logger.info("get_metadata_by_id_request", extra={"doc_id": doc_id, "doc_id_repr": repr(doc_id), "doc_id_len": len(doc_id)})
         # Try to find the document
-        meta = state.db.get_metadata(doc_id)
+        meta = await _run_sync(state.db.get_metadata, doc_id)
         if not meta:
             # Log what we searched for and try a few variations
             logger.warning("get_metadata_by_id_not_found", extra={"doc_id": doc_id, "doc_id_bytes": doc_id.encode('utf-8').hex()})
@@ -432,7 +443,7 @@ async def get_metadata_by_id(doc_id: str):
             decoded = urllib.parse.unquote(doc_id)
             if decoded != doc_id:
                 logger.info("get_metadata_by_id_trying_decoded", extra={"decoded": decoded})
-                meta = state.db.get_metadata(decoded)
+                meta = await _run_sync(state.db.get_metadata, decoded)
             if not meta:
                 REQS.labels(endpoint="/v1/documents/by-id/metadata", status="404").inc()
                 raise HTTPException(status_code=404, detail="Document not found")
@@ -459,7 +470,7 @@ async def get_metadata(doc_id: str):
         raise HTTPException(status_code=503, detail="service_unavailable")
 
     try:
-        meta = state.db.get_metadata(doc_id)
+        meta = await _run_sync(state.db.get_metadata, doc_id)
         if not meta:
             REQS.labels(endpoint="/v1/documents/{doc_id}/metadata", status="404").inc()
             raise HTTPException(status_code=404, detail="Document not found")
@@ -491,7 +502,7 @@ async def patch_extra_by_id(req: PatchExtraByIdRequest):
     try:
         logger.info("patch_extra_by_id_request", extra={"doc_id": req.doc_id, "doc_id_repr": repr(req.doc_id), "patch_keys": list(req.patch.keys())})
         with LAT.labels(stage="patch_extra").time():
-            meta = state.db.patch_extra(doc_id=req.doc_id, patch=req.patch)
+            meta = await _run_sync(state.db.patch_extra, doc_id=req.doc_id, patch=req.patch)
         if not meta:
             logger.warning("patch_extra_by_id_not_found", extra={"doc_id": req.doc_id})
             REQS.labels(endpoint="/v1/documents/by-id/extra", status="404").inc()
@@ -520,7 +531,7 @@ async def patch_extra(doc_id: str, req: PatchExtraRequest):
 
     try:
         with LAT.labels(stage="patch_extra").time():
-            meta = state.db.patch_extra(doc_id=doc_id, patch=req.patch)
+            meta = await _run_sync(state.db.patch_extra, doc_id=doc_id, patch=req.patch)
         if not meta:
             REQS.labels(endpoint="/v1/documents/{doc_id}/extra", status="404").inc()
             raise HTTPException(status_code=404, detail="Document not found")
@@ -548,7 +559,7 @@ async def search_documents(req: DocumentSearchRequest):
 
     try:
         with LAT.labels(stage="search").time():
-            docs, total = state.db.search_metadata(req)
+            docs, total = await _run_sync(state.db.search_metadata, req)
 
         REQS.labels(endpoint="/v1/documents/search", status="200").inc()
         return DocumentSearchResponse(ok=True, documents=docs, total=total)
@@ -573,7 +584,7 @@ async def list_collections(tenant_id: str | None = None, limit: int = 1000):
 
     try:
         with LAT.labels(stage="collections").time():
-            cols = state.db.list_collections(tenant_id=tenant_id, limit=limit)
+            cols = await _run_sync(state.db.list_collections, tenant_id=tenant_id, limit=limit)
         REQS.labels(endpoint="/v1/collections", status="200").inc()
         return {"ok": True, "collections": cols}
     except Exception as e:

@@ -28,6 +28,7 @@ class ChatRequest(BaseModel):
     # pass-through to retrieval
     retrieval_mode: Literal["bm25", "vector", "hybrid"] | None = None
     top_k: int | None = None
+    rerank: bool | None = None
     filters: GateFilters | None = None
     acl: list[str] = Field(default_factory=list)
 

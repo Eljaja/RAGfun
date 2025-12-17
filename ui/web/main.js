@@ -120,7 +120,9 @@ async function deleteAllDocs() {
 const docsState = {
   items: [],
   total: 0,
-  limit: 100,
+  // Page size for /api/v1/documents. We still auto-load all pages,
+  // but a larger limit reduces roundtrips.
+  limit: 500,
   offset: 0,
 };
 
@@ -603,21 +605,57 @@ if (qEl) qEl.addEventListener("keydown", e => {
 
 async function loadDocuments() {
   const container = document.getElementById("doc_list");
+  const loadMoreBtn = document.getElementById("load_more_docs");
+  const refreshBtn = document.getElementById("refresh_docs");
+  const applyFilesFiltersBtn = document.getElementById("apply_files_filters");
+  const deleteAllBtn = document.getElementById("delete_all_docs");
+
+  const setDocsBusy = busy => {
+    if (loadMoreBtn) loadMoreBtn.disabled = busy || (docsState.total && docsState.items.length >= docsState.total);
+    if (refreshBtn) refreshBtn.disabled = busy;
+    if (applyFilesFiltersBtn) applyFilesFiltersBtn.disabled = busy;
+    if (deleteAllBtn) deleteAllBtn.disabled = busy;
+  };
+
   try {
-    const data = await listDocuments();
-    const docs = data.documents || [];
-    docsState.total = data.total || 0;
-    if (docsState.offset === 0) {
-      docsState.items = docs;
-    } else {
-      // append next page; backend sorts by stored_at desc, so this is stable for browsing
-      docsState.items = docsState.items.concat(docs);
+    setDocsBusy(true);
+
+    // Auto-load ALL documents, not only the first page.
+    // We render incrementally so the UI shows progress.
+    let safety = 0;
+    while (true) {
+      safety += 1;
+      if (safety > 10000) break; // safety valve against infinite loops
+
+      const data = await listDocuments();
+      const docs = data.documents || [];
+
+      if (typeof data.total === "number") docsState.total = data.total;
+
+      if (docsState.offset === 0) {
+        docsState.items = docs;
+      } else {
+        // append next page; backend sorts by stored_at desc, so this is stable for browsing
+        docsState.items = docsState.items.concat(docs);
+      }
+      docsState.offset += docs.length;
+
+      renderDocuments(docsState.items);
+      updateDocsMeta();
+
+      const total = docsState.total || 0;
+      if (!docs.length) break;
+      if (total && docsState.items.length >= total) break;
+      if (docs.length < docsState.limit) break;
+
+      // Let the browser paint between pages.
+      await new Promise(r => setTimeout(r, 0));
     }
-    docsState.offset += docs.length;
-    renderDocuments(docsState.items);
-    updateDocsMeta();
   } catch (e) {
     container.innerHTML = `<div style="color: var(--error); text-align: center; padding: 40px;">Ошибка загрузки: ${escapeHtml(e.message)}</div>`;
+  } finally {
+    setDocsBusy(false);
+    updateDocsMeta();
   }
 }
 

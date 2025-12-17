@@ -141,7 +141,30 @@ async def handle_delete(
 
     # 2) best-effort delete from storage (this removes metadata too)
     with LAT.labels("delete", "storage_delete").time():
-        await storage.delete_document(doc_id=doc_id)
+        try:
+            await storage.delete_document(doc_id=doc_id)
+        except httpx.HTTPStatusError as e:
+            # Treat missing docs as success: delete is idempotent and users may request deletion
+            # multiple times or the doc may have been removed already.
+            if e.response is not None and e.response.status_code == 404:
+                logger.info("storage_delete_not_found", extra={"extra": {"doc_id": doc_id}})
+            else:
+                raise
+
+    now = time.time()
+    await _patch_ingestion(
+        storage,
+        doc_id=doc_id,
+        ingestion={
+            "state": "done",
+            "type": "delete",
+            "task_id": task_id,
+            "doc_id": doc_id,
+            "attempt": attempt,
+            "updated_at": now,
+            "stage": "deleted",
+        },
+    )
 
 
 async def main() -> None:

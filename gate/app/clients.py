@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
-from typing import Any, AsyncIterator, Literal
+from typing import Any, AsyncIterator, BinaryIO, Literal
 from urllib.parse import quote
 
 import httpx
@@ -22,6 +23,7 @@ class RetrievalClient:
         query: str,
         mode: Literal["bm25", "vector", "hybrid"],
         top_k: int,
+        rerank: bool | None,
         filters: dict[str, Any] | None,
         acl: list[str],
         include_sources: bool,
@@ -30,6 +32,7 @@ class RetrievalClient:
             "query": query,
             "mode": mode,
             "top_k": top_k,
+            "rerank": rerank,
             "include_sources": include_sources,
             "sources_level": "basic",
             "filters": filters,
@@ -124,7 +127,7 @@ class DocumentStorageClient:
     async def store_document(
         self,
         *,
-        file_content: bytes,
+        file_content: bytes | BinaryIO,
         filename: str,
         content_type: str | None = None,
         doc_id: str,
@@ -139,7 +142,13 @@ class DocumentStorageClient:
     ) -> dict[str, Any]:
         # Provide content_type explicitly; otherwise some clients fall back to application/octet-stream
         # which breaks downstream format detection (pdf/docx/etc).
-        files = {"file": (filename, file_content, content_type or "application/octet-stream")}
+        ct = content_type or "application/octet-stream"
+        # httpx supports streaming multipart from file-like objects. This avoids buffering the whole
+        # upload in memory inside gate.
+        if isinstance(file_content, (bytes, bytearray)):
+            files = {"file": (filename, bytes(file_content), ct)}
+        else:
+            files = {"file": (filename, file_content, ct)}
         data = {"doc_id": doc_id}
         if title:
             data["title"] = title
@@ -300,15 +309,35 @@ class LLMClient:
         assert self._api_key is not None
         headers = {"Authorization": f"Bearer {self._api_key}"}
         payload = {"model": self._model, "messages": messages, "temperature": 0.2}
+        # Best-effort retry on throttling/transient errors.
+        # Important for evaluation runs that generate many requests.
+        backoffs_s = [1, 2, 4, 8, 16, 30]
+        last_status: int | None = None
         async with httpx.AsyncClient(timeout=self._timeout_s) as client:
-            r = await client.post(f"{self._base_url}/chat/completions", json=payload, headers=headers)
-            r.raise_for_status()
-            data = r.json()
+            for attempt, sleep_s in enumerate(backoffs_s, start=1):
+                r = await client.post(f"{self._base_url}/chat/completions", json=payload, headers=headers)
+                last_status = r.status_code
+                if r.status_code == 429 or 500 <= r.status_code <= 599:
+                    logger.warning(
+                        "llm_retryable_status",
+                        extra={"extra": {"status_code": r.status_code, "attempt": attempt, "sleep_s": sleep_s}},
+                    )
+                    await asyncio.sleep(sleep_s)
+                    continue
+                r.raise_for_status()
+                data = r.json()
+                break
+            else:
+                # Last attempt without sleeping
+                r = await client.post(f"{self._base_url}/chat/completions", json=payload, headers=headers)
+                last_status = r.status_code
+                r.raise_for_status()
+                data = r.json()
         try:
             return str(data["choices"][0]["message"]["content"])
         except Exception:
             logger.error("llm_unexpected_response", extra={"extra": {"keys": list(data.keys())}})
-            raise RuntimeError("llm_unexpected_response")
+            raise RuntimeError(f"llm_unexpected_response:last_status={last_status}")
 
     async def chat_stream(self, *, messages: list[dict[str, str]]) -> AsyncIterator[str]:
         """Stream chat completions as SSE events."""

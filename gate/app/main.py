@@ -34,23 +34,39 @@ ING_PUB_LAT = Histogram("gate_ingestion_publish_latency_seconds", "Publish laten
 _CIT_RE = re.compile(r"\[\d+\]")
 
 
-def _ensure_inline_citations(answer: str, refs: list[int]) -> str:
+def _has_inline_citations(text: str) -> bool:
+    return bool(text) and bool(_CIT_RE.search(text))
+
+
+async def _enforce_citations_or_refuse(
+    *,
+    llm: LLMClient,
+    messages: list[dict[str, str]],
+    answer: str,
+    refs: list[int],
+) -> str:
     """
-    Best-effort fallback if the LLM forgets to cite.
-    - If citations already present: keep as-is.
-    - Else: append refs to each sentence end (over-citation is better than none for UI traceability).
+    If sources exist and the model returned an answer without citations, do one strict rewrite attempt.
+    If it still fails, refuse (to avoid "fake grounding" by auto-adding citations).
     """
-    if not answer:
-        return answer
     if not refs:
         return answer
-    if _CIT_RE.search(answer):
+    if _has_inline_citations(answer):
         return answer
 
     suffix = "".join([f"[{r}]" for r in refs])
-    parts = re.split(r"(?<=[.!?])\s+", answer.strip())
-    parts = [p + ("" if p.endswith(suffix) else suffix) for p in parts if p]
-    return " ".join(parts)
+    rewrite_prompt = (
+        "Rewrite your answer to comply STRICTLY with citations.\n"
+        f"- Every factual claim MUST include inline citations like {suffix}\n"
+        "- If you cannot answer using the provided sources, reply exactly: \"I don't know\" (no citations).\n"
+        "- Do NOT add any facts, numbers, commands, or code that are not explicitly present in the sources.\n"
+        "- Do NOT use generic advice or filler.\n"
+    )
+    retry_messages = list(messages) + [{"role": "user", "content": rewrite_prompt}]
+    rewritten = await llm.chat(messages=retry_messages)
+    if _has_inline_citations(rewritten) or rewritten.strip() == "I don't know":
+        return rewritten
+    return "I don't know"
 
 
 class AppState:
@@ -98,9 +114,9 @@ async def lifespan(app: FastAPI):
         try:
             await state.publisher.start()
         except Exception as e:
-            # Degrade gracefully: still allow sync indexing path.
+            # Degrade gracefully, but keep the publisher object:
+            # it can reconnect lazily on the first publish attempt.
             logger.error("rabbit_publisher_init_failed", extra={"extra": {"error": str(e)}})
-            state.publisher = None
     yield
     if state.publisher:
         await state.publisher.close()
@@ -169,6 +185,7 @@ async def chat(payload: ChatRequest):
                 query=payload.query,
                 mode=mode,
                 top_k=top_k,
+                rerank=payload.rerank,
                 filters=filters,
                 acl=payload.acl,
                 include_sources=payload.include_sources,
@@ -191,7 +208,7 @@ async def chat(payload: ChatRequest):
         answer = await state.llm.chat(messages=messages)
         if payload.include_sources:
             refs = [int(s.get("ref")) for s in (sources or []) if s.get("ref") is not None]
-            answer = _ensure_inline_citations(answer, refs)
+            answer = await _enforce_citations_or_refuse(llm=state.llm, messages=messages, answer=answer, refs=refs)
 
     ref_by_key = {(str(s.get("doc_id")), s.get("uri")): s.get("ref") for s in (sources or [])}
 
@@ -258,18 +275,6 @@ async def upload_document(
         logger.error("upload_retrieval_unavailable")
         return {"ok": False, "error": "retrieval_unavailable", "detail": "Retrieval service is not available"}
 
-    try:
-        raw = await file.read()
-    except Exception as e:
-        REQS.labels(endpoint="/v1/documents/upload", status="400").inc()
-        logger.error("upload_read_file_error", extra={"extra": {"doc_id": doc_id, "error": str(e)}})
-        return {"ok": False, "error": "file_read_error", "detail": f"Failed to read file: {str(e)}"}
-
-    if not raw:
-        REQS.labels(endpoint="/v1/documents/upload", status="400").inc()
-        logger.warning("upload_empty_file", extra={"extra": {"doc_id": doc_id, "filename": file.filename}})
-        return {"ok": False, "error": "empty_file", "detail": "File is empty"}
-
     tags_list = [t.strip() for t in (tags or "").split(",") if t.strip()]
     acl_list = [a.strip() for a in (acl or "").split(",") if a.strip()]
     file_title = title or file.filename or "untitled"
@@ -277,11 +282,13 @@ async def upload_document(
     # Step 1: Store in document-storage if available
     storage_result = None
     storage_ok = False
+    stored_bytes: int | None = None
     if state.storage:
         try:
             with LAT.labels("storage_store").time():
                 storage_result = await state.storage.store_document(
-                    file_content=raw,
+                    # Stream file to document-storage (avoid buffering in gate).
+                    file_content=file.file,
                     filename=file.filename or "unknown",
                     content_type=file.content_type,
                     doc_id=doc_id,
@@ -294,7 +301,14 @@ async def upload_document(
                     tenant_id=tenant_id,
                     project_id=project_id,
                 )
-            logger.info("document_stored", extra={"extra": {"doc_id": doc_id, "storage_id": storage_result.get("storage_id")}})
+            try:
+                stored_bytes = int(storage_result.get("size")) if storage_result and storage_result.get("size") is not None else None
+            except Exception:
+                stored_bytes = None
+            logger.info(
+                "document_stored",
+                extra={"extra": {"doc_id": doc_id, "storage_id": storage_result.get("storage_id"), "size": stored_bytes}},
+            )
             storage_ok = True
         except httpx.TimeoutException as e:
             logger.warning("storage_store_timeout", extra={"extra": {"doc_id": doc_id, "error": str(e)}})
@@ -383,12 +397,29 @@ async def upload_document(
                 "doc_id": doc_id,
                 "storage": storage_result,
                 "filename": file.filename,
-                "bytes": len(raw),
+                "bytes": stored_bytes,
             }
         else:
             # Legacy path: decode bytes as UTF-8 and index as one document text.
             # If doc-processor is configured but storage didn't confirm the upload, we cannot use doc-processor
             # (it pulls bytes from storage). Fall back to direct indexing.
+            try:
+                # If we streamed the file to storage above, we need to rewind before reading for legacy indexing.
+                await file.seek(0)
+            except Exception:
+                pass
+            try:
+                raw = await file.read()
+            except Exception as e:
+                REQS.labels(endpoint="/v1/documents/upload", status="400").inc()
+                logger.error("upload_read_file_error", extra={"extra": {"doc_id": doc_id, "error": str(e)}})
+                return {"ok": False, "error": "file_read_error", "detail": f"Failed to read file: {str(e)}"}
+
+            if not raw:
+                REQS.labels(endpoint="/v1/documents/upload", status="400").inc()
+                logger.warning("upload_empty_file", extra={"extra": {"doc_id": doc_id, "filename": file.filename}})
+                return {"ok": False, "error": "empty_file", "detail": "File is empty"}
+
             text = _legacy_extract_text(raw_bytes=raw)
             if not text:
                 REQS.labels(endpoint="/v1/documents/upload", status="400").inc()
@@ -772,6 +803,7 @@ async def get_document_status(doc_id: str):
                 query="document",  # simple query to check if doc is indexed
                 mode="hybrid",
                 top_k=1,
+                rerank=None,
                 filters={"doc_ids": [doc_id]},
                 acl=[],
                 include_sources=False,
@@ -811,6 +843,7 @@ async def chat_stream(payload: ChatRequest):
                         query=payload.query,
                         mode=mode,
                         top_k=top_k,
+                        rerank=payload.rerank,
                         filters=filters,
                         acl=payload.acl,
                         include_sources=payload.include_sources,
@@ -878,7 +911,9 @@ async def chat_stream(payload: ChatRequest):
             full_answer = "".join(answer_parts)
             if payload.include_sources:
                 refs = [int(s.get("ref")) for s in (sources or []) if s.get("ref") is not None]
-                full_answer = _ensure_inline_citations(full_answer, refs)
+                # Streaming: cannot easily re-run the full generation. Enforce strictness by refusing if citations are missing.
+                if refs and not _has_inline_citations(full_answer):
+                    full_answer = "I don't know"
             yield f"data: {json.dumps({'type': 'done', 'answer': full_answer, 'mode': mode, 'degraded': list(degraded), 'partial': partial, 'sources': sources if payload.include_sources else [], 'context': [c.model_dump() for c in ctx]})}\n\n"
 
             REQS.labels(endpoint="/v1/chat/stream", status="200").inc()

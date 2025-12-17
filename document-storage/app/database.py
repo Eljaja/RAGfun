@@ -7,7 +7,7 @@ from typing import Any
 
 import psycopg2
 from psycopg2.extras import Json, RealDictCursor
-from psycopg2.pool import SimpleConnectionPool
+from psycopg2.pool import ThreadedConnectionPool
 
 from app.models import DocumentMetadata, DocumentSearchRequest
 
@@ -17,12 +17,14 @@ logger = logging.getLogger("storage.db")
 class DatabaseClient:
     def __init__(self, db_url: str, min_conn: int = 1, max_conn: int = 10):
         self.db_url = db_url
-        self.pool: SimpleConnectionPool | None = None
+        self.pool: ThreadedConnectionPool | None = None
         self._init_pool(min_conn, max_conn)
 
     def _init_pool(self, min_conn: int, max_conn: int):
         try:
-            self.pool = SimpleConnectionPool(
+            # Thread-safe pool: required because document-storage runs DB operations
+            # in a threadpool (to avoid blocking the async event loop).
+            self.pool = ThreadedConnectionPool(
                 min_conn, max_conn, self.db_url, cursor_factory=RealDictCursor
             )
             # Test connection
