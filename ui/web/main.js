@@ -150,10 +150,44 @@ function updateDocsMeta() {
   if (!el) return;
   const shown = docsState.items.length;
   const total = docsState.total || 0;
-  if (!total) {
-    el.textContent = shown ? `Показано: ${shown}` : "";
+  if (!shown) {
+    el.textContent = total ? `Показано: 0 из ${total}` : "";
   } else {
-    el.textContent = `Показано: ${shown} из ${total}`;
+    // Stats by status (based on already loaded docs; in this UI we auto-load all pages).
+    const stats = {
+      indexed: 0,
+      not_indexed: 0,
+      queued: 0,
+      processing: 0,
+      retrying: 0,
+      failed: 0,
+      unknown: 0,
+    };
+
+    for (const doc of docsState.items) {
+      const ing = doc && doc.extra && doc.extra.ingestion ? doc.extra.ingestion : null;
+      const st = ing && ing.state ? String(ing.state) : "";
+      if (st === "queued") stats.queued += 1;
+      else if (st === "processing") stats.processing += 1;
+      else if (st === "retrying") stats.retrying += 1;
+      else if (st === "failed") stats.failed += 1;
+      else if (doc && doc.indexed) stats.indexed += 1;
+      else if (doc && doc.indexed === false) stats.not_indexed += 1;
+      else stats.unknown += 1;
+    }
+
+    const left = total ? `Показано: ${shown} из ${total}` : `Показано: ${shown}`;
+    const parts = [
+      `Проиндексировано: ${stats.indexed}`,
+      `Не проиндексировано: ${stats.not_indexed}`,
+    ];
+    if (stats.queued) parts.push(`В очереди: ${stats.queued}`);
+    if (stats.processing) parts.push(`Обработка: ${stats.processing}`);
+    if (stats.retrying) parts.push(`Повтор: ${stats.retrying}`);
+    if (stats.failed) parts.push(`Ошибка: ${stats.failed}`);
+    if (stats.unknown) parts.push(`Неизвестно: ${stats.unknown}`);
+
+    el.textContent = `${left} · ${parts.join(" · ")}`;
   }
 
   const btn = document.getElementById("load_more_docs");

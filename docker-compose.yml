@@ -161,15 +161,13 @@ services:
       start_period: 10s
 
   infinity-embed:
-    build:
-      context: ./infinity
-    image: ragfun/infinity-qwen3-embed:latest
+    image: michaelf34/infinity:latest
     container_name: infinity-embed
     command:
       [
         "v2",
         "--model-id",
-        "Qwen/Qwen3-Embedding-8B",
+        "intfloat/multilingual-e5-large-instruct",
         "--device",
         "cuda",
         "--device-id",
@@ -203,12 +201,12 @@ services:
       - RAG_QDRANT_URL=http://qdrant:6333
       # Use a separate collection because the embedding model defines vector dim.
       # (existing collections may already be created with a different vector size).
-      - RAG_QDRANT_COLLECTION=rag_chunks_4096
+      - RAG_QDRANT_COLLECTION=rag_chunks_1024
       # Embeddings (Infinity inside docker network)
       - RAG_EMBEDDING_PROVIDER=http
       - RAG_EMBEDDING_URL=http://infinity-embed:7997/embeddings
-      - RAG_EMBEDDING_MODEL=Qwen/Qwen3-Embedding-8B
-      - RAG_VECTOR_SIZE=4096
+      - RAG_EMBEDDING_MODEL=intfloat/multilingual-e5-large-instruct
+      - RAG_VECTOR_SIZE=1024
       # Retrieval tuning (RU RAG eval)
       - RAG_BM25_TOP_K=150
       - RAG_VECTOR_TOP_K=150
@@ -216,7 +214,7 @@ services:
       # Rerank (Infinity rerank service started by this compose)
       - RAG_RERANK_MODE=always
       - RAG_RERANK_URL=http://infinity-rerank:7998/rerank
-      - RAG_RERANK_MODEL=Qwen/Qwen3-Reranker-4B
+      - RAG_RERANK_MODEL=BAAI/bge-reranker-v2-m3
       - RAG_RERANK_MAX_CANDIDATES=100
       - RAG_LOG_LEVEL=INFO
       - RAG_ENABLE_PAGE_DEDUPLICATION=true
@@ -393,18 +391,25 @@ services:
 
   # Rerank service (Infinity). Kept in the same docker network for stable DNS (infinity-rerank).
   infinity-rerank:
-    build:
-      context: ./qwen3-rerank
-    image: ragfun/qwen3-rerank:latest
+    image: michaelf34/infinity:latest
     container_name: infinity-rerank
-    environment:
-      - RERANK_MODEL_ID=Qwen/Qwen3-Reranker-4B
-      - RERANK_MAX_LENGTH=1024
-      - RERANK_BATCH_SIZE=8
-      - HF_HOME=/root/.cache/huggingface
-      - DO_NOT_TRACK=1
+    command:
+      [
+        "v2",
+        "--model-id",
+        "BAAI/bge-reranker-v2-m3",
+        "--device",
+        "cuda",
+        "--device-id",
+        "0",
+        "--port",
+        "7998"
+      ]
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      - HF_HOME=/root/.cache/huggingface
+      - DO_NOT_TRACK=1
     networks:
       - rag-network
     deploy:
@@ -412,7 +417,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ["3"]
+              device_ids: ["4"]
               capabilities: [gpu]
 
   prometheus:
