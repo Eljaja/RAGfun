@@ -42,6 +42,17 @@ class Settings(BaseSettings):
     top_k: int = 8
     max_context_chars: int = 18_000
 
+    # Multi-hop retrieval improvements (opt-in)
+    # Multi-query: generate a few query variants and fuse their results.
+    multi_query_enabled: bool = False
+    multi_query_max_queries: int = 4
+    multi_query_top_k_multiplier: int = 12  # raw_top_k = max(top_k, 1) * multiplier
+    multi_query_rrf_k: int = 60
+    # Two-pass: run an initial retrieval, extract hint terms from the top hits, then retrieve again.
+    two_pass_enabled: bool = False
+    two_pass_hint_max_terms: int = 8
+    two_pass_min_unique_docs: int = 3
+
     # HTTP / UI
     cors_allow_origins: str = "*"  # for dev, can be narrowed
 
@@ -73,6 +84,17 @@ class Settings(BaseSettings):
             },
             "rag": {
                 "max_context_chars": self.max_context_chars,
+                "multi_query": {
+                    "enabled": self.multi_query_enabled,
+                    "max_queries": self.multi_query_max_queries,
+                    "top_k_multiplier": self.multi_query_top_k_multiplier,
+                    "rrf_k": self.multi_query_rrf_k,
+                },
+                "two_pass": {
+                    "enabled": self.two_pass_enabled,
+                    "hint_max_terms": self.two_pass_hint_max_terms,
+                    "min_unique_docs": self.two_pass_min_unique_docs,
+                },
             },
             "storage": {
                 "url": str(self.storage_url) if self.storage_url else None,

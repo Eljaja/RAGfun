@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 import json
+from collections import Counter as CollCounter
 from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -21,6 +22,7 @@ from app.logging_setup import setup_json_logging
 from app.models import ChatRequest, ChatResponse, ContextChunk, Source
 from app.queue import RabbitPublisher
 from app.rag import build_context_blocks, build_messages
+from rapidfuzz import fuzz
 
 logger = logging.getLogger("gate")
 
@@ -36,6 +38,212 @@ _CIT_RE = re.compile(r"\[\d+\]")
 
 def _has_inline_citations(text: str) -> bool:
     return bool(text) and bool(_CIT_RE.search(text))
+
+
+_WS_RE = re.compile(r"\s+")
+_QUOTED_RE = re.compile(r"\"([^\"]+)\"|'([^']+)'")
+_YEAR_RE = re.compile(r"\b(18\d{2}|19\d{2}|20\d{2})\b")
+# Unicode-friendly tokenization (EN + RU + digits). Keep it simple and fast.
+# \w includes underscore; that's acceptable for search queries.
+_TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9]+")
+
+
+def _norm_query(q: str) -> str:
+    q = (q or "").strip().lower()
+    q = _WS_RE.sub(" ", q)
+    return q
+
+
+def _dedupe_queries(qs: list[str], *, threshold: int = 92) -> list[str]:
+    out: list[str] = []
+    norms: list[str] = []
+    for q in qs:
+        q = (q or "").strip()
+        if not q:
+            continue
+        nq = _norm_query(q)
+        if not nq:
+            continue
+        dup = False
+        for prev in norms:
+            # token_set_ratio is robust to word reordering
+            if fuzz.token_set_ratio(nq, prev) >= threshold:
+                dup = True
+                break
+        if dup:
+            continue
+        out.append(q)
+        norms.append(nq)
+    return out
+
+
+def _keyword_query(q: str) -> str:
+    # Keep a compact keyword-only query (helps BM25 on long questions).
+    toks = [t.lower() for t in _TOKEN_RE.findall(q or "")]
+    if not toks:
+        return ""
+    stop = {
+        "the",
+        "a",
+        "an",
+        "of",
+        "in",
+        "on",
+        "at",
+        "to",
+        "for",
+        "and",
+        "or",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "with",
+        "what",
+        "which",
+        "who",
+        "when",
+        "where",
+        "why",
+        "how",
+        "many",
+        "much",
+        "did",
+        "does",
+        "do",
+        "have",
+        "has",
+        # RU stopwords (small list, just to avoid query noise)
+        "и",
+        "а",
+        "но",
+        "или",
+        "да",
+        "нет",
+        "не",
+        "это",
+        "этот",
+        "эта",
+        "эти",
+        "как",
+        "что",
+        "кто",
+        "где",
+        "когда",
+        "почему",
+        "зачем",
+        "сколько",
+        "какой",
+        "какая",
+        "какие",
+        "каков",
+        "каково",
+        "каковы",
+        "в",
+        "на",
+        "по",
+        "к",
+        "у",
+        "с",
+        "со",
+        "из",
+        "за",
+        "для",
+        "о",
+        "об",
+        "про",
+        "над",
+        "под",
+        "при",
+        "от",
+        "до",
+        "после",
+        "между",
+        "через",
+        "все",
+        "всё",
+        "же",
+        "ли",
+        "бы",
+        "были",
+        "был",
+        "будет",
+        "есть",
+        "является",
+        "являются",
+        "то",
+        "там",
+        "тут",
+    }
+    toks = [t for t in toks if len(t) >= 3 and t not in stop]
+    if not toks:
+        return ""
+    # Prefer frequent + longer tokens
+    c = CollCounter(toks)
+    ranked = sorted(c.items(), key=lambda kv: (kv[1], len(kv[0])), reverse=True)
+    keep = [t for t, _ in ranked[:10]]
+    return " ".join(keep)
+
+
+def _query_variants(q: str) -> list[str]:
+    q = (q or "").strip()
+    if not q:
+        return []
+    out: list[str] = [q]
+    kw = _keyword_query(q)
+    if kw and kw != q:
+        out.append(kw)
+    # quoted phrases and years often anchor multi-hop
+    phrases: list[str] = []
+    for m in _QUOTED_RE.finditer(q):
+        p = (m.group(1) or m.group(2) or "").strip()
+        if p and len(p) >= 3:
+            phrases.append(p)
+    years = _YEAR_RE.findall(q)
+    if phrases:
+        out.append(" ".join(phrases))
+    if years:
+        out.append(" ".join(sorted(set(years))))
+    return _dedupe_queries(out)
+
+
+def _extract_hint_terms_from_hits(hits: list[dict[str, Any]], *, max_terms: int) -> list[str]:
+    """
+    Best-effort: extract a few 'anchor' terms from top hits to build a follow-up query.
+    Keep it conservative to avoid query drift.
+    """
+    cand: list[str] = []
+    for h in hits[:8]:
+        t = str(h.get("text") or "")
+        # Pull years and capitalized-ish tokens (in practice, proper nouns in English pages)
+        cand.extend(_YEAR_RE.findall(t))
+        cand.extend([x for x in _TOKEN_RE.findall(t) if len(x) >= 4][:20])
+    # Normalize and prefer longer distinct terms; dedupe with fuzzy matching
+    cand = [c.strip() for c in cand if c and c.strip()]
+    cand = sorted(set(cand), key=lambda s: (-len(s), s))[: max_terms * 3]
+    # Keep only a few, fuzzy-deduped
+    uniq: list[str] = []
+    for x in cand:
+        nx = _norm_query(x)
+        if not nx:
+            continue
+        if any(fuzz.token_set_ratio(nx, _norm_query(u)) >= 92 for u in uniq):
+            continue
+        uniq.append(x)
+        if len(uniq) >= max_terms:
+            break
+    return uniq
+
+
+def _unique_doc_count(hits: list[dict[str, Any]]) -> int:
+    s: set[str] = set()
+    for h in hits:
+        did = str(h.get("doc_id") or "").strip()
+        if did:
+            s.add(did)
+    return len(s)
 
 
 async def _enforce_citations_or_refuse(
@@ -181,15 +389,106 @@ async def chat(payload: ChatRequest):
 
     try:
         with LAT.labels("retrieval").time():
-            retrieval_json = await state.retrieval.search(
-                query=payload.query,
-                mode=mode,
-                top_k=top_k,
-                rerank=payload.rerank,
-                filters=filters,
-                acl=payload.acl,
-                include_sources=payload.include_sources,
-            )
+            # Optional: multi-query + two-pass retrieval (opt-in).
+            if state.settings.multi_query_enabled or state.settings.two_pass_enabled:
+                # Keep candidate pool bounded; too many low-quality hits increases refusals.
+                raw_top_k = max(1, top_k) * max(1, int(state.settings.multi_query_top_k_multiplier))
+                raw_top_k = max(20, min(80, int(raw_top_k)))
+
+                # Pass 1 (q0 only) - used to derive hint terms for pass 2 if enabled.
+                pass1 = await state.retrieval.search(
+                    query=payload.query,
+                    mode=mode,
+                    top_k=raw_top_k,
+                    # IMPORTANT: keep rerank behavior for q0 (restores quality vs massive refusals).
+                    rerank=payload.rerank,
+                    filters=filters,
+                    acl=payload.acl,
+                    include_sources=payload.include_sources,
+                )
+
+                queries = _query_variants(payload.query)
+                # Two-pass: add a follow-up query from top hits if pass1 seems too narrow.
+                if state.settings.two_pass_enabled:
+                    hits1 = list(pass1.get("hits") or [])
+                    if _unique_doc_count(hits1) < int(state.settings.two_pass_min_unique_docs):
+                        hints = _extract_hint_terms_from_hits(
+                            hits1,
+                            max_terms=max(1, int(state.settings.two_pass_hint_max_terms)),
+                        )
+                        if hints:
+                            q2 = (payload.query + " " + " ".join(hints)).strip()
+                            queries.append(q2)
+
+                # Clamp and dedupe
+                queries = _dedupe_queries(queries)[: max(1, int(state.settings.multi_query_max_queries))]
+                if not queries:
+                    queries = [payload.query]
+
+                # For each query, retrieve candidates (rerank off), then fuse by RRF on chunk_id.
+                async def _one(q: str) -> dict[str, Any]:
+                    return await state.retrieval.search(
+                        query=q,
+                        mode=mode,
+                        top_k=raw_top_k,
+                        # Only q0 is reranked; expansions are for recall.
+                        rerank=False if q != payload.query else payload.rerank,
+                        filters=filters,
+                        acl=payload.acl,
+                        include_sources=payload.include_sources,
+                    )
+
+                rs = await asyncio.gather(*[_one(q) for q in queries], return_exceptions=True)
+                # include pass1 results too
+                rs = [pass1] + [r for r in rs if not isinstance(r, Exception)]
+
+                ranked_lists: dict[str, list[str]] = {}
+                hit_by_cid: dict[str, dict[str, Any]] = {}
+                for i, rj in enumerate(rs):
+                    hits_i = list(rj.get("hits") or [])
+                    ranked_lists[f"q{i}"] = [str(h.get("chunk_id")) for h in hits_i if h.get("chunk_id")]
+                    for h in hits_i:
+                        cid = str(h.get("chunk_id") or "").strip()
+                        if not cid:
+                            continue
+                        # keep the first version we saw (usually already has text/source)
+                        hit_by_cid.setdefault(cid, h)
+
+                fused: dict[str, float] = {}
+                rrf_k = max(1, int(state.settings.multi_query_rrf_k))
+                for _, cids in ranked_lists.items():
+                    for rank, cid in enumerate(cids, start=1):
+                        fused[cid] = fused.get(cid, 0.0) + (1.0 / (rrf_k + rank))
+
+                fused_hits = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)
+                merged_hits: list[dict[str, Any]] = []
+                for cid, sc in fused_hits[: raw_top_k]:
+                    h = dict(hit_by_cid.get(cid) or {})
+                    # Preserve original retrieval score (esp. rerank score). Store fused score separately.
+                    md = dict(h.get("metadata") or {})
+                    md["multi_rrf_score"] = float(sc)
+                    h["metadata"] = md
+                    merged_hits.append(h)
+
+                retrieval_json = {
+                    "ok": True,
+                    "mode": mode,
+                    "partial": any(bool(r.get("partial")) for r in rs if isinstance(r, dict)),
+                    "degraded": sorted({d for r in rs if isinstance(r, dict) for d in (r.get("degraded") or [])}),
+                    "hits": merged_hits,
+                    # keep a small debug payload (UI uses it), but don't blow up response size
+                    "multi_query": {"queries": queries, "raw_top_k": raw_top_k},
+                }
+            else:
+                retrieval_json = await state.retrieval.search(
+                    query=payload.query,
+                    mode=mode,
+                    top_k=top_k,
+                    rerank=payload.rerank,
+                    filters=filters,
+                    acl=payload.acl,
+                    include_sources=payload.include_sources,
+                )
     except httpx.TimeoutException:
         REQS.labels(endpoint="/v1/chat", status="504").inc()
         return ChatResponse(ok=False, answer="retrieval_timeout", used_mode=mode)

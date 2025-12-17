@@ -348,6 +348,14 @@ services:
       - GATE_RETRIEVAL_MODE=hybrid
       - GATE_TOP_K=8
       - GATE_MAX_CONTEXT_CHARS=18000
+      # Multi-hop retrieval improvements (multi-query + 2-pass). Enable for ITMO.
+      - GATE_MULTI_QUERY_ENABLED=true
+      - GATE_MULTI_QUERY_MAX_QUERIES=4
+      - GATE_MULTI_QUERY_TOP_K_MULTIPLIER=12
+      - GATE_MULTI_QUERY_RRF_K=60
+      - GATE_TWO_PASS_ENABLED=true
+      - GATE_TWO_PASS_HINT_MAX_TERMS=8
+      - GATE_TWO_PASS_MIN_UNIQUE_DOCS=3
       # Document Storage
       - GATE_STORAGE_URL=http://document-storage:8081
       - GATE_STORAGE_TIMEOUT_S=60
