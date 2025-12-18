@@ -42,6 +42,12 @@ class Settings(BaseSettings):
     top_k: int = 8
     max_context_chars: int = 18_000
 
+    # BM25 anchor pass (recommended): run an additional BM25 lookup on a keyword-only query
+    # and union/fuse candidates, so exact-match entities don't get lost in hybrid/rerank.
+    bm25_anchor_enabled: bool = True
+    bm25_anchor_top_k: int = 30
+    bm25_anchor_rrf_k: int = 60
+
     # Multi-hop retrieval improvements (opt-in)
     # Multi-query: generate a few query variants and fuse their results.
     multi_query_enabled: bool = False
@@ -84,6 +90,11 @@ class Settings(BaseSettings):
             },
             "rag": {
                 "max_context_chars": self.max_context_chars,
+                "bm25_anchor": {
+                    "enabled": self.bm25_anchor_enabled,
+                    "top_k": self.bm25_anchor_top_k,
+                    "rrf_k": self.bm25_anchor_rrf_k,
+                },
                 "multi_query": {
                     "enabled": self.multi_query_enabled,
                     "max_queries": self.multi_query_max_queries,

@@ -81,67 +81,6 @@ services:
       retries: 5
       start_period: 10s
 
-  # RustFS (S3-compatible object storage for document-storage)
-  rustfs:
-    image: rustfs/rustfs:latest
-    container_name: rustfs-server
-    security_opt:
-      - "no-new-privileges:true"
-    ports:
-      - "9000:9000" # S3 API port
-      - "9001:9001" # Console port
-    environment:
-      - RUSTFS_VOLUMES=/data/rustfs{0...3}
-      - RUSTFS_ADDRESS=0.0.0.0:9000
-      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
-      - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_EXTERNAL_ADDRESS=:9000
-      - RUSTFS_CORS_ALLOWED_ORIGINS=*
-      - RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS=*
-      - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
-      - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfsadmin}
-      - RUSTFS_OBS_LOGGER_LEVEL=info
-      - RUSTFS_TLS_PATH=/opt/tls
-      # Object Cache
-      - RUSTFS_OBJECT_CACHE_ENABLE=true
-      - RUSTFS_OBJECT_CACHE_TTL_SECS=300
-    volumes:
-      - rustfs_data_0:/data/rustfs0
-      - rustfs_data_1:/data/rustfs1
-      - rustfs_data_2:/data/rustfs2
-      - rustfs_data_3:/data/rustfs3
-      - rustfs_logs:/app/logs
-    networks:
-      - rag-network
-      - rustfs-network
-    restart: unless-stopped
-    depends_on:
-      volume-permission-helper:
-        condition: service_completed_successfully
-    healthcheck:
-      test: ["CMD", "sh", "-c", "curl -f http://localhost:9000/health && curl -f http://localhost:9001/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-
-  # RustFS volume permissions fixer service
-  volume-permission-helper:
-    image: alpine
-    volumes:
-      - rustfs_data_0:/data0
-      - rustfs_data_1:/data1
-      - rustfs_data_2:/data2
-      - rustfs_data_3:/data3
-      - rustfs_logs:/logs
-    command: >
-      sh -c "
-        chown -R 10001:10001 /data0 /data1 /data2 /data3 /logs &&
-        echo 'Volume Permissions fixed' &&
-        exit 0
-      "
-    restart: "no"
-
   rabbitmq:
     image: rabbitmq:3-management
     container_name: rabbitmq
@@ -163,32 +102,9 @@ services:
   infinity-embed:
     image: michaelf34/infinity:latest
     container_name: infinity-embed
-    command:
-      [
-        "v2",
-        "--model-id",
-        "intfloat/multilingual-e5-large-instruct",
-        "--device",
-        "cuda",
-        "--device-id",
-        "0",
-        "--port",
-        "7997"
-      ]
-    volumes:
-      - ~/.cache/huggingface:/root/.cache/huggingface
-    environment:
-      - HF_HOME=/root/.cache/huggingface
-      - DO_NOT_TRACK=1
+    command: ["v2", "--model-id", "sentence-transformers/distiluse-base-multilingual-cased", "--port", "7997"]
     networks:
       - rag-network
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["4"]
-              capabilities: [gpu]
 
   # Stateless Hybrid Retrieval microservice (scale this one for multiple replicas)
   retrieval:
@@ -199,23 +115,18 @@ services:
     environment:
       - RAG_OS_URL=http://opensearch:9200
       - RAG_QDRANT_URL=http://qdrant:6333
-      # Use a separate collection because the embedding model defines vector dim.
-      # (existing collections may already be created with a different vector size).
-      - RAG_QDRANT_COLLECTION=rag_chunks_1024
+      # Use a separate collection because the host Infinity embedding model is 512-dim
+      # (existing 'rag_chunks' may already be created with a different vector size).
+      - RAG_QDRANT_COLLECTION=rag_chunks_512
       # Embeddings (Infinity inside docker network)
       - RAG_EMBEDDING_PROVIDER=http
       - RAG_EMBEDDING_URL=http://infinity-embed:7997/embeddings
-      - RAG_EMBEDDING_MODEL=intfloat/multilingual-e5-large-instruct
-      - RAG_VECTOR_SIZE=1024
-      # Retrieval tuning (RU RAG eval)
-      - RAG_BM25_TOP_K=150
-      - RAG_VECTOR_TOP_K=150
-      - RAG_MAX_CHUNKS_PER_DOC=8
+      - RAG_EMBEDDING_MODEL=sentence-transformers/distiluse-base-multilingual-cased
+      - RAG_VECTOR_SIZE=512
       # Rerank (Infinity rerank service started by this compose)
-      - RAG_RERANK_MODE=always
+      - RAG_RERANK_MODE=auto
       - RAG_RERANK_URL=http://infinity-rerank:7998/rerank
       - RAG_RERANK_MODEL=BAAI/bge-reranker-v2-m3
-      - RAG_RERANK_MAX_CANDIDATES=100
       - RAG_LOG_LEVEL=INFO
       - RAG_ENABLE_PAGE_DEDUPLICATION=true
       - RAG_ENABLE_PARENT_PAGE_RETRIEVAL=true
@@ -240,13 +151,8 @@ services:
     ports:
       - "8081:8081"
     environment:
-      - STORAGE_STORAGE_BACKEND=s3
+      - STORAGE_STORAGE_BACKEND=local
       - STORAGE_STORAGE_PATH=/data/documents
-      - STORAGE_S3_ENDPOINT=http://rustfs:9000
-      - STORAGE_S3_BUCKET=${STORAGE_S3_BUCKET:-documents}
-      - STORAGE_S3_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
-      - STORAGE_S3_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfsadmin}
-      - STORAGE_S3_REGION=${STORAGE_S3_REGION:-us-east-1}
       - STORAGE_DB_URL=postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/document_storage
       - STORAGE_MAX_FILE_SIZE_MB=100
       - STORAGE_LOG_LEVEL=INFO
@@ -255,11 +161,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      rustfs:
-        condition: service_healthy
     networks:
       - rag-network
-      - rustfs-network
 
   # vLLM (OpenAI-compatible) hosting Granite-Docling VLM for document-to-text extraction.
   # NOTE: requires NVIDIA GPU + drivers on the host.
@@ -280,9 +183,7 @@ services:
       resources:
         reservations:
           devices:
-            - driver: nvidia
-              device_ids: ["2"]
-              capabilities: [gpu]
+            - capabilities: [gpu]
 
   # Document Processor Service (pulls files from document-storage, uses Granite-Docling via vLLM, indexes into retrieval)
   doc-processor:
@@ -348,14 +249,10 @@ services:
       - GATE_RETRIEVAL_MODE=hybrid
       - GATE_TOP_K=8
       - GATE_MAX_CONTEXT_CHARS=18000
-      # Multi-hop retrieval improvements (multi-query + 2-pass). Enable for ITMO.
-      - GATE_MULTI_QUERY_ENABLED=true
-      - GATE_MULTI_QUERY_MAX_QUERIES=4
-      - GATE_MULTI_QUERY_TOP_K_MULTIPLIER=12
-      - GATE_MULTI_QUERY_RRF_K=60
-      - GATE_TWO_PASS_ENABLED=true
-      - GATE_TWO_PASS_HINT_MAX_TERMS=8
-      - GATE_TWO_PASS_MIN_UNIQUE_DOCS=3
+      # BM25 anchor pass: ensure exact-match entities don't get dropped by hybrid/rerank
+      - GATE_BM25_ANCHOR_ENABLED=true
+      - GATE_BM25_ANCHOR_TOP_K=30
+      - GATE_BM25_ANCHOR_RRF_K=60
       # Document Storage
       - GATE_STORAGE_URL=http://document-storage:8081
       - GATE_STORAGE_TIMEOUT_S=60
@@ -401,32 +298,9 @@ services:
   infinity-rerank:
     image: michaelf34/infinity:latest
     container_name: infinity-rerank
-    command:
-      [
-        "v2",
-        "--model-id",
-        "BAAI/bge-reranker-v2-m3",
-        "--device",
-        "cuda",
-        "--device-id",
-        "0",
-        "--port",
-        "7998"
-      ]
-    volumes:
-      - ~/.cache/huggingface:/root/.cache/huggingface
-    environment:
-      - HF_HOME=/root/.cache/huggingface
-      - DO_NOT_TRACK=1
+    command: ["v2", "--model-id", "BAAI/bge-reranker-v2-m3", "--port", "7998"]
     networks:
       - rag-network
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["4"]
-              capabilities: [gpu]
 
   prometheus:
     image: prom/prometheus:v2.55.0
@@ -468,16 +342,6 @@ volumes:
     driver: local
   document-storage-data:
     driver: local
-  rustfs_data_0:
-    driver: local
-  rustfs_data_1:
-    driver: local
-  rustfs_data_2:
-    driver: local
-  rustfs_data_3:
-    driver: local
-  rustfs_logs:
-    driver: local
   prometheus-data:
     driver: local
   grafana-data:
@@ -485,7 +349,5 @@ volumes:
 
 networks:
   rag-network:
-    driver: bridge
-  rustfs-network:
     driver: bridge
 

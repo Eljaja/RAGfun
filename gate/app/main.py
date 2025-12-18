@@ -209,6 +209,115 @@ def _query_variants(q: str) -> list[str]:
     return _dedupe_queries(out)
 
 
+def _rrf_merge_hits_by_chunk_id(
+    *,
+    base_hits: list[dict[str, Any]],
+    anchor_hits: list[dict[str, Any]],
+    rrf_k: int,
+    cap: int,
+) -> list[dict[str, Any]]:
+    """
+    Merge two ranked hit lists by Reciprocal Rank Fusion (RRF), keyed by chunk_id.
+    Keeps the first-seen hit payload for each chunk_id, but attaches RRF diagnostics in metadata.
+    """
+    rrf_k = max(1, int(rrf_k))
+    cap = max(1, int(cap))
+
+    def _ranked_ids(hits: list[dict[str, Any]]) -> list[str]:
+        return [str(h.get("chunk_id")) for h in hits if h.get("chunk_id")]
+
+    base_ids = _ranked_ids(base_hits)
+    anch_ids = _ranked_ids(anchor_hits)
+
+    hit_by_cid: dict[str, dict[str, Any]] = {}
+    for h in base_hits:
+        cid = str(h.get("chunk_id") or "").strip()
+        if cid:
+            hit_by_cid.setdefault(cid, h)
+    for h in anchor_hits:
+        cid = str(h.get("chunk_id") or "").strip()
+        if cid:
+            hit_by_cid.setdefault(cid, h)
+
+    fused: dict[str, float] = {}
+    for rank, cid in enumerate(base_ids, start=1):
+        fused[cid] = fused.get(cid, 0.0) + (1.0 / (rrf_k + rank))
+    for rank, cid in enumerate(anch_ids, start=1):
+        fused[cid] = fused.get(cid, 0.0) + (1.0 / (rrf_k + rank))
+
+    merged: list[dict[str, Any]] = []
+    for cid, sc in sorted(fused.items(), key=lambda kv: kv[1], reverse=True)[:cap]:
+        h = dict(hit_by_cid.get(cid) or {})
+        md = dict(h.get("metadata") or {})
+        md["bm25_anchor_rrf_score"] = float(sc)
+        if cid in set(anch_ids) and cid not in set(base_ids):
+            md["bm25_anchor_only"] = True
+        elif cid in set(anch_ids):
+            md["bm25_anchor_present"] = True
+        h["metadata"] = md
+        merged.append(h)
+    return merged
+
+
+async def _apply_bm25_anchor_pass(
+    *,
+    retrieval: RetrievalClient,
+    settings: Settings,
+    payload: ChatRequest,
+    retrieval_json: dict[str, Any],
+    mode: str,
+    top_k: int,
+    filters: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """
+    Run a small BM25 lookup on a keyword-only query and fuse candidates into retrieval_json["hits"].
+    This prevents exact-match entity chunks from being dropped by hybrid/rerank pipelines.
+    """
+    if not getattr(settings, "bm25_anchor_enabled", False):
+        return retrieval_json
+
+    base_hits = list(retrieval_json.get("hits") or [])
+    anchor_q = _keyword_query(payload.query) or (payload.query or "").strip()
+    if not anchor_q:
+        return retrieval_json
+
+    try:
+        anchor_top_k = max(1, int(getattr(settings, "bm25_anchor_top_k", 30)))
+        anchor_json = await retrieval.search(
+            query=anchor_q,
+            mode="bm25",
+            top_k=anchor_top_k,
+            rerank=False,
+            filters=filters,
+            acl=payload.acl,
+            include_sources=payload.include_sources,
+        )
+    except Exception as e:
+        logger.warning(
+            "bm25_anchor_pass_failed",
+            extra={"extra": {"error": str(e), "query": anchor_q, "mode": mode}},
+        )
+        return retrieval_json
+
+    anchor_hits = list(anchor_json.get("hits") or [])
+    if not anchor_hits:
+        return retrieval_json
+
+    # Fuse by RRF and cap to a reasonable candidate pool.
+    cap = max(len(base_hits), max(1, int(top_k)), max(1, int(getattr(settings, "bm25_anchor_top_k", 30))))
+    cap = max(20, min(80, int(cap)))
+    rrf_k = max(1, int(getattr(settings, "bm25_anchor_rrf_k", 60)))
+    merged_hits = _rrf_merge_hits_by_chunk_id(base_hits=base_hits, anchor_hits=anchor_hits, rrf_k=rrf_k, cap=cap)
+
+    out = dict(retrieval_json)
+    out["hits"] = merged_hits
+    out["bm25_anchor"] = {"query": anchor_q, "top_k": int(getattr(settings, "bm25_anchor_top_k", 30)), "rrf_k": rrf_k}
+    # propagate partial/degraded from anchor lookup
+    out["partial"] = bool(out.get("partial")) or bool(anchor_json.get("partial"))
+    out["degraded"] = sorted(set(list(out.get("degraded") or [])) | set(list(anchor_json.get("degraded") or [])))
+    return out
+
+
 def _extract_hint_terms_from_hits(hits: list[dict[str, Any]], *, max_terms: int) -> list[str]:
     """
     Best-effort: extract a few 'anchor' terms from top hits to build a follow-up query.
@@ -495,6 +604,17 @@ async def chat(payload: ChatRequest):
     except Exception as e:
         REQS.labels(endpoint="/v1/chat", status="502").inc()
         return ChatResponse(ok=False, answer=f"retrieval_error: {type(e).__name__}", used_mode=mode)
+
+    # BM25 anchor pass + union/fuse candidates (prevents exact-match entities from being dropped).
+    retrieval_json = await _apply_bm25_anchor_pass(
+        retrieval=state.retrieval,
+        settings=state.settings,
+        payload=payload,
+        retrieval_json=retrieval_json,
+        mode=mode,
+        top_k=top_k,
+        filters=filters,
+    )
 
     hits = retrieval_json.get("hits") or []
     degraded = retrieval_json.get("degraded") or []
@@ -1153,6 +1273,16 @@ async def chat_stream(payload: ChatRequest):
             except Exception as e:
                 yield f"data: {json.dumps({'error': f'retrieval_error: {type(e).__name__}'})}\n\n"
                 return
+
+            retrieval_json = await _apply_bm25_anchor_pass(
+                retrieval=state.retrieval,
+                settings=state.settings,
+                payload=payload,
+                retrieval_json=retrieval_json,
+                mode=mode,
+                top_k=top_k,
+                filters=filters,
+            )
 
             hits = retrieval_json.get("hits") or []
             degraded = retrieval_json.get("degraded") or []
