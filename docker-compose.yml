@@ -174,23 +174,69 @@ services:
     ports:
       - "8080:8080"
     environment:
+      # =========================
+      # Retrieval / Search quality knobs (RAG_*)
+      # =========================
+      # Service identity
+      - RAG_SERVICE_NAME=hybrid-retrieval
+      - RAG_ENVIRONMENT=dev
+      - RAG_LOG_LEVEL=INFO
+      # OpenSearch (BM25)
       - RAG_OS_URL=http://opensearch:9200
+      # Optional auth:
+      # - RAG_OS_USERNAME=...
+      # - RAG_OS_PASSWORD=...
+      - RAG_OS_INDEX_ALIAS=rag_chunks
+      - RAG_OS_INDEX_PREFIX=rag_chunks_v
+      # Qdrant (Vector)
       - RAG_QDRANT_URL=http://qdrant:6333
+      # Optional auth:
+      # - RAG_QDRANT_API_KEY=...
       # Use a separate collection because the host Infinity embedding model is 512-dim
       # (existing 'rag_chunks' may already be created with a different vector size).
       - RAG_QDRANT_COLLECTION=rag_chunks_512
+      - RAG_VECTOR_DISTANCE=cosine
       # Embeddings (Infinity inside docker network)
       - RAG_EMBEDDING_PROVIDER=http
       - RAG_EMBEDDING_URL=http://infinity-embed:7997/embeddings
       - RAG_EMBEDDING_MODEL=sentence-transformers/distiluse-base-multilingual-cased
+      # Optional auth (if your embeddings endpoint needs it):
+      # - RAG_EMBEDDING_API_KEY=...
+      - RAG_EMBEDDING_TIMEOUT_S=10
+      - RAG_EMBEDDING_BATCH_SIZE=32
       - RAG_VECTOR_SIZE=512
+      # Chunking (used only for mode=document indexing)
+      - RAG_CHUNK_MAX_TOKENS=300
+      - RAG_CHUNK_OVERLAP_TOKENS=50
+      # Candidate pool (QUALITY): increase recall before fusion/rerank
+      - RAG_DEFAULT_TOP_K=10
+      - RAG_BM25_TOP_K=120
+      - RAG_VECTOR_TOP_K=120
+      # Fusion tuning
+      - RAG_RRF_K=60
+      - RAG_WEIGHT_BM25=1.0
+      - RAG_WEIGHT_VECTOR=1.0
+      - RAG_FUSION_ALPHA=0.75
+      - RAG_MAX_CHUNKS_PER_DOC=3
+      # Sources / URI redaction
+      - RAG_REDACT_URI_MODE=none
       # Rerank (Infinity rerank service started by this compose)
       - RAG_RERANK_MODE=auto
       - RAG_RERANK_URL=http://infinity-rerank:7998/rerank
       - RAG_RERANK_MODEL=BAAI/bge-reranker-v2-m3
-      - RAG_LOG_LEVEL=INFO
+      # Optional auth (if your rerank endpoint needs it):
+      # - RAG_RERANK_API_KEY=...
+      # Rerank knobs (QUALITY): increase re-ranked candidate cap + allow more time
+      - RAG_RERANK_TIMEOUT_S=8
+      - RAG_RERANK_MAX_CANDIDATES=80
+      - RAG_RERANK_AUTO_MIN_QUERY_TOKENS=6
+      - RAG_RERANK_AUTO_MIN_INTERSECTION=2
+      # Page-level improvements (QUALITY)
       - RAG_ENABLE_PAGE_DEDUPLICATION=true
       - RAG_ENABLE_PARENT_PAGE_RETRIEVAL=true
+      # Observability (optional)
+      - RAG_OTEL_ENABLED=false
+      - RAG_OTEL_SERVICE_NAME=hybrid-retrieval
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -212,6 +258,12 @@ services:
     ports:
       - "8081:8081"
     environment:
+      # =========================
+      # Document storage (STORAGE_*)
+      # =========================
+      - STORAGE_SERVICE_NAME=document-storage
+      - STORAGE_ENVIRONMENT=dev
+      - STORAGE_LOG_LEVEL=INFO
       - STORAGE_STORAGE_BACKEND=s3
       - STORAGE_STORAGE_PATH=/data/documents
       - STORAGE_S3_ENDPOINT=http://rustfs:9000
@@ -221,7 +273,8 @@ services:
       - STORAGE_S3_REGION=${STORAGE_S3_REGION:-us-east-1}
       - STORAGE_DB_URL=postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/document_storage
       - STORAGE_MAX_FILE_SIZE_MB=100
-      - STORAGE_LOG_LEVEL=INFO
+      # Allow-list for uploaded file types (keep aligned with doc-processor capabilities)
+      - STORAGE_ALLOWED_CONTENT_TYPES=text/plain,text/markdown,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/html,application/xhtml+xml,text/xml,application/xml
     volumes:
       - document-storage-data:/data/documents
     depends_on:
@@ -261,12 +314,27 @@ services:
     ports:
       - "8082:8082"
     environment:
-      - PROCESSOR_STORAGE_URL=http://document-storage:8081
-      - PROCESSOR_RETRIEVAL_URL=http://retrieval:8080
-      - PROCESSOR_VLM_BASE_URL=http://vllm-docling:8123/v1
-      - PROCESSOR_VLM_MODEL=ibm-granite/granite-docling-258M
+      # =========================
+      # Document processing (PROCESSOR_*)
+      # =========================
+      - PROCESSOR_SERVICE_NAME=doc-processor
+      - PROCESSOR_ENVIRONMENT=dev
       - PROCESSOR_LOG_LEVEL=INFO
-      - PROCESSOR_MAX_PAGES=25
+      - PROCESSOR_STORAGE_URL=http://document-storage:8081
+      - PROCESSOR_STORAGE_TIMEOUT_S=60
+      - PROCESSOR_RETRIEVAL_URL=http://retrieval:8080
+      - PROCESSOR_RETRIEVAL_TIMEOUT_S=60
+      - PROCESSOR_VLM_BASE_URL=http://vllm-docling:8123/v1
+      # Optional auth (if your VLM endpoint needs it):
+      # - PROCESSOR_VLM_API_KEY=...
+      - PROCESSOR_VLM_MODEL=ibm-granite/granite-docling-258M
+      # Extraction quality knobs (QUALITY)
+      - PROCESSOR_VLM_TIMEOUT_S=180
+      - PROCESSOR_MAX_PAGES=35
+      - PROCESSOR_MAX_IMAGE_SIDE_PX=2000
+      # Chunking knobs
+      - PROCESSOR_CHUNK_SIZE_CHARS=4000
+      - PROCESSOR_CHUNK_OVERLAP_CHARS=300
     depends_on:
       document-storage:
         condition: service_started
@@ -286,12 +354,16 @@ services:
       - WORKER_QUEUE=ingestion.tasks
       - WORKER_RETRY_QUEUE=ingestion.tasks.retry
       - WORKER_DLQ_QUEUE=ingestion.tasks.dlq
+      - WORKER_RETRY_TTL_MS=5000
       - WORKER_MAX_ATTEMPTS=5
       - WORKER_PREFETCH=5
       - WORKER_METRICS_PORT=8083
       - WORKER_STORAGE_URL=http://document-storage:8081
+      - WORKER_STORAGE_TIMEOUT_S=60
       - WORKER_RETRIEVAL_URL=http://retrieval:8080
+      - WORKER_RETRIEVAL_TIMEOUT_S=60
       - WORKER_DOC_PROCESSOR_URL=http://doc-processor:8082
+      - WORKER_DOC_PROCESSOR_TIMEOUT_S=300
       - WORKER_LOG_LEVEL=INFO
     depends_on:
       rabbitmq:
@@ -312,15 +384,30 @@ services:
     ports:
       - "8090:8090"
     environment:
+      # =========================
+      # Gate / RAG orchestration (GATE_*)
+      # =========================
+      - GATE_SERVICE_NAME=rag-gate
+      - GATE_ENVIRONMENT=dev
+      - GATE_LOG_LEVEL=INFO
       # Use host-published retrieval port to avoid docker-network response issues
       - GATE_RETRIEVAL_URL=http://host.docker.internal:8080
       - GATE_RETRIEVAL_TIMEOUT_S=60
       - GATE_RETRIEVAL_MODE=hybrid
       - GATE_TOP_K=8
       - GATE_MAX_CONTEXT_CHARS=18000
+      # Multi-query retrieval (RRF fusion of query variants)
+      - GATE_MULTI_QUERY_ENABLED=true
+      - GATE_MULTI_QUERY_MAX_QUERIES=4
+      - GATE_MULTI_QUERY_TOP_K_MULTIPLIER=12
+      - GATE_MULTI_QUERY_RRF_K=60
+      # Two-pass retrieval (second query augmented with hint terms from pass1 hits)
+      - GATE_TWO_PASS_ENABLED=true
+      - GATE_TWO_PASS_HINT_MAX_TERMS=8
+      - GATE_TWO_PASS_MIN_UNIQUE_DOCS=3
       # BM25 anchor pass: ensure exact-match entities don't get dropped by hybrid/rerank
       - GATE_BM25_ANCHOR_ENABLED=true
-      - GATE_BM25_ANCHOR_TOP_K=30
+      - GATE_BM25_ANCHOR_TOP_K=60
       - GATE_BM25_ANCHOR_RRF_K=60
       # Document Storage
       - GATE_STORAGE_URL=http://document-storage:8081
@@ -336,7 +423,9 @@ services:
       - GATE_LLM_BASE_URL=${GATE_LLM_BASE_URL:-https://inference.asicloud.cudos.org/v1}
       - GATE_LLM_MODEL=${GATE_LLM_MODEL:-meta-llama/llama-3.3-70b-instruct}
       - GATE_LLM_API_KEY=${GATE_LLM_API_KEY:-}
-      - GATE_LOG_LEVEL=INFO
+      - GATE_LLM_TIMEOUT_S=60
+      # CORS / UI
+      - GATE_CORS_ALLOW_ORIGINS=*
     depends_on:
       retrieval:
         condition: service_started

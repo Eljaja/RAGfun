@@ -9,3 +9,5 @@ RUN set -euxo pipefail; \
     pip install --no-cache-dir -U "transformers>=4.51.0" "colpali-engine"; \
     python -c "import transformers; print('transformers', transformers.__version__)"
 
+
+

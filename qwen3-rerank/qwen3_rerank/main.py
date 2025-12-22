@@ -114,3 +114,5 @@ def rerank(req: RerankRequest) -> dict[str, Any]:
 
     return {"results": results}
 
+
+

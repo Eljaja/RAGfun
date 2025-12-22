@@ -17,3 +17,5 @@ ENV RERANK_PORT=7998
 ENTRYPOINT ["bash", "-lc"]
 CMD ["source /app/.venv/bin/activate && uvicorn qwen3_rerank.main:app --host 0.0.0.0 --port ${RERANK_PORT} --log-level info"]
 
+
+
