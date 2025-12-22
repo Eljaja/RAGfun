@@ -198,6 +198,8 @@ async def index_upsert(payload: IndexUpsertRequest):
                 embedder=state.embedder,
                 max_tokens=state.settings.chunk_max_tokens,
                 overlap_tokens=state.settings.chunk_overlap_tokens,
+                embedding_contextual_headers_enabled=state.settings.embedding_contextual_headers_enabled,
+                embedding_contextual_headers_max_chars=state.settings.embedding_contextual_headers_max_chars,
             ),
             timeout=900.0  # 15 minutes for very large documents
         )

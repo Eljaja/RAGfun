@@ -65,6 +65,14 @@ class Settings(BaseSettings):
     enable_page_deduplication: bool = False  # Deduplicate chunks by (doc_id, page)
     enable_parent_page_retrieval: bool = False  # Return full pages instead of chunks
 
+    # Embedding enrichment (opt-in):
+    # prepend lightweight contextual headers (title/uri/page/lang/source) to the text BEFORE embedding,
+    # while keeping stored chunk text unchanged.
+    # This usually improves vector retrieval for ambiguous references and multi-hop questions,
+    # but requires re-embedding once enabled.
+    embedding_contextual_headers_enabled: bool = False
+    embedding_contextual_headers_max_chars: int = 400
+
     # Observability
     otel_enabled: bool = False
     otel_service_name: str = "hybrid-retrieval"
@@ -96,6 +104,7 @@ class Settings(BaseSettings):
                 "api_key_set": self.embedding_api_key is not None,
                 "timeout_s": self.embedding_timeout_s,
                 "batch_size": self.embedding_batch_size,
+                "contextual_headers_enabled": self.embedding_contextual_headers_enabled,
             },
             "chunking": {
                 "max_tokens": self.chunk_max_tokens,

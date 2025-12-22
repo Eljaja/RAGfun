@@ -51,6 +51,51 @@ def _chunk_id(doc_id: str, chunk_index: int) -> str:
     return f"{doc_id}:{chunk_index}"
 
 
+def _build_embedding_input(
+    *,
+    chunk: ChunkMeta,
+    enabled: bool,
+    max_header_chars: int,
+) -> str:
+    """
+    Build text to embed. When enabled, prepend a compact contextual header (doc metadata + locator)
+    to improve retrieval, while keeping stored chunk text unchanged.
+    """
+    txt = (chunk.text or "").strip()
+    if not enabled:
+        return txt
+
+    header_lines: list[str] = []
+    if chunk.title:
+        header_lines.append(f"Title: {chunk.title}")
+    if chunk.uri:
+        header_lines.append(f"URI: {chunk.uri}")
+    if chunk.source:
+        header_lines.append(f"Source: {chunk.source}")
+    if chunk.lang:
+        header_lines.append(f"Lang: {chunk.lang}")
+    if chunk.tenant_id:
+        header_lines.append(f"Tenant: {chunk.tenant_id}")
+    if chunk.project_id:
+        header_lines.append(f"Project: {chunk.project_id}")
+
+    if chunk.locator and chunk.locator.page is not None:
+        header_lines.append(f"Page: {chunk.locator.page}")
+    if chunk.locator and chunk.locator.anchor:
+        header_lines.append(f"Anchor: {chunk.locator.anchor}")
+    if chunk.locator and chunk.locator.heading_path:
+        hp = " / ".join([h for h in (chunk.locator.heading_path or []) if h])
+        if hp:
+            header_lines.append(f"Heading: {hp}")
+
+    header = "\n".join(header_lines).strip()
+    if max_header_chars and max_header_chars > 0 and len(header) > int(max_header_chars):
+        header = header[: int(max_header_chars)].rstrip() + "…"
+    if not header:
+        return txt
+    return (header + "\n\n" + txt).strip()
+
+
 async def upsert(
     *,
     req: IndexUpsertRequest,
@@ -59,6 +104,8 @@ async def upsert(
     embedder: EmbeddingsClient,
     max_tokens: int,
     overlap_tokens: int,
+    embedding_contextual_headers_enabled: bool = False,
+    embedding_contextual_headers_max_chars: int = 400,
 ) -> IndexUpsertResponse:
     if req.mode == "document":
         if not req.document or req.text is None:
@@ -79,12 +126,24 @@ async def upsert(
     if not req.chunks:
         return IndexUpsertResponse(ok=False, partial=True, errors=[{"error": "no_chunks"}])
 
-    # normalize + compute content_hash
+    # normalize + compute hashes
     chunks: list[ChunkMeta] = []
     for c in req.chunks:
         c = _normalize_chunk(c, req.document)
         c.content_hash = c.content_hash or sha256_hex(c.text)
         chunks.append(c)
+
+    # embedding inputs + embed hashes (may include contextual headers)
+    embed_input_by_id: dict[str, str] = {}
+    embed_hash_by_id: dict[str, str] = {}
+    for c in chunks:
+        emb_in = _build_embedding_input(
+            chunk=c,
+            enabled=bool(embedding_contextual_headers_enabled),
+            max_header_chars=int(embedding_contextual_headers_max_chars),
+        )
+        embed_input_by_id[c.chunk_id] = emb_in
+        embed_hash_by_id[c.chunk_id] = sha256_hex(emb_in)
 
     upserted = 0
     skipped = 0
@@ -98,6 +157,7 @@ async def upsert(
     need_embed: list[ChunkMeta] = []
     for c in chunks:
         existing_hash = None
+        existing_embed_hash = None
         qdrant_has_point = False
         if qdrant is not None:
             try:
@@ -105,21 +165,35 @@ async def upsert(
                 if ex and isinstance(ex.get("payload"), dict):
                     qdrant_has_point = True
                     existing_hash = ex["payload"].get("content_hash")
+                    existing_embed_hash = ex["payload"].get("embed_hash")
             except Exception:
                 existing_hash = None
+                existing_embed_hash = None
         if qdrant is None and existing_hash is None and os_client is not None:
             try:
                 exs = await asyncio.to_thread(os_client.get_by_id, c.chunk_id)
                 if exs:
                     existing_hash = exs.get("content_hash")
+                    existing_embed_hash = exs.get("embed_hash")
             except Exception:
                 existing_hash = None
-        if qdrant is not None and qdrant_has_point and existing_hash == c.content_hash:
-            skipped += 1
-        elif qdrant is None and existing_hash == c.content_hash:
-            skipped += 1
+                existing_embed_hash = None
+        desired_embed_hash = embed_hash_by_id.get(c.chunk_id)
+        if embedding_contextual_headers_enabled:
+            # When embedding input changes, we must re-embed even if raw chunk text is unchanged.
+            if qdrant is not None and qdrant_has_point and existing_embed_hash == desired_embed_hash:
+                skipped += 1
+            elif qdrant is None and existing_embed_hash == desired_embed_hash:
+                skipped += 1
+            else:
+                need_embed.append(c)
         else:
-            need_embed.append(c)
+            if qdrant is not None and qdrant_has_point and existing_hash == c.content_hash:
+                skipped += 1
+            elif qdrant is None and existing_hash == c.content_hash:
+                skipped += 1
+            else:
+                need_embed.append(c)
 
     # embed batch
     vectors: dict[str, list[float]] = {}
@@ -127,7 +201,7 @@ async def upsert(
         with tracer.start_as_current_span("embed"):
             with LAT.labels("embed").time():
                 try:
-                    embs = await embedder.embed([c.text for c in need_embed])
+                    embs = await embedder.embed([embed_input_by_id.get(c.chunk_id, c.text) for c in need_embed])
                     for c, v in zip(need_embed, embs, strict=False):
                         vectors[c.chunk_id] = v
                 except Exception as e:
@@ -159,6 +233,7 @@ async def upsert(
                                 "created_at": c.created_at.isoformat() if c.created_at else None,
                                 "updated_at": c.updated_at.isoformat() if c.updated_at else None,
                                 "content_hash": c.content_hash,
+                                "embed_hash": embed_hash_by_id.get(c.chunk_id),
                                 "token_count": c.token_count,
                                 "locator": c.locator.model_dump() if c.locator else None,
                             }
@@ -209,6 +284,7 @@ async def upsert(
                             "created_at": c.created_at.isoformat() if c.created_at else None,
                             "updated_at": c.updated_at.isoformat() if c.updated_at else None,
                             "content_hash": c.content_hash,
+                            "embed_hash": embed_hash_by_id.get(c.chunk_id),
                             "token_count": c.token_count,
                             "locator": c.locator.model_dump() if c.locator else None,
                         }
