@@ -14,7 +14,20 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from app.config import Settings, load_settings
 from app.database import DatabaseClient
-from app.metrics import ERRS, LAT, REQS
+from app.metrics import (
+    ERRS,
+    HTTP_INFLIGHT,
+    HTTP_LAT,
+    HTTP_REQS,
+    HTTP_REQ_SIZE,
+    HTTP_RESP_SIZE,
+    LAT,
+    REQS,
+    STORAGE_BYTES,
+    STORAGE_DEDUP,
+    STORAGE_DOCS,
+    STORAGE_UPLOAD_BYTES,
+)
 from app.models import DocumentMetadata, DocumentSearchRequest, DocumentSearchResponse, PatchExtraRequest, PatchExtraByIdRequest, StoreDocumentResponse
 from app.observability import TraceContextFilter, setup_json_logging
 from app.storage import StorageBackend, create_storage_backend
@@ -88,6 +101,29 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 @app.middleware("http")
 async def access_log(request: Request, call_next):
+    # Prometheus HTTP metrics (avoid self-scrape noise)
+    path = request.url.path
+    if path not in ("/v1/metrics", "/metrics"):
+        method = request.method
+        route_obj = request.scope.get("route")
+        route = getattr(route_obj, "path", None) or path
+
+        def _cl(headers) -> int | None:
+            try:
+                v = headers.get("content-length")
+                return int(v) if v is not None else None
+            except Exception:
+                return None
+
+        req_size = _cl(request.headers)
+        HTTP_INFLIGHT.labels(method=method, route=route).inc()
+        start_perf = time.perf_counter()
+    else:
+        method = request.method
+        route = request.url.path
+        req_size = None
+        start_perf = None
+
     start = time.time()
     response: Response | None = None
     try:
@@ -96,6 +132,23 @@ async def access_log(request: Request, call_next):
     finally:
         dur_ms = (time.time() - start) * 1000.0
         status = response.status_code if response is not None else 500
+
+        # Prometheus HTTP metrics
+        if start_perf is not None:
+            dur_s = max(0.0, time.perf_counter() - start_perf)
+            HTTP_REQS.labels(method=method, route=route, status=str(status)).inc()
+            HTTP_LAT.labels(method=method, route=route, status=str(status)).observe(dur_s)
+            if req_size is not None:
+                HTTP_REQ_SIZE.labels(method=method, route=route).observe(req_size)
+            resp_size = None
+            try:
+                resp_size = int(response.headers.get("content-length")) if response is not None and response.headers.get("content-length") else None
+            except Exception:
+                resp_size = None
+            if resp_size is not None:
+                HTTP_RESP_SIZE.labels(method=method, route=route, status=str(status)).observe(resp_size)
+            HTTP_INFLIGHT.labels(method=method, route=route).dec()
+
         # Don't log DELETE requests that return 404 - documents may already be deleted
         if request.method == "DELETE" and status == 404:
             logger.debug(
@@ -154,6 +207,15 @@ async def version():
 
 @app.get("/v1/metrics")
 async def metrics():
+    # Refresh "capacity" gauges from DB on scrape (cheap enough for small dev DB)
+    if state.db is not None:
+        try:
+            stats = await _run_sync(state.db.get_usage_stats)
+            STORAGE_DOCS.set(int(stats.get("docs") or 0))
+            STORAGE_BYTES.set(int(stats.get("bytes") or 0))
+        except Exception:
+            # best-effort: never fail scrape
+            pass
     data = generate_latest()
     return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
@@ -257,6 +319,10 @@ async def store_document(
             )
 
         REQS.labels(endpoint="/v1/documents/store", status="200").inc()
+        # Dedup metrics (based on DB lookup result)
+        outcome = "duplicate" if bool(duplicate_of) else "unique"
+        STORAGE_DEDUP.labels(outcome=outcome).inc()
+        STORAGE_UPLOAD_BYTES.labels(outcome=outcome).inc(len(content))
         return StoreDocumentResponse(
             ok=True,
             storage_id=storage_id,

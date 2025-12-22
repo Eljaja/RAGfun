@@ -357,6 +357,22 @@ class DatabaseClient:
         finally:
             self.pool.putconn(conn)
 
+    def get_usage_stats(self) -> dict[str, int]:
+        """
+        Lightweight usage stats for Prometheus gauges.
+        Returns: {"docs": <count>, "bytes": <sum(size)>}
+        """
+        conn = self.pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*)::bigint as docs, COALESCE(SUM(size), 0)::bigint as bytes FROM document_metadata"
+                )
+                row = cur.fetchone() or {}
+                return {"docs": int(row.get("docs") or 0), "bytes": int(row.get("bytes") or 0)}
+        finally:
+            self.pool.putconn(conn)
+
     def _row_to_metadata(self, row: dict) -> DocumentMetadata:
         """Convert database row to DocumentMetadata."""
         return DocumentMetadata(
