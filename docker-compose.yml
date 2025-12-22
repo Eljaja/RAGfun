@@ -145,9 +145,16 @@ services:
   rabbitmq:
     image: rabbitmq:3-management
     container_name: rabbitmq
+    # Enable built-in Prometheus metrics plugin (exposes :15692/metrics)
+    command: >
+      sh -c "
+        rabbitmq-plugins enable --offline rabbitmq_prometheus &&
+        rabbitmq-server
+      "
     ports:
       - "5672:5672"
       - "15672:15672"
+      - "15692:15692"
     environment:
       - RABBITMQ_DEFAULT_USER=${RABBITMQ_DEFAULT_USER:-guest}
       - RABBITMQ_DEFAULT_PASS=${RABBITMQ_DEFAULT_PASS:-guest}
@@ -163,7 +170,9 @@ services:
   infinity-embed:
     image: michaelf34/infinity:latest
     container_name: infinity-embed
-    command: ["v2", "--model-id", "sentence-transformers/distiluse-base-multilingual-cased", "--port", "7997"]
+    # Stronger multilingual embedding model (better recall for RU factoid QA).
+    # NOTE: this changes vector dimensionality -> requires re-indexing into a new Qdrant collection.
+    command: ["v2", "--model-id", "BAAI/bge-m3", "--port", "7997"]
     networks:
       - rag-network
 
@@ -194,30 +203,35 @@ services:
       # - RAG_QDRANT_API_KEY=...
       # Use a separate collection because the host Infinity embedding model is 512-dim
       # (existing 'rag_chunks' may already be created with a different vector size).
-      - RAG_QDRANT_COLLECTION=rag_chunks_512
+      # BAAI/bge-m3 is 1024-dim -> use a separate collection to avoid dimension mismatch.
+      - RAG_QDRANT_COLLECTION=rag_chunks_bge_m3_1024
       - RAG_VECTOR_DISTANCE=cosine
       # Embeddings (Infinity inside docker network)
       - RAG_EMBEDDING_PROVIDER=http
       - RAG_EMBEDDING_URL=http://infinity-embed:7997/embeddings
-      - RAG_EMBEDDING_MODEL=sentence-transformers/distiluse-base-multilingual-cased
+      - RAG_EMBEDDING_MODEL=BAAI/bge-m3
       # Optional auth (if your embeddings endpoint needs it):
       # - RAG_EMBEDDING_API_KEY=...
       - RAG_EMBEDDING_TIMEOUT_S=10
       - RAG_EMBEDDING_BATCH_SIZE=32
-      - RAG_VECTOR_SIZE=512
+      - RAG_VECTOR_SIZE=1024
+      # Contextual Chunk Headers (CCH) for embeddings (opt-in; requires re-index/re-embed when enabled)
+      - RAG_EMBEDDING_CONTEXTUAL_HEADERS_ENABLED=true
+      - RAG_EMBEDDING_CONTEXTUAL_HEADERS_MAX_CHARS=400
       # Chunking (used only for mode=document indexing)
       - RAG_CHUNK_MAX_TOKENS=300
       - RAG_CHUNK_OVERLAP_TOKENS=50
       # Candidate pool (QUALITY): increase recall before fusion/rerank
-      - RAG_DEFAULT_TOP_K=10
-      - RAG_BM25_TOP_K=120
-      - RAG_VECTOR_TOP_K=120
+      - RAG_DEFAULT_TOP_K=20
+      - RAG_BM25_TOP_K=200
+      - RAG_VECTOR_TOP_K=200
       # Fusion tuning
       - RAG_RRF_K=60
       - RAG_WEIGHT_BM25=1.0
       - RAG_WEIGHT_VECTOR=1.0
       - RAG_FUSION_ALPHA=0.75
-      - RAG_MAX_CHUNKS_PER_DOC=3
+      # IMPORTANT for file_hit@k: return more unique doc_ids in top_k by limiting chunks-per-doc.
+      - RAG_MAX_CHUNKS_PER_DOC=1
       # Sources / URI redaction
       - RAG_REDACT_URI_MODE=none
       # Rerank (Infinity rerank service started by this compose)
@@ -227,8 +241,8 @@ services:
       # Optional auth (if your rerank endpoint needs it):
       # - RAG_RERANK_API_KEY=...
       # Rerank knobs (QUALITY): increase re-ranked candidate cap + allow more time
-      - RAG_RERANK_TIMEOUT_S=8
-      - RAG_RERANK_MAX_CANDIDATES=80
+      - RAG_RERANK_TIMEOUT_S=15
+      - RAG_RERANK_MAX_CANDIDATES=200
       - RAG_RERANK_AUTO_MIN_QUERY_TOKENS=6
       - RAG_RERANK_AUTO_MIN_INTERSECTION=2
       # Page-level improvements (QUALITY)
@@ -306,6 +320,27 @@ services:
         reservations:
           devices:
             - capabilities: [gpu]
+
+  # Router LLM (OpenAI-compatible) for auto-tuning retrieval knobs (optional)
+  vllm-ministral-router:
+    image: vllm/vllm-openai:latest
+    container_name: vllm-ministral-router
+    command: ["--model", "mistralai/Ministral-3-3B-Base-2512", "--port", "8112"]
+    ports:
+      - "8112:8112"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      - HF_HOME=/root/.cache/huggingface
+      - NVIDIA_VISIBLE_DEVICES=2
+    networks:
+      - rag-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              device_ids: ["2"]
 
   # Document Processor Service (pulls files from document-storage, uses Granite-Docling via vLLM, indexes into retrieval)
   doc-processor:
@@ -394,15 +429,30 @@ services:
       - GATE_RETRIEVAL_URL=http://host.docker.internal:8080
       - GATE_RETRIEVAL_TIMEOUT_S=60
       - GATE_RETRIEVAL_MODE=hybrid
+      # Default top_k for chat requests (ru_eval overrides per-request, but keeping this aligned helps).
       - GATE_TOP_K=8
       - GATE_MAX_CONTEXT_CHARS=18000
+      # Context packing (segment stitching) (opt-in)
+      - GATE_SEGMENT_STITCHING_ENABLED=false
+      - GATE_SEGMENT_STITCHING_MAX_CHUNKS=4
+      - GATE_SEGMENT_STITCHING_GROUP_BY_PAGE=true
+      # Router (auto-tune retrieval knobs) (opt-in)
+      - GATE_ROUTER_ENABLED=false
+      - GATE_ROUTER_DRY_RUN=false
+      - GATE_ROUTER_LLM_PROVIDER=openai_compat
+      - GATE_ROUTER_LLM_BASE_URL=http://vllm-ministral-router:8112/v1
+      - GATE_ROUTER_LLM_MODEL=mistralai/Ministral-3-3B-Base-2512
+      - GATE_ROUTER_LLM_API_KEY=
+      - GATE_ROUTER_LLM_TIMEOUT_S=10
+      - GATE_ROUTER_LLM_TEMPERATURE=0.0
+      - GATE_ROUTER_LLM_MAX_TOKENS=220
       # Multi-query retrieval (RRF fusion of query variants)
       - GATE_MULTI_QUERY_ENABLED=true
       - GATE_MULTI_QUERY_MAX_QUERIES=4
       - GATE_MULTI_QUERY_TOP_K_MULTIPLIER=12
       - GATE_MULTI_QUERY_RRF_K=60
       # Two-pass retrieval (second query augmented with hint terms from pass1 hits)
-      - GATE_TWO_PASS_ENABLED=true
+      - GATE_TWO_PASS_ENABLED=false
       - GATE_TWO_PASS_HINT_MAX_TERMS=8
       - GATE_TWO_PASS_MIN_UNIQUE_DOCS=3
       # BM25 anchor pass: ensure exact-match entities don't get dropped by hybrid/rerank
@@ -421,7 +471,7 @@ services:
       # LLM (OpenAI-compatible). Keep mock as default to avoid requiring a key by default.
       - GATE_LLM_PROVIDER=${GATE_LLM_PROVIDER:-openai_compat}
       - GATE_LLM_BASE_URL=${GATE_LLM_BASE_URL:-https://inference.asicloud.cudos.org/v1}
-      - GATE_LLM_MODEL=${GATE_LLM_MODEL:-meta-llama/llama-3.3-70b-instruct}
+      - GATE_LLM_MODEL=${GATE_LLM_MODEL:-openai/gpt-oss-120bt}
       - GATE_LLM_API_KEY=${GATE_LLM_API_KEY:-}
       - GATE_LLM_TIMEOUT_S=60
       # CORS / UI
@@ -472,6 +522,62 @@ services:
     volumes:
       - prometheus-data:/prometheus
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - rag-network
+
+  # Postgres metrics exporter (Prometheus)
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.16.0
+    container_name: postgres-exporter
+    environment:
+      - DATA_SOURCE_NAME=postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/postgres?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - rag-network
+
+  # OpenSearch metrics exporter (Prometheus)
+  opensearch-exporter:
+    image: prometheuscommunity/elasticsearch-exporter:v1.8.0
+    container_name: opensearch-exporter
+    command:
+      - "--es.uri=http://opensearch:9200"
+      - "--es.all"
+      - "--es.indices"
+      - "--es.shards"
+      - "--es.cluster_settings"
+      - "--es.timeout=10s"
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    networks:
+      - rag-network
+
+  # Host metrics (Prometheus)
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: node-exporter
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--path.rootfs=/rootfs"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    networks:
+      - rag-network
+
+  # Container metrics (Prometheus)
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: cadvisor
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:rw
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
     networks:
       - rag-network
 
