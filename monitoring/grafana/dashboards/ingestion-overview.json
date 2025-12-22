@@ -95,6 +95,27 @@
           "legendFormat": "{{type}}/{{stage}}"
         }
       ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "RabbitMQ queue depth (messages)",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "targets": [
+        { "refId": "A", "expr": "sum(rabbitmq_queue_messages) by (queue)", "legendFormat": "{{queue}}" }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "RabbitMQ deliveries / publishes — rate",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(rabbitmq_channel_messages_published_total[1m]))", "legendFormat": "published" },
+        { "refId": "B", "expr": "sum(rate(rabbitmq_channel_messages_delivered_total[1m]))", "legendFormat": "delivered" }
+      ]
     }
   ]
 }
