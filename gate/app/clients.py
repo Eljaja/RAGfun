@@ -27,6 +27,7 @@ class RetrievalClient:
         filters: dict[str, Any] | None,
         acl: list[str],
         include_sources: bool,
+        max_chunks_per_doc: int | None = None,
     ) -> dict[str, Any]:
         payload = {
             "query": query,
@@ -39,6 +40,8 @@ class RetrievalClient:
             "acl": acl,
             "group_by_doc": True,
         }
+        if max_chunks_per_doc is not None:
+            payload["max_chunks_per_doc"] = int(max_chunks_per_doc)
         async with httpx.AsyncClient(timeout=self._timeout_s) as client:
             r = await client.post(f"{self._base_url}/v1/search", json=payload)
             try:

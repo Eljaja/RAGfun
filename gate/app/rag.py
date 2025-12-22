@@ -3,7 +3,12 @@ from __future__ import annotations
 from typing import Any
 
 
-def build_context_blocks(*, hits: list[dict[str, Any]], max_chars: int) -> tuple[list[dict[str, Any]], str, list[dict[str, Any]]]:
+def build_context_blocks(
+    *,
+    hits: list[dict[str, Any]],
+    max_chars: int,
+    max_chunk_chars: int | None = None,
+) -> tuple[list[dict[str, Any]], str, list[dict[str, Any]]]:
     """
     Returns: (kept_hits, context_text, sources)
     """
@@ -22,6 +27,8 @@ def build_context_blocks(*, hits: list[dict[str, Any]], max_chars: int) -> tuple
         txt = (h.get("text") or "").strip()
         if not txt:
             continue
+        if max_chunk_chars is not None and max_chunk_chars > 0 and len(txt) > int(max_chunk_chars):
+            txt = txt[: int(max_chunk_chars)].rstrip() + "\n…"
 
         src = h.get("source") or {}
         title = src.get("title") or h.get("metadata", {}).get("title")
@@ -64,7 +71,13 @@ def build_context_blocks(*, hits: list[dict[str, Any]], max_chars: int) -> tuple
     return kept, "\n\n".join(parts), uniq
 
 
-def build_messages(*, query: str, history: list[dict[str, str]], context_text: str) -> list[dict[str, str]]:
+def build_messages(
+    *,
+    query: str,
+    history: list[dict[str, str]],
+    context_text: str,
+    include_sources: bool,
+) -> list[dict[str, str]]:
     sys = {
         "role": "system",
         "content": (
@@ -81,6 +94,14 @@ def build_messages(*, query: str, history: list[dict[str, str]], context_text: s
             "- If the provided context does not have enough information to answer, say \"I don't know.\"\n"
             "- Do **not** guess, infer, or use general world knowledge if it is not supported by the context.\n"
             "- Do **not** mention the word \"context\" or say \"based on the context.\" Simply answer the question directly.\n\n"
+            "## Factoid / entity questions (extra strict):\n"
+            "- For questions asking for a **name**, **title**, **city/country**, **date**, **number**, **genre**, **definition**, or a short **fact**:\n"
+            "  - Locate the exact supporting sentence/phrase in the sources.\n"
+            "  - Copy the final answer token(s) **verbatim** from the sources (do not paraphrase the entity/value).\n"
+            "  - If multiple different candidates appear in sources and it's ambiguous, say \"I don't know.\"\n"
+            "- For **lists** (e.g. \"who participated\", \"which countries\"):\n"
+            "  - Include **all** items explicitly present in sources.\n"
+            "  - Do not add missing items from memory.\n\n"
             "## Reliability / rumor & speculation policy (strict):\n"
             "- Treat rumors, allegations, \"reportedly,\" \"unconfirmed,\" \"speculation,\" and social-media claims as **unverified** information.\n"
             "- Do **not** present **unverified** claims as the explanation or reason for an event.\n"
@@ -89,14 +110,20 @@ def build_messages(*, query: str, history: list[dict[str, str]], context_text: s
             "## Conflicts & ambiguity:\n"
             "- If sources **conflict** on a key fact, do not pick a side; state that the sources conflict and you don't know the answer.\n"
             "- Prefer the most direct, explicit statements from the sources over indirect hints.\n\n"
+        )
+        + (
             "## Citations (required):\n"
             "- Every factual claim from the sources **must** have an inline citation like [1].\n"
             "- If a claim is supported by multiple sources, cite all of them (e.g. [1][2]).\n"
             "- Citation numbers must correspond to the source listings in the provided context blocks.\n"
             "- If you refuse to answer or say \"I don't know,\" do **not** include any citations.\n\n"
+            if include_sources
+            else "## Citations:\n- Do NOT include any citations like [1] in your answer.\n\n"
+        )
+        + (
             "## Answer style best practices:\n"
             "- Be concise but complete in your answers.\n"
-            "- If the question asks for a number, date, or name, provide the exact value in the answer.\n"
+            "- If the question asks for a number, date, name, CLI command, or code, provide it **only if it is explicitly present in the sources**, and copy it exactly.\n"
             "- If the question asks for a list or set of items, format the answer as a comma-separated list (or use bullet points if the list is long).\n"
             "- If the question is based on a false premise (an incorrect assumption), explicitly note that the premise is false and then give the correct information.\n"
             "- If the answer might change over time, use only time-specific information from the sources and avoid phrases like \"as of today\" unless the source gives that context.\n"
