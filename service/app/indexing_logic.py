@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any
+from typing import TypeVar
 
 from opentelemetry import trace
 from qdrant_client.http import models as qm
@@ -18,6 +19,15 @@ from app.utils import sha256_hex
 
 logger = logging.getLogger("rag.index")
 tracer = trace.get_tracer("rag.index")
+
+T = TypeVar("T")
+
+
+def _iter_batches(items: list[T], batch_size: int) -> list[list[T]]:
+    if not items:
+        return []
+    bs = max(1, int(batch_size))
+    return [items[i : i + bs] for i in range(0, len(items), bs)]
 
 
 def _normalize_chunk(chunk: ChunkMeta, doc: DocumentMeta | None) -> ChunkMeta:
@@ -104,6 +114,7 @@ async def upsert(
     embedder: EmbeddingsClient,
     max_tokens: int,
     overlap_tokens: int,
+    embedding_batch_size: int = 32,
     embedding_contextual_headers_enabled: bool = False,
     embedding_contextual_headers_max_chars: int = 400,
 ) -> IndexUpsertResponse:
@@ -155,13 +166,26 @@ async def upsert(
     #   If point is missing in Qdrant we MUST embed, even if OpenSearch already has the same content_hash.
     # - If Qdrant is disabled, we fallback to OpenSearch only to avoid pointless work.
     need_embed: list[ChunkMeta] = []
+
+    # Preload existing points from Qdrant in batches to avoid N network calls.
+    # We only need payload fields: content_hash/embed_hash.
+    qdrant_existing_by_chunk_id: dict[str, dict[str, Any]] = {}
+    if qdrant is not None:
+        try:
+            for batch in _iter_batches([c.chunk_id for c in chunks], batch_size=256):
+                ex_map = await asyncio.to_thread(qdrant.retrieve_many, batch)
+                if ex_map:
+                    qdrant_existing_by_chunk_id.update(ex_map)
+        except Exception:
+            qdrant_existing_by_chunk_id = {}
+
     for c in chunks:
         existing_hash = None
         existing_embed_hash = None
         qdrant_has_point = False
         if qdrant is not None:
             try:
-                ex = await asyncio.to_thread(qdrant.retrieve, c.chunk_id)
+                ex = qdrant_existing_by_chunk_id.get(c.chunk_id)
                 if ex and isinstance(ex.get("payload"), dict):
                     qdrant_has_point = True
                     existing_hash = ex["payload"].get("content_hash")
@@ -201,9 +225,13 @@ async def upsert(
         with tracer.start_as_current_span("embed"):
             with LAT.labels("embed").time():
                 try:
-                    embs = await embedder.embed([embed_input_by_id.get(c.chunk_id, c.text) for c in need_embed])
-                    for c, v in zip(need_embed, embs, strict=False):
-                        vectors[c.chunk_id] = v
+                    # Avoid huge embedding requests: split into batches.
+                    bs = max(1, int(embedding_batch_size))
+                    for batch in _iter_batches(need_embed, batch_size=bs):
+                        texts = [embed_input_by_id.get(c.chunk_id, c.text) for c in batch]
+                        embs = await embedder.embed(texts)
+                        for c, v in zip(batch, embs, strict=False):
+                            vectors[c.chunk_id] = v
                 except Exception as e:
                     ERRS.labels("embed", type(e).__name__).inc()
                     partial = True

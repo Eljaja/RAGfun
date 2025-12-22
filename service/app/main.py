@@ -15,7 +15,7 @@ from app.clients.qdrant import QdrantFacade
 from app.clients.rerank import RerankClient
 from app.indexing_logic import delete as delete_logic
 from app.indexing_logic import upsert as upsert_logic
-from app.metrics import REQS
+from app.metrics import HTTP_INFLIGHT, HTTP_LAT, HTTP_REQS, HTTP_REQ_SIZE, HTTP_RESP_SIZE, RAG_PARTIAL, RAG_RERANK, REQS
 from app.models import IndexDeleteRequest, IndexExistsRequest, IndexExistsResponse, IndexUpsertRequest, SearchRequest
 from app.observability import TraceContextFilter, setup_json_logging, setup_otel
 from app.search_logic import search as search_logic
@@ -53,6 +53,12 @@ async def lifespan(app: FastAPI):
     setup_json_logging(state.settings.log_level)
     logging.getLogger().addFilter(TraceContextFilter())
     setup_otel(state.settings.otel_enabled, state.settings.otel_service_name, fastapi_app=app)
+
+    # Pre-create common label series so Grafana panels show 0 instead of "No data" right after startup.
+    RAG_PARTIAL.labels(endpoint="/v1/search", kind="partial").inc(0)
+    RAG_PARTIAL.labels(endpoint="/v1/search", kind="partial_rerank").inc(0)
+    for outcome in ("applied", "skipped", "failed", "unavailable"):
+        RAG_RERANK.labels(outcome=outcome).inc(0)
 
     # Build clients and validate essential resources (best-effort; readiness reflects availability).
     state.embedder = EmbeddingsClient(
@@ -130,12 +136,43 @@ app = FastAPI(title="Hybrid Retrieval", version="0.1.0", lifespan=lifespan)
 
 @app.middleware("http")
 async def access_log(request: Request, call_next):
-    start = time.time()
+    # Prometheus HTTP metrics (avoid self-scrape noise)
+    path = request.url.path
+    if path in ("/v1/metrics", "/metrics"):
+        return await call_next(request)
+
+    method = request.method
+    route_obj = request.scope.get("route")
+    route = getattr(route_obj, "path", None) or path
+
+    def _cl(headers) -> int | None:
+        try:
+            v = headers.get("content-length")
+            return int(v) if v is not None else None
+        except Exception:
+            return None
+
+    req_size = _cl(request.headers)
+
+    HTTP_INFLIGHT.labels(method=method, route=route).inc()
+    start = time.perf_counter()
+    response: Response | None = None
     try:
         response = await call_next(request)
         return response
     finally:
-        dur_ms = (time.time() - start) * 1000.0
+        dur_s = max(0.0, time.perf_counter() - start)
+        status = response.status_code if response is not None else 500
+        HTTP_REQS.labels(method=method, route=route, status=str(status)).inc()
+        HTTP_LAT.labels(method=method, route=route, status=str(status)).observe(dur_s)
+        if req_size is not None:
+            HTTP_REQ_SIZE.labels(method=method, route=route).observe(req_size)
+        resp_size = _cl(response.headers) if response is not None else None
+        if resp_size is not None:
+            HTTP_RESP_SIZE.labels(method=method, route=route, status=str(status)).observe(resp_size)
+        HTTP_INFLIGHT.labels(method=method, route=route).dec()
+
+        dur_ms = dur_s * 1000.0
         logger.info(
             "http_request",
             extra={
@@ -198,6 +235,7 @@ async def index_upsert(payload: IndexUpsertRequest):
                 embedder=state.embedder,
                 max_tokens=state.settings.chunk_max_tokens,
                 overlap_tokens=state.settings.chunk_overlap_tokens,
+                embedding_batch_size=state.settings.embedding_batch_size,
                 embedding_contextual_headers_enabled=state.settings.embedding_contextual_headers_enabled,
                 embedding_contextual_headers_max_chars=state.settings.embedding_contextual_headers_max_chars,
             ),

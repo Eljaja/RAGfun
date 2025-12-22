@@ -13,7 +13,7 @@ from app.clients.opensearch import OpenSearchClient
 from app.clients.qdrant import QdrantFacade
 from app.clients.rerank import RerankClient
 from app.fusion import hybrid_fusion, rrf_fusion
-from app.metrics import CAND, DEP_DEGRADED, ERRS, LAT
+from app.metrics import CAND, DEP_DEGRADED, ERRS, LAT, RAG_PAGE_DEDUP_SAVED, RAG_PARENT_PAGES, RAG_PARTIAL, RAG_RERANK
 from app.models import SearchFilters, SearchHit, SearchRequest, SearchResponse, SourceObj
 from app.utils import redact_uri
 
@@ -227,6 +227,7 @@ async def search(
     degraded: list[str] = []
     partial = False
     partial_rerank = False
+    rerank_outcome: str = "skipped"
 
     # Decide rerank intent as early as possible; rerank is only applied if a client exists and we have candidates.
     def want_rerank(*, bm25_hits: list[SearchHit], vec_hits: list[SearchHit]) -> bool:
@@ -416,12 +417,15 @@ async def search(
                     for h in out:
                         if h.rerank_score is not None:
                             h.score = h.rerank_score
+                    rerank_outcome = "applied"
                 except Exception as e:
                     ERRS.labels("rerank", type(e).__name__).inc()
                     partial_rerank = True
+                    rerank_outcome = "failed"
     elif want_rerank(bm25_hits=bm25_hits, vec_hits=vec_hits) and reranker is None:
         # configured request wants rerank but no client available
         partial_rerank = True
+        rerank_outcome = "unavailable"
 
     # Page deduplication: remove duplicate chunks from the same page
     if enable_page_deduplication:
@@ -429,6 +433,10 @@ async def search(
             with LAT.labels("page_deduplication").time():
                 out_before = len(out)
                 out = deduplicate_by_page(out)
+                try:
+                    RAG_PAGE_DEDUP_SAVED.observe(max(0, out_before - len(out)))
+                except Exception:
+                    pass
                 logger.debug(f"Page deduplication: {out_before} -> {len(out)} hits")
 
     # Parent page retrieval: replace chunks with full page content
@@ -437,6 +445,10 @@ async def search(
             with LAT.labels("parent_page_retrieval").time():
                 try:
                     page_map = await get_parent_pages(out, os_client, qdrant)
+                    try:
+                        RAG_PARENT_PAGES.observe(len(page_map or {}))
+                    except Exception:
+                        pass
                     # Replace chunk text with full page text
                     for hit in out:
                         locator = hit.metadata.get("locator") or {}
@@ -461,6 +473,18 @@ async def search(
         out = out[:top_k]
 
     with tracer.start_as_current_span("assemble_response"):
+        # Business metrics (best-effort)
+        if partial:
+            RAG_PARTIAL.labels(endpoint="/v1/search", kind="partial").inc()
+        if partial_rerank:
+            RAG_PARTIAL.labels(endpoint="/v1/search", kind="partial_rerank").inc()
+        RAG_RERANK.labels(outcome=rerank_outcome).inc()
+        for k in set(degraded or []):
+            try:
+                DEP_DEGRADED.labels(str(k)).inc()
+            except Exception:
+                pass
+
         # sources
         sources_out: list[SourceObj] | None = None
         if req.include_sources:

@@ -52,6 +52,31 @@ class QdrantFacade:
             payload["chunk_id"] = chunk_id
         return {"id": str(p0.id), "payload": payload}
 
+    def retrieve_many(self, chunk_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """
+        Batch retrieve by chunk_id.
+        Returns: chunk_id -> {"id": "...", "payload": {...}}
+        """
+        if not chunk_ids:
+            return {}
+        pid_by_cid: dict[str, int] = {cid: point_id_for_chunk_id(cid) for cid in chunk_ids}
+        cid_by_pid: dict[int, str] = {pid: cid for cid, pid in pid_by_cid.items()}
+        pts = self.client.retrieve(collection_name=self.collection, ids=list(cid_by_pid.keys()), with_payload=True, with_vectors=False)
+        out: dict[str, dict[str, Any]] = {}
+        for p in pts or []:
+            try:
+                pid = int(p.id)  # point ids are stable ints from our hash
+            except Exception:
+                continue
+            cid = cid_by_pid.get(pid)
+            if not cid:
+                continue
+            payload = p.payload or {}
+            if "chunk_id" not in payload:
+                payload["chunk_id"] = cid
+            out[cid] = {"id": str(p.id), "payload": payload}
+        return out
+
     def upsert_points(self, points: list[qm.PointStruct]) -> None:
         self.client.upsert(collection_name=self.collection, points=points, wait=True)
 
