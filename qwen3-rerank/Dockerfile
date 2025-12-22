@@ -19,3 +19,4 @@ CMD ["source /app/.venv/bin/activate && uvicorn qwen3_rerank.main:app --host 0.0
 
 
 
+
