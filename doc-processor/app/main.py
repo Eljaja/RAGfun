@@ -5,8 +5,8 @@ import logging
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Response
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+from fastapi import FastAPI, Request, Response
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
 from app.chunking import chunk_text_chars
 from app.clients import RetrievalClient, StorageClient, VLMClient
@@ -20,6 +20,44 @@ logger = logging.getLogger("processor")
 REQS = Counter("processor_requests_total", "Requests", ["endpoint", "status"])
 LAT = Histogram("processor_latency_seconds", "Latency", ["stage"])
 
+# Standard HTTP server metrics (shared names across services; Prometheus "job" label disambiguates)
+HTTP_INFLIGHT = Gauge("http_server_inflight_requests", "In-flight HTTP requests", ["method", "route"])
+HTTP_REQS = Counter("http_server_requests_total", "HTTP requests", ["method", "route", "status"])
+HTTP_LAT = Histogram(
+    "http_server_request_duration_seconds",
+    "HTTP request duration (seconds)",
+    ["method", "route", "status"],
+    buckets=(0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 30, 60),
+)
+HTTP_REQ_SIZE = Histogram(
+    "http_server_request_size_bytes",
+    "HTTP request size (bytes), from Content-Length when available",
+    ["method", "route"],
+    buckets=(0, 200, 500, 1_000, 2_000, 5_000, 10_000, 50_000, 200_000, 1_000_000, 5_000_000, 20_000_000),
+)
+HTTP_RESP_SIZE = Histogram(
+    "http_server_response_size_bytes",
+    "HTTP response size (bytes), from Content-Length when available",
+    ["method", "route", "status"],
+    buckets=(0, 200, 500, 1_000, 2_000, 5_000, 10_000, 50_000, 200_000, 1_000_000, 5_000_000, 20_000_000),
+)
+
+# Business-quality metrics
+PROCESSOR_DEGRADED = Counter("processor_degraded_total", "Degradation events", ["kind"])
+PROCESSOR_PARTIAL = Counter("processor_partial_total", "Partial processing results", ["endpoint"])
+PROCESSOR_PATH = Counter("processor_path_total", "Processing path decisions", ["path"])
+PROCESSOR_PAGES = Histogram("processor_pages", "Pages processed", buckets=(1, 2, 3, 5, 10, 20, 35, 50, 100))
+PROCESSOR_CHUNKS = Histogram("processor_chunks", "Chunks produced", buckets=(1, 5, 10, 20, 50, 100, 200, 500, 1000, 2000))
+PROCESSOR_EXTRACTED_CHARS = Histogram(
+    "processor_extracted_chars",
+    "Extracted characters",
+    buckets=(0, 200, 1_000, 5_000, 20_000, 100_000, 300_000, 1_000_000, 3_000_000, 10_000_000),
+)
+
+# Pre-create common label series so Grafana panels show 0 instead of "No data" right after startup.
+for _p in ("vlm", "non_vlm", "skipped_duplicate"):
+    PROCESSOR_PATH.labels(_p).inc(0)
+PROCESSOR_PARTIAL.labels(endpoint="/v1/process").inc(0)
 
 class AppState:
     settings: Settings | None = None
@@ -56,6 +94,44 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Doc Processor", version="0.1.0", lifespan=lifespan)
+
+@app.middleware("http")
+async def http_metrics(request: Request, call_next):
+    # Avoid self-scrape noise
+    path = request.url.path
+    if path in ("/v1/metrics", "/metrics"):
+        return await call_next(request)
+
+    method = request.method
+    route_obj = request.scope.get("route")
+    route = getattr(route_obj, "path", None) or path
+
+    def _cl(headers) -> int | None:
+        try:
+            v = headers.get("content-length")
+            return int(v) if v is not None else None
+        except Exception:
+            return None
+
+    req_size = _cl(request.headers)
+
+    HTTP_INFLIGHT.labels(method=method, route=route).inc()
+    start = time.perf_counter()
+    response: Response | None = None
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        dur_s = max(0.0, time.perf_counter() - start)
+        status = response.status_code if response is not None else 500
+        HTTP_REQS.labels(method=method, route=route, status=str(status)).inc()
+        HTTP_LAT.labels(method=method, route=route, status=str(status)).observe(dur_s)
+        if req_size is not None:
+            HTTP_REQ_SIZE.labels(method=method, route=route).observe(req_size)
+        resp_size = _cl(response.headers) if response is not None else None
+        if resp_size is not None:
+            HTTP_RESP_SIZE.labels(method=method, route=route, status=str(status)).observe(resp_size)
+        HTTP_INFLIGHT.labels(method=method, route=route).dec()
 
 
 @app.get("/v1/healthz")
@@ -117,6 +193,7 @@ async def process(req: ProcessRequest):
         duplicate_of = None
     if duplicate_of:
         REQS.labels(endpoint="/v1/process", status="200").inc()
+        PROCESSOR_PATH.labels("skipped_duplicate").inc()
         return ProcessResponse(
             ok=True,
             doc_id=doc_id,
@@ -163,6 +240,7 @@ async def process(req: ProcessRequest):
         pages = len(pages_text)
         content_type = ed.content_type or content_type
         degraded.append("vlm_skipped")
+        PROCESSOR_PATH.labels("non_vlm").inc()
     else:
         # VLM path: render pages -> ask VLM per page.
         with LAT.labels("pdf_render").time():
@@ -220,6 +298,7 @@ async def process(req: ProcessRequest):
             )
 
         content_type = norm_ct
+        PROCESSOR_PATH.labels("vlm").inc()
 
     # Build chunks (preserve page in locator when we have pages)
     chunks: list[ChunkMeta] = []
@@ -263,8 +342,17 @@ async def process(req: ProcessRequest):
     with LAT.labels("retrieval_upsert").time():
         retrieval_resp = await state.retrieval.index_upsert(payload=upsert_payload)
 
-    REQS.labels(endpoint="/v1/process", status="200").inc()
+    if partial:
+        PROCESSOR_PARTIAL.labels(endpoint="/v1/process").inc()
+    for k in degraded:
+        PROCESSOR_DEGRADED.labels(str(k)).inc()
+    if pages is not None:
+        PROCESSOR_PAGES.observe(int(pages))
+    PROCESSOR_CHUNKS.observe(len(chunks))
     extracted_chars = sum(len(t) for t in pages_text if t)
+    PROCESSOR_EXTRACTED_CHARS.observe(int(extracted_chars))
+
+    REQS.labels(endpoint="/v1/process", status="200").inc()
     return ProcessResponse(
         ok=True,
         doc_id=doc_id,
