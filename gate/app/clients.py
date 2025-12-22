@@ -303,15 +303,24 @@ class LLMClient:
         self._model = model
         self._timeout_s = timeout_s
 
-    async def chat(self, *, messages: list[dict[str, str]]) -> str:
+    async def chat(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        temperature: float = 0.2,
+        max_tokens: int | None = None,
+    ) -> str:
         if self._provider == "mock":
             return self._mock(messages)
         if self._provider != "openai_compat":
             raise ValueError(f"unknown_llm_provider:{self._provider}")
         assert self._base_url is not None
-        assert self._api_key is not None
-        headers = {"Authorization": f"Bearer {self._api_key}"}
-        payload = {"model": self._model, "messages": messages, "temperature": 0.2}
+        headers: dict[str, str] = {}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        payload: dict[str, Any] = {"model": self._model, "messages": messages, "temperature": float(temperature)}
+        if max_tokens is not None:
+            payload["max_tokens"] = int(max_tokens)
         # Best-effort retry on throttling/transient errors.
         # Important for evaluation runs that generate many requests.
         backoffs_s = [1, 2, 4, 8, 16, 30]

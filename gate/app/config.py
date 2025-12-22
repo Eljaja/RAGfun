@@ -37,6 +37,22 @@ class Settings(BaseSettings):
     llm_model: str = "gpt-4o-mini"
     llm_timeout_s: float = 60.0
 
+    # Query router (optional): uses a small LLM to pick retrieval knobs per request.
+    # This is intentionally separate from the main answering LLM to keep routing cheap and controllable.
+    router_enabled: bool = False
+    # If enabled, we still compute the route, but do not apply it (logs only).
+    router_dry_run: bool = False
+    router_llm_provider: Literal["mock", "openai_compat"] = "openai_compat"
+    router_llm_base_url: AnyHttpUrl | None = Field(default=None)
+    router_llm_api_key: SecretStr | None = None
+    router_llm_model: str = "ministral-3b-2512"
+    router_llm_timeout_s: float = 10.0
+    router_llm_temperature: float = 0.0
+    router_llm_max_tokens: int = 220
+    # If true, router is allowed to override explicit per-request fields like retrieval_mode/top_k/rerank.
+    # Keep false by default to preserve API contract for callers that set these intentionally.
+    router_override_request_params: bool = False
+
     # RAG behavior
     retrieval_mode: Literal["bm25", "vector", "hybrid"] = "hybrid"
     top_k: int = 8
@@ -89,6 +105,18 @@ class Settings(BaseSettings):
                 "mode": self.retrieval_mode,
                 "top_k": self.top_k,
             },
+            "router": {
+                "enabled": self.router_enabled,
+                "dry_run": self.router_dry_run,
+                "provider": self.router_llm_provider,
+                "base_url": str(self.router_llm_base_url) if self.router_llm_base_url else None,
+                "model": self.router_llm_model,
+                "api_key_set": self.router_llm_api_key is not None,
+                "timeout_s": self.router_llm_timeout_s,
+                "temperature": self.router_llm_temperature,
+                "max_tokens": self.router_llm_max_tokens,
+                "override_request_params": self.router_override_request_params,
+            },
             "llm": {
                 "provider": self.llm_provider,
                 "base_url": str(self.llm_base_url) if self.llm_base_url else None,
@@ -140,12 +168,20 @@ def load_settings() -> Settings:
     # Normalize empty secrets from env (e.g. VAR="") to None
     if s.llm_api_key is not None and s.llm_api_key.get_secret_value().strip() == "":
         s.llm_api_key = None
+    if s.router_llm_api_key is not None and s.router_llm_api_key.get_secret_value().strip() == "":
+        s.router_llm_api_key = None
     if s.llm_provider == "openai_compat" and s.llm_api_key is None:
         raise ValueError("GATE_LLM_PROVIDER=openai_compat requires GATE_LLM_API_KEY")
+    if s.router_enabled and s.router_llm_provider == "openai_compat" and s.router_llm_base_url is None:
+        raise ValueError("GATE_ROUTER_ENABLED=true requires GATE_ROUTER_LLM_BASE_URL for router_llm_provider=openai_compat")
     if s.top_k <= 0:
         raise ValueError("GATE_TOP_K must be > 0")
     if s.max_context_chars <= 0:
         raise ValueError("GATE_MAX_CONTEXT_CHARS must be > 0")
+    if s.router_llm_timeout_s <= 0:
+        raise ValueError("GATE_ROUTER_LLM_TIMEOUT_S must be > 0")
+    if s.router_llm_max_tokens <= 0:
+        raise ValueError("GATE_ROUTER_LLM_MAX_TOKENS must be > 0")
     return s
 
 

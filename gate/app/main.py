@@ -11,10 +11,10 @@ from contextlib import asynccontextmanager
 import httpx
 import json
 from collections import Counter as CollCounter
-from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
 from app.clients import DocProcessorClient, DocumentStorageClient, LLMClient, RetrievalClient
 from app.config import Settings, load_settings
@@ -23,6 +23,7 @@ from app.logging_setup import setup_json_logging
 from app.models import ChatRequest, ChatResponse, ContextChunk, Source
 from app.queue import RabbitPublisher
 from app.rag import build_context_blocks, build_messages
+from app.router import build_router_messages, parse_router_decision
 from rapidfuzz import fuzz
 
 logger = logging.getLogger("gate")
@@ -32,6 +33,37 @@ LAT = Histogram("gate_latency_seconds", "Latency", ["stage"])
 
 ING_PUB = Counter("gate_ingestion_tasks_published_total", "Ingestion tasks published", ["type", "status"])
 ING_PUB_LAT = Histogram("gate_ingestion_publish_latency_seconds", "Publish latency", ["type"])
+
+# Standard HTTP server metrics (shared names across services; Prometheus "job" label disambiguates)
+HTTP_INFLIGHT = Gauge("http_server_inflight_requests", "In-flight HTTP requests", ["method", "route"])
+HTTP_REQS = Counter("http_server_requests_total", "HTTP requests", ["method", "route", "status"])
+HTTP_LAT = Histogram(
+    "http_server_request_duration_seconds",
+    "HTTP request duration (seconds)",
+    ["method", "route", "status"],
+    buckets=(0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 30, 60),
+)
+HTTP_REQ_SIZE = Histogram(
+    "http_server_request_size_bytes",
+    "HTTP request size (bytes), from Content-Length when available",
+    ["method", "route"],
+    buckets=(0, 200, 500, 1_000, 2_000, 5_000, 10_000, 50_000, 200_000, 1_000_000, 5_000_000, 20_000_000),
+)
+HTTP_RESP_SIZE = Histogram(
+    "http_server_response_size_bytes",
+    "HTTP response size (bytes), from Content-Length when available",
+    ["method", "route", "status"],
+    buckets=(0, 200, 500, 1_000, 2_000, 5_000, 10_000, 50_000, 200_000, 1_000_000, 5_000_000, 20_000_000),
+)
+
+# Business-quality metrics
+GATE_REFUSALS = Counter("gate_refusals_total", "Refusals (answer == 'I don't know')", ["endpoint"])
+GATE_DEGRADED = Counter("gate_degraded_total", "Degradation events", ["kind"])
+GATE_PARTIAL = Counter("gate_partial_total", "Partial responses", ["endpoint"])
+
+# Pre-create common label series so Grafana panels show 0 instead of "No data" right after startup.
+GATE_REFUSALS.labels(endpoint="/v1/chat").inc(0)
+GATE_PARTIAL.labels(endpoint="/v1/chat").inc(0)
 
 
 _CIT_RE = re.compile(r"\[\d+\]")
@@ -132,7 +164,7 @@ async def _enforce_extractive_or_refuse(
         "Rewrite your answer STRICTLY as follows:\n"
         "- Output ONLY the exact answer phrase copied verbatim from Sources (no extra words).\n"
         "- Do NOT add citations like [1].\n"
-        "- If the exact answer phrase is not explicitly present in Sources, reply exactly: \"I don't know\".\n"
+        "- If the exact answer phrase is not explicitly present in Sources, reply exactly with \"I don't know\" (English) OR \"Не знаю.\" (Russian), matching the user's language.\n"
     )
     retry_messages = list(messages) + [{"role": "user", "content": rewrite_prompt}]
     rewritten = (await llm.chat(messages=retry_messages)).strip()
@@ -358,12 +390,14 @@ async def _apply_bm25_anchor_pass(
     mode: str,
     top_k: int,
     filters: dict[str, Any] | None,
+    enabled_override: bool | None = None,
 ) -> dict[str, Any]:
     """
     Run a small BM25 lookup on a keyword-only query and fuse candidates into retrieval_json["hits"].
     This prevents exact-match entity chunks from being dropped by hybrid/rerank pipelines.
     """
-    if not getattr(settings, "bm25_anchor_enabled", False):
+    enabled = getattr(settings, "bm25_anchor_enabled", False) if enabled_override is None else bool(enabled_override)
+    if not enabled:
         return retrieval_json
 
     base_hits = list(retrieval_json.get("hits") or [])
@@ -481,6 +515,7 @@ class AppState:
     config_error: str | None = None
     retrieval: RetrievalClient | None = None
     llm: LLMClient | None = None
+    router_llm: LLMClient | None = None
     storage: DocumentStorageClient | None = None
     doc_processor: DocProcessorClient | None = None
     publisher: RabbitPublisher | None = None
@@ -509,6 +544,14 @@ async def lifespan(app: FastAPI):
         model=state.settings.llm_model,
         timeout_s=state.settings.llm_timeout_s,
     )
+    if state.settings.router_enabled:
+        state.router_llm = LLMClient(
+            provider=state.settings.router_llm_provider,
+            base_url=str(state.settings.router_llm_base_url) if state.settings.router_llm_base_url else None,
+            api_key=state.settings.router_llm_api_key.get_secret_value() if state.settings.router_llm_api_key else None,
+            model=state.settings.router_llm_model,
+            timeout_s=state.settings.router_llm_timeout_s,
+        )
     if state.settings.storage_url:
         state.storage = DocumentStorageClient(base_url=str(state.settings.storage_url), timeout_s=state.settings.storage_timeout_s)
     if state.settings.doc_processor_url:
@@ -538,6 +581,44 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def http_metrics(request: Request, call_next):
+    # Avoid self-scrape noise
+    path = request.url.path
+    if path in ("/v1/metrics", "/metrics"):
+        return await call_next(request)
+
+    method = request.method
+    route_obj = request.scope.get("route")
+    route = getattr(route_obj, "path", None) or path
+
+    def _cl(headers) -> int | None:
+        try:
+            v = headers.get("content-length")
+            return int(v) if v is not None else None
+        except Exception:
+            return None
+
+    req_size = _cl(request.headers)
+
+    HTTP_INFLIGHT.labels(method=method, route=route).inc()
+    start = time.perf_counter()
+    response: Response | None = None
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        dur_s = max(0.0, time.perf_counter() - start)
+        status = response.status_code if response is not None else 500
+        HTTP_REQS.labels(method=method, route=route, status=str(status)).inc()
+        HTTP_LAT.labels(method=method, route=route, status=str(status)).observe(dur_s)
+        if req_size is not None:
+            HTTP_REQ_SIZE.labels(method=method, route=route).observe(req_size)
+        resp_size = _cl(response.headers) if response is not None else None
+        if resp_size is not None:
+            HTTP_RESP_SIZE.labels(method=method, route=route, status=str(status)).observe(resp_size)
+        HTTP_INFLIGHT.labels(method=method, route=route).dec()
 
 
 @app.get("/v1/healthz")
@@ -581,15 +662,87 @@ async def chat(payload: ChatRequest):
     assert state.retrieval is not None
     assert state.llm is not None
 
+    # Defaults (may be overridden by request payload and/or router)
     mode = payload.retrieval_mode or state.settings.retrieval_mode
     top_k = payload.top_k or state.settings.top_k
+    rerank = payload.rerank
+    multi_query_enabled = bool(state.settings.multi_query_enabled)
+    two_pass_enabled = bool(state.settings.two_pass_enabled)
+    bm25_anchor_enabled = bool(state.settings.bm25_anchor_enabled)
+    segment_stitching_enabled = bool(state.settings.segment_stitching_enabled)
+
+    # Optional query router: pick per-request retrieval knobs.
+    router_decision = None
+    if state.settings.router_enabled and state.router_llm is not None:
+        try:
+            with LAT.labels("router").time():
+                router_text = await state.router_llm.chat(
+                    messages=build_router_messages(query=payload.query),
+                    temperature=float(state.settings.router_llm_temperature),
+                    max_tokens=int(state.settings.router_llm_max_tokens),
+                )
+            router_decision = parse_router_decision(router_text)
+        except Exception as e:
+            logger.warning("router_failed", extra={"extra": {"error": str(e)}})
+            router_decision = None
+
+    if router_decision is not None:
+        try:
+            allow_override = bool(getattr(state.settings, "router_override_request_params", False))
+            # Only override mode/top_k/rerank if the caller didn't explicitly provide them.
+            if (allow_override or payload.retrieval_mode is None) and router_decision.retrieval_mode:
+                mode = router_decision.retrieval_mode
+            if (allow_override or payload.top_k is None) and (router_decision.top_k is not None):
+                top_k = max(1, min(40, int(router_decision.top_k)))
+            if (allow_override or payload.rerank is None) and (router_decision.rerank is not None):
+                rerank = bool(router_decision.rerank)
+
+            if router_decision.use_multi_query is not None:
+                multi_query_enabled = bool(router_decision.use_multi_query)
+            if router_decision.use_two_pass is not None:
+                two_pass_enabled = bool(router_decision.use_two_pass)
+            if router_decision.use_bm25_anchor is not None:
+                bm25_anchor_enabled = bool(router_decision.use_bm25_anchor)
+            if router_decision.use_segment_stitching is not None:
+                segment_stitching_enabled = bool(router_decision.use_segment_stitching)
+        except Exception:
+            # Never fail the request due to router parsing/apply issues.
+            router_decision = None
+
+    if router_decision is not None:
+        logger.info(
+            "router_decision",
+            extra={
+                "extra": {
+                    "dry_run": bool(state.settings.router_dry_run),
+                    "override_request_params": bool(getattr(state.settings, "router_override_request_params", False)),
+                    "mode": mode,
+                    "top_k": top_k,
+                    "rerank": rerank,
+                    "multi_query_enabled": multi_query_enabled,
+                    "two_pass_enabled": two_pass_enabled,
+                    "bm25_anchor_enabled": bm25_anchor_enabled,
+                    "segment_stitching_enabled": segment_stitching_enabled,
+                    "reason": getattr(router_decision, "reason", None),
+                }
+            },
+        )
+        # If dry-run, revert to settings-based behavior.
+        if state.settings.router_dry_run:
+            mode = payload.retrieval_mode or state.settings.retrieval_mode
+            top_k = payload.top_k or state.settings.top_k
+            rerank = payload.rerank
+            multi_query_enabled = bool(state.settings.multi_query_enabled)
+            two_pass_enabled = bool(state.settings.two_pass_enabled)
+            bm25_anchor_enabled = bool(state.settings.bm25_anchor_enabled)
+            segment_stitching_enabled = bool(state.settings.segment_stitching_enabled)
 
     filters = payload.filters.model_dump(exclude_none=True) if payload.filters else None
 
     try:
         with LAT.labels("retrieval").time():
             # Optional: multi-query + two-pass retrieval (opt-in).
-            if state.settings.multi_query_enabled or state.settings.two_pass_enabled:
+            if multi_query_enabled or two_pass_enabled:
                 # Keep candidate pool bounded; too many low-quality hits increases refusals.
                 raw_top_k = max(1, top_k) * max(1, int(state.settings.multi_query_top_k_multiplier))
                 raw_top_k = max(20, min(80, int(raw_top_k)))
@@ -600,7 +753,7 @@ async def chat(payload: ChatRequest):
                     mode=mode,
                     top_k=raw_top_k,
                     # IMPORTANT: keep rerank behavior for q0 (restores quality vs massive refusals).
-                    rerank=payload.rerank,
+                    rerank=rerank,
                     filters=filters,
                     acl=payload.acl,
                     include_sources=payload.include_sources,
@@ -608,7 +761,7 @@ async def chat(payload: ChatRequest):
 
                 queries = _query_variants(payload.query)
                 # Two-pass: add a follow-up query from top hits if pass1 seems too narrow.
-                if state.settings.two_pass_enabled:
+                if two_pass_enabled:
                     hits1 = list(pass1.get("hits") or [])
                     if _unique_doc_count(hits1) < int(state.settings.two_pass_min_unique_docs):
                         hints = _extract_hint_terms_from_hits(
@@ -631,7 +784,7 @@ async def chat(payload: ChatRequest):
                         mode=mode,
                         top_k=raw_top_k,
                         # Only q0 is reranked; expansions are for recall.
-                        rerank=False if q != payload.query else payload.rerank,
+                        rerank=False if q != payload.query else rerank,
                         filters=filters,
                         acl=payload.acl,
                         include_sources=payload.include_sources,
@@ -683,7 +836,7 @@ async def chat(payload: ChatRequest):
                     query=payload.query,
                     mode=mode,
                     top_k=top_k,
-                    rerank=payload.rerank,
+                    rerank=rerank,
                     filters=filters,
                     acl=payload.acl,
                     include_sources=payload.include_sources,
@@ -704,6 +857,7 @@ async def chat(payload: ChatRequest):
         mode=mode,
         top_k=top_k,
         filters=filters,
+        enabled_override=bm25_anchor_enabled,
     )
 
     hits = retrieval_json.get("hits") or []
@@ -754,7 +908,7 @@ async def chat(payload: ChatRequest):
         hits=hits,
         max_chars=state.settings.max_context_chars,
         max_chunk_chars=per_chunk,
-        stitch_segments=bool(state.settings.segment_stitching_enabled),
+        stitch_segments=bool(segment_stitching_enabled),
         stitch_max_chunks_per_segment=int(state.settings.segment_stitching_max_chunks),
         stitch_group_by_page=bool(state.settings.segment_stitching_group_by_page),
     )
@@ -825,7 +979,7 @@ async def chat(payload: ChatRequest):
                                 hits=merged_hits,
                                 max_chars=state.settings.max_context_chars,
                                 max_chunk_chars=per_chunk,
-                                stitch_segments=bool(state.settings.segment_stitching_enabled),
+                                stitch_segments=bool(segment_stitching_enabled),
                                 stitch_max_chunks_per_segment=int(state.settings.segment_stitching_max_chunks),
                                 stitch_group_by_page=bool(state.settings.segment_stitching_group_by_page),
                             )
@@ -874,6 +1028,13 @@ async def chat(payload: ChatRequest):
                 else None,
             )
         )
+
+    if partial:
+        GATE_PARTIAL.labels(endpoint="/v1/chat").inc()
+    for k in degraded:
+        GATE_DEGRADED.labels(str(k)).inc()
+    if (answer or "").strip() == "I don't know":
+        GATE_REFUSALS.labels(endpoint="/v1/chat").inc()
 
     REQS.labels(endpoint="/v1/chat", status="200").inc()
     return ChatResponse(
@@ -1517,8 +1678,50 @@ async def chat_stream(payload: ChatRequest):
     assert state.retrieval is not None
     assert state.llm is not None
 
+    # Defaults (may be overridden by request payload and/or router)
     mode = payload.retrieval_mode or state.settings.retrieval_mode
     top_k = payload.top_k or state.settings.top_k
+    rerank = payload.rerank
+    bm25_anchor_enabled = bool(state.settings.bm25_anchor_enabled)
+    segment_stitching_enabled = bool(state.settings.segment_stitching_enabled)
+
+    # Optional query router: pick per-request retrieval knobs.
+    router_decision = None
+    if state.settings.router_enabled and state.router_llm is not None:
+        try:
+            with LAT.labels("router").time():
+                router_text = await state.router_llm.chat(
+                    messages=build_router_messages(query=payload.query),
+                    temperature=float(state.settings.router_llm_temperature),
+                    max_tokens=int(state.settings.router_llm_max_tokens),
+                )
+            router_decision = parse_router_decision(router_text)
+        except Exception as e:
+            logger.warning("router_failed", extra={"extra": {"error": str(e)}})
+            router_decision = None
+
+    if router_decision is not None:
+        try:
+            allow_override = bool(getattr(state.settings, "router_override_request_params", False))
+            if (allow_override or payload.retrieval_mode is None) and router_decision.retrieval_mode:
+                mode = router_decision.retrieval_mode
+            if (allow_override or payload.top_k is None) and (router_decision.top_k is not None):
+                top_k = max(1, min(40, int(router_decision.top_k)))
+            if (allow_override or payload.rerank is None) and (router_decision.rerank is not None):
+                rerank = bool(router_decision.rerank)
+            if router_decision.use_bm25_anchor is not None:
+                bm25_anchor_enabled = bool(router_decision.use_bm25_anchor)
+            if router_decision.use_segment_stitching is not None:
+                segment_stitching_enabled = bool(router_decision.use_segment_stitching)
+        except Exception:
+            router_decision = None
+
+    if router_decision is not None and state.settings.router_dry_run:
+        mode = payload.retrieval_mode or state.settings.retrieval_mode
+        top_k = payload.top_k or state.settings.top_k
+        rerank = payload.rerank
+        bm25_anchor_enabled = bool(state.settings.bm25_anchor_enabled)
+        segment_stitching_enabled = bool(state.settings.segment_stitching_enabled)
 
     filters = payload.filters.model_dump(exclude_none=True) if payload.filters else None
 
@@ -1531,7 +1734,7 @@ async def chat_stream(payload: ChatRequest):
                         query=payload.query,
                         mode=mode,
                         top_k=top_k,
-                        rerank=payload.rerank,
+                        rerank=rerank,
                         filters=filters,
                         acl=payload.acl,
                         include_sources=payload.include_sources,
@@ -1551,6 +1754,7 @@ async def chat_stream(payload: ChatRequest):
                 mode=mode,
                 top_k=top_k,
                 filters=filters,
+                enabled_override=bm25_anchor_enabled,
             )
 
             hits = retrieval_json.get("hits") or []
@@ -1562,7 +1766,7 @@ async def chat_stream(payload: ChatRequest):
                 hits=hits,
                 max_chars=state.settings.max_context_chars,
                 max_chunk_chars=per_chunk,
-                stitch_segments=bool(state.settings.segment_stitching_enabled),
+                stitch_segments=bool(segment_stitching_enabled),
                 stitch_max_chunks_per_segment=int(state.settings.segment_stitching_max_chunks),
                 stitch_group_by_page=bool(state.settings.segment_stitching_group_by_page),
             )
