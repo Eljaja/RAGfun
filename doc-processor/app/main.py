@@ -109,6 +109,27 @@ async def process(req: ProcessRequest):
         REQS.labels(endpoint="/v1/process", status="404").inc()
         return ProcessResponse(ok=False, doc_id=doc_id, error="not_found", detail="doc_id not found in storage")
 
+    # Exact deduplication: if storage marks this doc as a duplicate, skip processing+indexing.
+    try:
+        dedup = ((meta.get("extra") or {}).get("dedup") or {}) if isinstance(meta.get("extra"), dict) else {}
+        duplicate_of = dedup.get("duplicate_of") if isinstance(dedup, dict) else None
+    except Exception:
+        duplicate_of = None
+    if duplicate_of:
+        REQS.labels(endpoint="/v1/process", status="200").inc()
+        return ProcessResponse(
+            ok=True,
+            doc_id=doc_id,
+            content_type=meta.get("content_type"),
+            pages=None,
+            extracted_chars=0,
+            chunks=0,
+            retrieval=None,
+            partial=False,
+            degraded=["skipped_duplicate"],
+            detail={"duplicate_of": str(duplicate_of)},
+        )
+
     filename = meta.get("title") or meta.get("doc_id") or doc_id
     content_type = meta.get("content_type")
 

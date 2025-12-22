@@ -77,6 +77,32 @@ async def handle_index(
     task_id = str(task.get("task_id") or "")
     attempt = int(task.get("attempt") or 0)
     now = time.time()
+
+    # Exact deduplication: if this doc_id is marked as a duplicate in storage, skip indexing.
+    try:
+        meta = await storage.get_metadata(doc_id=doc_id)
+        extra = (meta or {}).get("extra") if isinstance(meta, dict) else None
+        dedup = (extra or {}).get("dedup") if isinstance(extra, dict) else None
+        duplicate_of = (dedup or {}).get("duplicate_of") if isinstance(dedup, dict) else None
+        if duplicate_of:
+            await _patch_ingestion(
+                storage,
+                doc_id=doc_id,
+                ingestion={
+                    "state": "done",
+                    "type": "index",
+                    "task_id": task_id,
+                    "doc_id": doc_id,
+                    "attempt": attempt,
+                    "updated_at": now,
+                    "stage": "skipped_duplicate",
+                    "result": {"duplicate_of": str(duplicate_of)},
+                },
+            )
+            return
+    except Exception as e:
+        # best-effort; if metadata can't be fetched, continue indexing
+        logger.warning("dedup_metadata_check_failed", extra={"extra": {"doc_id": doc_id, "error": str(e)}})
     ingestion = {
         "state": "processing",
         "type": "index",
