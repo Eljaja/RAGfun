@@ -42,6 +42,14 @@ class Settings(BaseSettings):
     top_k: int = 8
     max_context_chars: int = 18_000
 
+    # Context packing (recommended): stitch multiple retrieved chunks from the same page/doc into
+    # a coherent segment before sending to the LLM. Helps multi-hop and narrative questions.
+    segment_stitching_enabled: bool = False
+    # Max distinct chunks to stitch into one segment (per page/doc group).
+    segment_stitching_max_chunks: int = 4
+    # If page is available, prefer grouping by (doc_id, uri, page); else fall back to (doc_id, uri).
+    segment_stitching_group_by_page: bool = True
+
     # BM25 anchor pass (recommended): run an additional BM25 lookup on a keyword-only query
     # and union/fuse candidates, so exact-match entities don't get lost in hybrid/rerank.
     bm25_anchor_enabled: bool = True
@@ -90,6 +98,11 @@ class Settings(BaseSettings):
             },
             "rag": {
                 "max_context_chars": self.max_context_chars,
+                "segment_stitching": {
+                    "enabled": self.segment_stitching_enabled,
+                    "max_chunks": self.segment_stitching_max_chunks,
+                    "group_by_page": self.segment_stitching_group_by_page,
+                },
                 "bm25_anchor": {
                     "enabled": self.bm25_anchor_enabled,
                     "top_k": self.bm25_anchor_top_k,

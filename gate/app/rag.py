@@ -3,15 +3,129 @@ from __future__ import annotations
 from typing import Any
 
 
+def _get_page_from_hit(h: dict[str, Any]) -> int | None:
+    md = h.get("metadata") or {}
+    loc = md.get("locator") or {}
+    if isinstance(loc, dict):
+        p = loc.get("page")
+        try:
+            return int(p) if p is not None else None
+        except Exception:
+            return None
+    return None
+
+
+def _get_chunk_index_from_hit(h: dict[str, Any]) -> int | None:
+    md = h.get("metadata") or {}
+    v = md.get("chunk_index")
+    try:
+        return int(v) if v is not None else None
+    except Exception:
+        return None
+
+
+def stitch_hits_into_segments(
+    *,
+    hits: list[dict[str, Any]],
+    max_chunks_per_segment: int,
+    group_by_page: bool,
+) -> list[dict[str, Any]]:
+    """
+    Build "segments" by stitching multiple chunks from the same doc (and optionally page)
+    into a single hit-like dict. Keeps first-seen ordering across groups.
+
+    This is a lightweight version of "relevant segment extraction" / "window around chunk":
+    - No extra backend calls
+    - Uses only already-retrieved chunks
+    """
+    if max_chunks_per_segment <= 1:
+        return hits
+
+    # Keep stable group order by first appearance.
+    group_order: list[tuple[str, str | None, int | None]] = []
+    groups: dict[tuple[str, str | None, int | None], list[dict[str, Any]]] = {}
+
+    for h in hits:
+        txt = (h.get("text") or "").strip()
+        if not txt:
+            continue
+        doc_id = h.get("doc_id")
+        md = h.get("metadata") or {}
+        uri = (h.get("source") or {}).get("uri") or md.get("uri")
+        page = _get_page_from_hit(h) if group_by_page else None
+        key = (str(doc_id), uri, page)
+        if key not in groups:
+            groups[key] = []
+            group_order.append(key)
+        groups[key].append(h)
+
+    out: list[dict[str, Any]] = []
+    for key in group_order:
+        ghits = groups.get(key) or []
+        if not ghits:
+            continue
+
+        # Prefer ordering by chunk_index when available; else keep retrieval order.
+        indexed = [(g, _get_chunk_index_from_hit(g)) for g in ghits]
+        if any(ix is not None for _, ix in indexed):
+            indexed.sort(key=lambda t: (t[1] is None, t[1] if t[1] is not None else 10**9))
+            ordered = [g for g, _ in indexed]
+        else:
+            ordered = ghits
+
+        # Deduplicate identical texts; cap number of stitched chunks.
+        seen_text: set[str] = set()
+        kept: list[dict[str, Any]] = []
+        for g in ordered:
+            t = (g.get("text") or "").strip()
+            if not t:
+                continue
+            if t in seen_text:
+                continue
+            seen_text.add(t)
+            kept.append(g)
+            if len(kept) >= max_chunks_per_segment:
+                break
+
+        if not kept:
+            continue
+
+        # Stitch text with a clear delimiter.
+        stitched_text = "\n\n---\n\n".join((k.get("text") or "").strip() for k in kept if (k.get("text") or "").strip()).strip()
+        if not stitched_text:
+            continue
+
+        # Use the first chunk as the representative hit; attach diagnostics.
+        rep = dict(kept[0])
+        rep["text"] = stitched_text
+        rep_md = dict(rep.get("metadata") or {})
+        rep_md["stitched_chunk_ids"] = [str(k.get("chunk_id")) for k in kept if k.get("chunk_id")]
+        rep_md["stitched_chunks"] = len(rep_md["stitched_chunk_ids"])
+        rep["metadata"] = rep_md
+        out.append(rep)
+
+    return out
+
+
 def build_context_blocks(
     *,
     hits: list[dict[str, Any]],
     max_chars: int,
     max_chunk_chars: int | None = None,
+    stitch_segments: bool = False,
+    stitch_max_chunks_per_segment: int = 4,
+    stitch_group_by_page: bool = True,
 ) -> tuple[list[dict[str, Any]], str, list[dict[str, Any]]]:
     """
     Returns: (kept_hits, context_text, sources)
     """
+    if stitch_segments:
+        hits = stitch_hits_into_segments(
+            hits=hits,
+            max_chunks_per_segment=max(1, int(stitch_max_chunks_per_segment)),
+            group_by_page=bool(stitch_group_by_page),
+        )
+
     kept: list[dict[str, Any]] = []
     sources: list[dict[str, Any]] = []
 

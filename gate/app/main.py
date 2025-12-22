@@ -750,7 +750,14 @@ async def chat(payload: ChatRequest):
                 logger.warning("factoid_preexpand_failed", extra={"extra": {"error": str(e), "doc_ids": doc_ids}})
 
     per_chunk = 1200 if (not payload.include_sources and _is_factoid_like_question(payload.query)) else None
-    kept, context_text, sources = build_context_blocks(hits=hits, max_chars=state.settings.max_context_chars, max_chunk_chars=per_chunk)
+    kept, context_text, sources = build_context_blocks(
+        hits=hits,
+        max_chars=state.settings.max_context_chars,
+        max_chunk_chars=per_chunk,
+        stitch_segments=bool(state.settings.segment_stitching_enabled),
+        stitch_max_chunks_per_segment=int(state.settings.segment_stitching_max_chunks),
+        stitch_group_by_page=bool(state.settings.segment_stitching_group_by_page),
+    )
     messages = build_messages(
         query=payload.query,
         history=[m.model_dump() for m in payload.history],
@@ -818,6 +825,9 @@ async def chat(payload: ChatRequest):
                                 hits=merged_hits,
                                 max_chars=state.settings.max_context_chars,
                                 max_chunk_chars=per_chunk,
+                                stitch_segments=bool(state.settings.segment_stitching_enabled),
+                                stitch_max_chunks_per_segment=int(state.settings.segment_stitching_max_chunks),
+                                stitch_group_by_page=bool(state.settings.segment_stitching_group_by_page),
                             )
                             messages2 = build_messages(
                                 query=payload.query,
@@ -914,6 +924,8 @@ async def upload_document(
     storage_result = None
     storage_ok = False
     stored_bytes: int | None = None
+    duplicate: bool = False
+    duplicate_of: str | None = None
     if state.storage:
         try:
             with LAT.labels("storage_store").time():
@@ -936,9 +948,23 @@ async def upload_document(
                 stored_bytes = int(storage_result.get("size")) if storage_result and storage_result.get("size") is not None else None
             except Exception:
                 stored_bytes = None
+            try:
+                duplicate_of = (storage_result or {}).get("duplicate_of")
+                duplicate = bool((storage_result or {}).get("duplicate")) or bool(duplicate_of)
+            except Exception:
+                duplicate_of = None
+                duplicate = False
             logger.info(
                 "document_stored",
-                extra={"extra": {"doc_id": doc_id, "storage_id": storage_result.get("storage_id"), "size": stored_bytes}},
+                extra={
+                    "extra": {
+                        "doc_id": doc_id,
+                        "storage_id": storage_result.get("storage_id") if storage_result else None,
+                        "size": stored_bytes,
+                        "duplicate": duplicate,
+                        "duplicate_of": duplicate_of,
+                    }
+                },
             )
             storage_ok = True
         except httpx.TimeoutException as e:
@@ -977,6 +1003,37 @@ async def upload_document(
         return text.strip()
 
     try:
+        # If storage reported this document as an exact duplicate (bytes-level), skip indexing.
+        if storage_ok and state.storage and (duplicate or duplicate_of):
+            now = time.time()
+            try:
+                await state.storage.patch_extra(
+                    doc_id=doc_id,
+                    patch={
+                        "ingestion": {
+                            "state": "done",
+                            "type": "index",
+                            "doc_id": doc_id,
+                            "updated_at": now,
+                            "stage": "skipped_duplicate",
+                            "result": {"duplicate_of": duplicate_of},
+                        }
+                    },
+                )
+            except Exception:
+                pass
+            REQS.labels(endpoint="/v1/documents/upload", status="200").inc()
+            return {
+                "ok": True,
+                "accepted": False,
+                "skipped": "duplicate",
+                "doc_id": doc_id,
+                "duplicate_of": duplicate_of,
+                "storage": storage_result,
+                "filename": file.filename,
+                "bytes": stored_bytes,
+            }
+
         # Async ingestion path: store first, enqueue, return immediately.
         if state.publisher and state.storage and storage_ok:
             task_id = str(uuid.uuid4())
@@ -1505,6 +1562,9 @@ async def chat_stream(payload: ChatRequest):
                 hits=hits,
                 max_chars=state.settings.max_context_chars,
                 max_chunk_chars=per_chunk,
+                stitch_segments=bool(state.settings.segment_stitching_enabled),
+                stitch_max_chunks_per_segment=int(state.settings.segment_stitching_max_chunks),
+                stitch_group_by_page=bool(state.settings.segment_stitching_group_by_page),
             )
             messages = build_messages(
                 query=payload.query,
