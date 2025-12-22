@@ -224,13 +224,34 @@ async def store_document(
         with LAT.labels(stage="store_file").time():
             storage_id = await _run_sync(state.storage.store, doc_id, content, content_type)
 
+        # Deduplication (exact, bytes-level): storage_id is deterministic (sha256-based) for both local and s3 backends.
+        duplicate_of: str | None = None
+        try:
+            duplicate_of = await _run_sync(state.db.find_any_doc_id_by_storage_id, storage_id=storage_id, exclude_doc_id=doc_id)
+        except Exception as e:
+            # best-effort: never fail uploads due to dedup bookkeeping
+            logger.warning("dedup_lookup_failed", extra={"doc_id": doc_id, "storage_id": storage_id, "error": str(e)})
+            duplicate_of = None
+
         # Store metadata
         with LAT.labels(stage="store_metadata").time():
+            existing_extra: dict[str, Any] = {}
+            if isinstance(metadata_dict, dict):
+                v = metadata_dict.get("extra")
+                if isinstance(v, dict):
+                    existing_extra = v
+
+            dedup_extra = {
+                "is_duplicate": bool(duplicate_of),
+                "duplicate_of": duplicate_of,
+                "storage_id": storage_id,
+                "method": "storage_id_sha256",
+            }
             doc_meta = await _run_sync(
                 state.db.store_metadata,
                 doc_id=doc_id,
                 storage_id=storage_id,
-                metadata=full_metadata,
+                metadata={**full_metadata, "extra": {**existing_extra, "dedup": dedup_extra}},
                 content_type=content_type,
                 size=len(content),
             )
@@ -243,6 +264,8 @@ async def store_document(
             size=len(content),
             content_type=content_type,
             stored_at=doc_meta.stored_at or datetime.utcnow(),
+            duplicate=bool(duplicate_of),
+            duplicate_of=duplicate_of,
         )
 
     except Exception as e:
@@ -368,12 +391,22 @@ async def delete_document_by_id(doc_id: str):
             REQS.labels(endpoint="/v1/documents/by-id", status="404").inc()
             raise HTTPException(status_code=404, detail="Document not found")
 
-        if meta.storage_id:
-            await _run_sync(state.storage.delete, meta.storage_id)
+        storage_id = meta.storage_id
 
+        # Delete metadata first (so we can safely decide whether to delete the underlying blob).
         deleted = await _run_sync(state.db.delete_metadata, doc_id)
+
+        file_deleted = False
+        remaining_refs = 0
+        if deleted and storage_id:
+            try:
+                remaining_refs = await _run_sync(state.db.count_docs_by_storage_id, storage_id=storage_id)
+                if remaining_refs == 0:
+                    file_deleted = bool(await _run_sync(state.storage.delete, storage_id))
+            except Exception as e:
+                logger.warning("delete_blob_refcount_failed", extra={"doc_id": doc_id, "storage_id": storage_id, "error": str(e)})
         REQS.labels(endpoint="/v1/documents/by-id", status="200").inc()
-        return {"ok": True, "deleted": deleted}
+        return {"ok": True, "deleted": deleted, "storage_id": storage_id, "file_deleted": file_deleted, "remaining_refs": remaining_refs}
     except HTTPException:
         raise
     except Exception as e:
@@ -401,15 +434,23 @@ async def delete_document(doc_id: str):
             REQS.labels(endpoint="/v1/documents/{doc_id}", status="404").inc()
             raise HTTPException(status_code=404, detail="Document not found")
 
-        # Delete file (best effort)
-        if meta.storage_id:
-            await _run_sync(state.storage.delete, meta.storage_id)
+        storage_id = meta.storage_id
 
-        # Delete metadata
+        # Delete metadata first (so we can safely decide whether to delete the underlying blob).
         deleted = await _run_sync(state.db.delete_metadata, doc_id)
 
+        file_deleted = False
+        remaining_refs = 0
+        if deleted and storage_id:
+            try:
+                remaining_refs = await _run_sync(state.db.count_docs_by_storage_id, storage_id=storage_id)
+                if remaining_refs == 0:
+                    file_deleted = bool(await _run_sync(state.storage.delete, storage_id))
+            except Exception as e:
+                logger.warning("delete_blob_refcount_failed", extra={"doc_id": doc_id, "storage_id": storage_id, "error": str(e)})
+
         REQS.labels(endpoint="/v1/documents/{doc_id}", status="200").inc()
-        return {"ok": True, "deleted": deleted}
+        return {"ok": True, "deleted": deleted, "storage_id": storage_id, "file_deleted": file_deleted, "remaining_refs": remaining_refs}
 
     except HTTPException:
         raise

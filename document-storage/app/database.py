@@ -159,6 +159,42 @@ class DatabaseClient:
         finally:
             self.pool.putconn(conn)
 
+    def find_any_doc_id_by_storage_id(self, *, storage_id: str, exclude_doc_id: str | None = None) -> str | None:
+        """
+        Find any doc_id that references the given storage_id.
+        Used for exact deduplication (bytes-level) because storage_id is deterministic (sha256-based).
+        """
+        conn = self.pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                if exclude_doc_id:
+                    cur.execute(
+                        "SELECT doc_id FROM document_metadata WHERE storage_id = %s AND doc_id <> %s ORDER BY stored_at ASC LIMIT 1",
+                        (storage_id, exclude_doc_id),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT doc_id FROM document_metadata WHERE storage_id = %s ORDER BY stored_at ASC LIMIT 1",
+                        (storage_id,),
+                    )
+                row = cur.fetchone()
+                if not row:
+                    return None
+                return str(row.get("doc_id"))
+        finally:
+            self.pool.putconn(conn)
+
+    def count_docs_by_storage_id(self, *, storage_id: str) -> int:
+        """Count how many documents reference a given storage_id."""
+        conn = self.pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*)::bigint as c FROM document_metadata WHERE storage_id = %s", (storage_id,))
+                row = cur.fetchone() or {}
+                return int(row.get("c") or 0)
+        finally:
+            self.pool.putconn(conn)
+
     def delete_metadata(self, doc_id: str) -> bool:
         """Delete document metadata."""
         conn = self.pool.getconn()

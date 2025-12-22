@@ -35,6 +35,9 @@ class StoreDocumentResponse(BaseModel):
     size: int | None = None
     content_type: str | None = None
     stored_at: datetime | None = None
+    # Exact deduplication (bytes-level)
+    duplicate: bool | None = None
+    duplicate_of: str | None = None
     error: str | None = None
 
 
