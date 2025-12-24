@@ -185,27 +185,15 @@ async def process(req: ProcessRequest):
         REQS.labels(endpoint="/v1/process", status="404").inc()
         return ProcessResponse(ok=False, doc_id=doc_id, error="not_found", detail="doc_id not found in storage")
 
-    # Exact deduplication: if storage marks this doc as a duplicate, skip processing+indexing.
+    # Exact deduplication: keep note, but still index per doc_id (retrieval contract).
     try:
         dedup = ((meta.get("extra") or {}).get("dedup") or {}) if isinstance(meta.get("extra"), dict) else {}
         duplicate_of = dedup.get("duplicate_of") if isinstance(dedup, dict) else None
     except Exception:
         duplicate_of = None
     if duplicate_of:
-        REQS.labels(endpoint="/v1/process", status="200").inc()
-        PROCESSOR_PATH.labels("skipped_duplicate").inc()
-        return ProcessResponse(
-            ok=True,
-            doc_id=doc_id,
-            content_type=meta.get("content_type"),
-            pages=None,
-            extracted_chars=0,
-            chunks=0,
-            retrieval=None,
-            partial=False,
-            degraded=["skipped_duplicate"],
-            detail={"duplicate_of": str(duplicate_of)},
-        )
+        PROCESSOR_PATH.labels("duplicate_detected").inc()
+        degraded.append("duplicate_detected")
 
     filename = meta.get("title") or meta.get("doc_id") or doc_id
     content_type = meta.get("content_type")
@@ -339,8 +327,32 @@ async def process(req: ProcessRequest):
         "refresh": bool(req.refresh),
     }
 
+    extracted_chars = sum(len(t) for t in pages_text if t)
+
     with LAT.labels("retrieval_upsert").time():
         retrieval_resp = await state.retrieval.index_upsert(payload=upsert_payload)
+
+    retrieval_ok = True
+    retrieval_partial = False
+    if isinstance(retrieval_resp, dict):
+        retrieval_ok = retrieval_resp.get("ok") is True
+        retrieval_partial = bool(retrieval_resp.get("partial"))
+
+    if not retrieval_ok or retrieval_partial:
+        REQS.labels(endpoint="/v1/process", status="502").inc()
+        return ProcessResponse(
+            ok=False,
+            doc_id=doc_id,
+            content_type=content_type,
+            pages=pages,
+            extracted_chars=extracted_chars,
+            chunks=len(chunks),
+            retrieval=retrieval_resp,
+            partial=bool(retrieval_partial),
+            degraded=degraded,
+            error="retrieval_upsert_failed",
+            detail={"retrieval_ok": retrieval_ok, "retrieval_partial": retrieval_partial},
+        )
 
     if partial:
         PROCESSOR_PARTIAL.labels(endpoint="/v1/process").inc()
@@ -349,7 +361,6 @@ async def process(req: ProcessRequest):
     if pages is not None:
         PROCESSOR_PAGES.observe(int(pages))
     PROCESSOR_CHUNKS.observe(len(chunks))
-    extracted_chars = sum(len(t) for t in pages_text if t)
     PROCESSOR_EXTRACTED_CHARS.observe(int(extracted_chars))
 
     REQS.labels(endpoint="/v1/process", status="200").inc()
@@ -364,9 +375,6 @@ async def process(req: ProcessRequest):
         partial=partial,
         degraded=degraded,
     )
-
-
-
 
 
 
