@@ -173,8 +173,18 @@ services:
     # Stronger multilingual embedding model (better recall for RU factoid QA).
     # NOTE: this changes vector dimensionality -> requires re-indexing into a new Qdrant collection.
     command: ["v2", "--model-id", "BAAI/bge-m3", "--port", "7997"]
+    environment:
+      # Make the container see NVIDIA GPUs (requires NVIDIA Container Toolkit on host).
+      # Pin embeddings service to GPU id 0.
+      - NVIDIA_VISIBLE_DEVICES=0
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     networks:
       - rag-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
 
   # Stateless Hybrid Retrieval microservice (scale this one for multiple replicas)
   retrieval:
@@ -213,7 +223,8 @@ services:
       # Optional auth (if your embeddings endpoint needs it):
       # - RAG_EMBEDDING_API_KEY=...
       - RAG_EMBEDDING_TIMEOUT_S=10
-      - RAG_EMBEDDING_BATCH_SIZE=32
+      - RAG_EMBEDDING_BATCH_SIZE=256
+      - RAG_EMBEDDING_CONCURRENCY=8
       - RAG_VECTOR_SIZE=1024
       # Contextual Chunk Headers (CCH) for embeddings (opt-in; requires re-index/re-embed when enabled)
       - RAG_EMBEDDING_CONTEXTUAL_HEADERS_ENABLED=true
