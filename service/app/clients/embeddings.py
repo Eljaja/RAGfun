@@ -23,6 +23,21 @@ class EmbeddingsClient:
         self.model = model
         self.api_key = api_key
         self.timeout_s = timeout_s
+        # Reuse a single HTTP client to avoid per-request connection setup overhead
+        # (especially visible during indexing batches and multi-query retrieval).
+        self._client: httpx.AsyncClient | None = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            # Conservative pool sizes; Infinity (and similar embedding servers) benefit from keep-alive.
+            limits = httpx.Limits(max_connections=50, max_keepalive_connections=20, keepalive_expiry=30.0)
+            self._client = httpx.AsyncClient(timeout=self.timeout_s, limits=limits)
+        return self._client
+
+    async def aclose(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
 
     def _mock_embed_one(self, text: str) -> list[float]:
         # Deterministic pseudo-embedding: stable per text; good for local dev/tests.
@@ -46,10 +61,15 @@ class EmbeddingsClient:
         # Support OpenAI-compatible embedding backends (e.g. Infinity) that require a model id.
         if self.model:
             payload["model"] = self.model
-        async with httpx.AsyncClient(timeout=self.timeout_s) as client:
+        client = self._get_client()
+        try:
             r = await client.post(self.url, json=payload, headers=headers)
             r.raise_for_status()
             data = r.json()
+        except Exception:
+            # Reset the client on any failure to avoid keeping a broken connection in the pool.
+            await self.aclose()
+            raise
 
         # Supported response formats:
         # 1) Simple contract: { "vectors": [[...], ...] }

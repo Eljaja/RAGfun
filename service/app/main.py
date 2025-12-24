@@ -129,7 +129,15 @@ async def lifespan(app: FastAPI):
         "error": None,
     }
 
-    yield
+    try:
+        yield
+    finally:
+        # Gracefully close reusable HTTP clients (keep-alive pools).
+        try:
+            if state.embedder is not None:
+                await state.embedder.aclose()
+        except Exception:
+            pass
 
 
 app = FastAPI(title="Hybrid Retrieval", version="0.1.0", lifespan=lifespan)
@@ -236,6 +244,7 @@ async def index_upsert(payload: IndexUpsertRequest):
                 max_tokens=state.settings.chunk_max_tokens,
                 overlap_tokens=state.settings.chunk_overlap_tokens,
                 embedding_batch_size=state.settings.embedding_batch_size,
+                embedding_concurrency=state.settings.embedding_concurrency,
                 embedding_contextual_headers_enabled=state.settings.embedding_contextual_headers_enabled,
                 embedding_contextual_headers_max_chars=state.settings.embedding_contextual_headers_max_chars,
             ),

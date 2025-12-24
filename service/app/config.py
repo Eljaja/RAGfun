@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     embedding_api_key: SecretStr | None = None
     embedding_timeout_s: float = 10.0
     embedding_batch_size: int = 32
+    embedding_concurrency: int = 1
 
     # Chunking
     chunk_max_tokens: int = 300
@@ -104,6 +105,7 @@ class Settings(BaseSettings):
                 "api_key_set": self.embedding_api_key is not None,
                 "timeout_s": self.embedding_timeout_s,
                 "batch_size": self.embedding_batch_size,
+                "concurrency": self.embedding_concurrency,
                 "contextual_headers_enabled": self.embedding_contextual_headers_enabled,
             },
             "chunking": {
@@ -144,6 +146,8 @@ def load_settings() -> Settings:
     s = Settings()
     if s.embedding_provider == "http" and s.embedding_url is None:
         raise ValueError("RAG_EMBEDDING_PROVIDER=http requires RAG_EMBEDDING_URL")
+    if s.embedding_concurrency <= 0:
+        raise ValueError("RAG_EMBEDDING_CONCURRENCY must be > 0")
     if s.rerank_mode != "disabled" and s.rerank_url is None:
         raise ValueError("RAG_RERANK_MODE requires RAG_RERANK_URL (unless disabled)")
     if s.vector_size <= 0:

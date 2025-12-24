@@ -115,6 +115,7 @@ async def upsert(
     max_tokens: int,
     overlap_tokens: int,
     embedding_batch_size: int = 32,
+    embedding_concurrency: int = 1,
     embedding_contextual_headers_enabled: bool = False,
     embedding_contextual_headers_max_chars: int = 400,
 ) -> IndexUpsertResponse:
@@ -227,11 +228,35 @@ async def upsert(
                 try:
                     # Avoid huge embedding requests: split into batches.
                     bs = max(1, int(embedding_batch_size))
-                    for batch in _iter_batches(need_embed, batch_size=bs):
+                    batches = _iter_batches(need_embed, batch_size=bs)
+                    conc = max(1, int(embedding_concurrency))
+
+                    async def _embed_batch(batch: list[ChunkMeta]) -> dict[str, list[float]]:
                         texts = [embed_input_by_id.get(c.chunk_id, c.text) for c in batch]
                         embs = await embedder.embed(texts)
+                        out: dict[str, list[float]] = {}
                         for c, v in zip(batch, embs, strict=False):
-                            vectors[c.chunk_id] = v
+                            out[c.chunk_id] = v
+                        return out
+
+                    if conc <= 1 or len(batches) <= 1:
+                        for batch in batches:
+                            vectors.update(await _embed_batch(batch))
+                    else:
+                        sem = asyncio.Semaphore(conc)
+
+                        async def _run_one(batch: list[ChunkMeta]) -> dict[str, list[float]]:
+                            async with sem:
+                                return await _embed_batch(batch)
+
+                        results = await asyncio.gather(*[_run_one(b) for b in batches], return_exceptions=True)
+                        for r in results:
+                            if isinstance(r, Exception):
+                                ERRS.labels("embed", type(r).__name__).inc()
+                                partial = True
+                                errors.append({"stage": "embed", "error": str(r)})
+                                continue
+                            vectors.update(r)
                 except Exception as e:
                     ERRS.labels("embed", type(e).__name__).inc()
                     partial = True
