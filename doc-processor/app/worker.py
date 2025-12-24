@@ -122,6 +122,14 @@ async def handle_index(
             resp = r.json()
     if resp.get("ok") is not True:
         raise RuntimeError(f"doc_processor_ok_false:{resp.get('error') or 'unknown'}")
+    retrieval = resp.get("retrieval") if isinstance(resp, dict) else None
+    retrieval_ok = True
+    retrieval_partial = False
+    if isinstance(retrieval, dict):
+        retrieval_ok = retrieval.get("ok") is True
+        retrieval_partial = bool(retrieval.get("partial"))
+    if not retrieval_ok or retrieval_partial:
+        raise RuntimeError(f"doc_processor_retrieval_failed:ok={retrieval_ok},partial={retrieval_partial}")
 
     now = time.time()
     ingestion = {
@@ -208,6 +216,8 @@ async def main() -> None:
 
     max_attempts = _parse_int("WORKER_MAX_ATTEMPTS", 5)
     prefetch = _parse_int("WORKER_PREFETCH", 5)
+    max_concurrency = _parse_int("WORKER_CONCURRENCY", prefetch)
+    max_concurrency = max(1, int(max_concurrency))
 
     metrics_port = _parse_int("WORKER_METRICS_PORT", 8083)
     start_http_server(metrics_port)
@@ -266,16 +276,18 @@ async def main() -> None:
         )
         await channel.default_exchange.publish(msg, routing_key=dlq_queue)
 
-    async with q.iterator() as queue_iter:
-        async for message in queue_iter:
+    sem = asyncio.Semaphore(max_concurrency)
+    tasks: set[asyncio.Task[None]] = set()
+
+    async def _process_message(message: aio_pika.IncomingMessage) -> None:
+        async with sem:
             async with message.process(ignore_processed=True):
                 try:
                     task = json.loads(message.body.decode("utf-8"))
                 except Exception:
                     # bad message: drop to DLQ
                     CONSUMED.labels(type="unknown", status="bad_json").inc()
-                    await message.ack()
-                    continue
+                    return
 
                 ttype = str(task.get("type") or "unknown")
                 attempt = int(task.get("attempt") or 0)
@@ -326,8 +338,14 @@ async def main() -> None:
                     INFLIGHT.labels(ttype).dec()
                     _ = t0  # keep for future if we add overall histograms
 
+    async with q.iterator() as queue_iter:
+        async for message in queue_iter:
+            task = asyncio.create_task(_process_message(message))
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+            if len(tasks) >= max_concurrency:
+                await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
