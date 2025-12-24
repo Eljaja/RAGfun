@@ -151,7 +151,7 @@ function updateDocsMeta() {
   const shown = docsState.items.length;
   const total = docsState.total || 0;
   if (!shown) {
-    el.textContent = total ? `Показано: 0 из ${total}` : "";
+    el.textContent = total ? `Shown: 0 of ${total}` : "";
   } else {
     // Stats by status (based on already loaded docs; in this UI we auto-load all pages).
     const stats = {
@@ -176,18 +176,18 @@ function updateDocsMeta() {
       else stats.unknown += 1;
     }
 
-    const left = total ? `Показано: ${shown} из ${total}` : `Показано: ${shown}`;
+    const left = total ? `Shown: ${shown} of ${total}` : `Shown: ${shown}`;
     const parts = [
-      `Проиндексировано: ${stats.indexed}`,
-      `Не проиндексировано: ${stats.not_indexed}`,
+      `Indexed: ${stats.indexed}`,
+      `Not indexed: ${stats.not_indexed}`,
     ];
-    if (stats.queued) parts.push(`В очереди: ${stats.queued}`);
-    if (stats.processing) parts.push(`Обработка: ${stats.processing}`);
-    if (stats.retrying) parts.push(`Повтор: ${stats.retrying}`);
-    if (stats.failed) parts.push(`Ошибка: ${stats.failed}`);
-    if (stats.unknown) parts.push(`Неизвестно: ${stats.unknown}`);
+    if (stats.queued) parts.push(`Queued: ${stats.queued}`);
+    if (stats.processing) parts.push(`Processing: ${stats.processing}`);
+    if (stats.retrying) parts.push(`Retrying: ${stats.retrying}`);
+    if (stats.failed) parts.push(`Error: ${stats.failed}`);
+    if (stats.unknown) parts.push(`Unknown: ${stats.unknown}`);
 
-    el.textContent = `${left} · ${parts.join(" · ")}`;
+    el.textContent = `${left} | ${parts.join(" | ")}`;
   }
 
   const btn = document.getElementById("load_more_docs");
@@ -210,7 +210,7 @@ function setBusy(busy, text) {
   const statusEl = document.getElementById("status");
   if (text) {
     statusEl.textContent = text;
-    statusEl.className = "composer-status" + (text.includes("Ошибка") ? " error" : text.includes("OK") ? " success" : "");
+    statusEl.className = "composer-status" + (text.includes("Error") ? " error" : text.includes("OK") ? " success" : "");
   } else {
     statusEl.textContent = "";
     statusEl.className = "composer-status";
@@ -223,7 +223,7 @@ function setUploadBusy(busy, text) {
   const statusEl = document.getElementById("upload_status");
   if (text) {
     statusEl.textContent = text;
-    statusEl.className = "status" + (text.includes("Ошибка") ? " error" : text.includes("OK") ? " success" : "");
+    statusEl.className = "status" + (text.includes("Error") ? " error" : text.includes("OK") ? " success" : "");
   } else {
     statusEl.textContent = "";
     statusEl.className = "status";
@@ -279,7 +279,7 @@ function retrievalHtml(context) {
 function renderDocuments(docs) {
   const container = document.getElementById("doc_list");
   if (!docs || !docs.length) {
-    container.innerHTML = '<div style="color: var(--text-secondary); text-align: center; padding: 40px;">Документы не найдены</div>';
+    container.innerHTML = '<div style="color: var(--text-secondary); text-align: center; padding: 40px;">No documents found</div>';
     return;
   }
 
@@ -289,32 +289,32 @@ function renderDocuments(docs) {
     <div class="doc-item">
       <div class="doc-header">
         <div style="flex: 1;">
-          <div class="doc-title">${escapeHtml(doc.title || doc.doc_id || "Без названия")}</div>
+          <div class="doc-title">${escapeHtml(doc.title || doc.doc_id || "Untitled")}</div>
           <div class="doc-id">ID: ${escapeHtml(doc.doc_id)}</div>
         </div>
         <div class="badges">
-          ${doc.storage_id ? '<span class="badge stored">Сохранен</span>' : ""}
+          ${doc.storage_id ? '<span class="badge stored">Stored</span>' : ""}
           ${(() => {
             const ing = doc && doc.extra && doc.extra.ingestion ? doc.extra.ingestion : null;
             const st = ing && ing.state ? String(ing.state) : "";
-            if (st === "queued") return '<span class="badge queued">В очереди</span>';
-            if (st === "processing") return '<span class="badge processing">Обрабатывается</span>';
-            if (st === "retrying") return '<span class="badge queued">Повтор</span>';
-            if (st === "failed") return '<span class="badge failed">Ошибка</span>';
-            return doc.indexed ? '<span class="badge indexed">Проиндексирован</span>' : '<span class="badge not-indexed">Не проиндексирован</span>';
+            if (st === "queued") return '<span class="badge queued">Queued</span>';
+            if (st === "processing") return '<span class="badge processing">Processing</span>';
+            if (st === "retrying") return '<span class="badge queued">Retrying</span>';
+            if (st === "failed") return '<span class="badge failed">Error</span>';
+            return doc.indexed ? '<span class="badge indexed">Indexed</span>' : '<span class="badge not-indexed">Not indexed</span>';
           })()}
         </div>
       </div>
       <div class="doc-meta">
-        ${doc.source ? `<span>Источник: ${escapeHtml(doc.source)}</span>` : ""}
-        ${doc.project_id ? `<span style="margin-left: 12px;">Коллекция: ${escapeHtml(doc.project_id)}</span>` : ""}
-        ${doc.lang ? `<span style="margin-left: 12px;">Язык: ${escapeHtml(doc.lang)}</span>` : ""}
-        ${doc.size ? `<span style="margin-left: 12px;">Размер: ${formatBytes(doc.size)}</span>` : ""}
-        ${doc.stored_at ? `<span style="margin-left: 12px;">Загружен: ${new Date(doc.stored_at).toLocaleString("ru")}</span>` : ""}
+        ${doc.source ? `<span>Source: ${escapeHtml(doc.source)}</span>` : ""}
+        ${doc.project_id ? `<span style="margin-left: 12px;">Collection: ${escapeHtml(doc.project_id)}</span>` : ""}
+        ${doc.lang ? `<span style="margin-left: 12px;">Language: ${escapeHtml(doc.lang)}</span>` : ""}
+        ${doc.size ? `<span style="margin-left: 12px;">Size: ${formatBytes(doc.size)}</span>` : ""}
+        ${doc.stored_at ? `<span style="margin-left: 12px;">Uploaded: ${new Date(doc.stored_at).toLocaleString("en-US")}</span>` : ""}
       </div>
-      ${doc.tags && doc.tags.length ? `<div class="doc-meta">Теги: ${doc.tags.map(t => escapeHtml(t)).join(", ")}</div>` : ""}
+      ${doc.tags && doc.tags.length ? `<div class="doc-meta">Tags: ${doc.tags.map(t => escapeHtml(t)).join(", ")}</div>` : ""}
       <div class="doc-meta" style="margin-top: 10px;">
-        <button class="btn btn-danger" data-action="delete-doc" data-doc-id="${escapeHtml(doc.doc_id)}">Удалить</button>
+        <button class="btn btn-danger" data-action="delete-doc" data-doc-id="${escapeHtml(doc.doc_id)}">Delete</button>
       </div>
     </div>
   `
@@ -326,18 +326,18 @@ function renderDocuments(docs) {
     btn.addEventListener("click", async e => {
       const docId = e.currentTarget.getAttribute("data-doc-id");
       if (!docId) return;
-      const ok = confirm(`Удалить документ ${docId}?\n\nЭто удалит файл из хранилища и удалит чанки из индекса.`);
+      const ok = confirm(`Delete document ${docId}?\n\nThis will remove the file from storage and delete chunks from the index.`);
       if (!ok) return;
       try {
         e.currentTarget.disabled = true;
         const res = await deleteDoc(docId);
         await loadDocuments();
         if (res && res.accepted && res.task_id) {
-          alert(`Удаление поставлено в очередь.\n\ntask_id=${res.task_id}`);
+          alert(`Deletion queued.\n\ntask_id=${res.task_id}`);
         }
       } catch (err) {
         e.currentTarget.disabled = false;
-        alert(`Ошибка удаления: ${err.message}`);
+        alert(`Delete failed: ${err.message}`);
       }
     });
   });
@@ -351,44 +351,201 @@ function escapeHtml(text) {
 
 function formatMessageText(text) {
   if (!text) return "";
-  
+
   // First, escape HTML to prevent XSS
   let escaped = escapeHtml(text);
-  
-  // Process code blocks (```language\ncode\n``` or ```\ncode\n```)
-  // Use a placeholder to mark code blocks
+
+  // Extract fenced code blocks.
   const codeBlockPlaceholders = [];
-  let placeholderIndex = 0;
-  
+  let blockIndex = 0;
   const codeBlockPattern = /```(\w+)?\s*\n([\s\S]*?)```/g;
-  escaped = escaped.replace(codeBlockPattern, (match, lang, code) => {
-    const placeholder = `__CODE_BLOCK_${placeholderIndex}__`;
+  escaped = escaped.replace(codeBlockPattern, (_match, lang, code) => {
+    const placeholder = `__CODE_BLOCK_${blockIndex}__`;
     const language = lang ? ` data-lang="${lang.trim()}"` : "";
     codeBlockPlaceholders.push(`<pre><code${language}>${code.trim()}</code></pre>`);
-    placeholderIndex++;
+    blockIndex += 1;
     return placeholder;
   });
-  
-  // Process inline code (`code`) - but not inside code block placeholders
-  escaped = escaped.replace(/`([^`\n]+)`/g, (match, code) => {
-    // Skip if this is inside a placeholder
-    if (match.includes('__CODE_BLOCK_')) return match;
-    return `<code>${code}</code>`;
+
+  // Extract inline code.
+  const inlineCodePlaceholders = [];
+  let inlineIndex = 0;
+  escaped = escaped.replace(/`([^`\n]+)`/g, (_match, code) => {
+    const placeholder = `__INLINE_CODE_${inlineIndex}__`;
+    inlineCodePlaceholders.push(`<code>${code}</code>`);
+    inlineIndex += 1;
+    return placeholder;
   });
-  
-  // Replace placeholders with actual code blocks
-  codeBlockPlaceholders.forEach((codeBlock, index) => {
-    escaped = escaped.replace(`__CODE_BLOCK_${index}__`, codeBlock);
-  });
-  
-  // Convert line breaks to <br> (but preserve code blocks)
-  const parts = escaped.split(/(<pre>[\s\S]*?<\/pre>)/g);
-  return parts.map((part) => {
-    if (part.startsWith('<pre>')) {
-      return part; // Don't process code blocks
+
+  const applyInlineMarkdown = (value) => {
+    let out = value;
+    out = out.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    out = out.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+    out = out.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
+    return out;
+  };
+
+  const renderBlocks = (value) => {
+    const lines = value.split("\n");
+    let html = "";
+    let paragraph = [];
+    let inUl = false;
+    let inOl = false;
+    let pendingTable = null;
+
+    const flushParagraph = () => {
+      if (!paragraph.length) return;
+      const content = applyInlineMarkdown(paragraph.join("<br>"));
+      html += `<p>${content}</p>`;
+      paragraph = [];
+    };
+
+    const closeLists = () => {
+      if (inUl) {
+        html += "</ul>";
+        inUl = false;
+      }
+      if (inOl) {
+        html += "</ol>";
+        inOl = false;
+      }
+    };
+
+    const flushTable = () => {
+      if (!pendingTable) return;
+      const header = pendingTable.header || [];
+      const rows = pendingTable.rows || [];
+      const renderRow = (cells, cellTag) => {
+        const safe = cells.map(c => `<${cellTag}>${applyInlineMarkdown(c.trim())}</${cellTag}>`).join("");
+        return `<tr>${safe}</tr>`;
+      };
+      let tableHtml = '<table class="md-table">';
+      if (header.length) {
+        tableHtml += `<thead>${renderRow(header, "th")}</thead>`;
+      }
+      if (rows.length) {
+        tableHtml += `<tbody>${rows.map(r => renderRow(r, "td")).join("")}</tbody>`;
+      }
+      tableHtml += "</table>";
+      html += tableHtml;
+      pendingTable = null;
+    };
+
+    const parseTableCells = (line) => {
+      let trimmed = line.trim();
+      if (trimmed.startsWith("|")) trimmed = trimmed.slice(1);
+      if (trimmed.endsWith("|")) trimmed = trimmed.slice(0, -1);
+      return trimmed.split("|").map(c => c.trim());
+    };
+
+    const isTableDivider = (line) => {
+      const trimmed = line.trim();
+      if (!trimmed.includes("|")) return false;
+      const raw = trimmed.replace(/\s+/g, "");
+      if (!raw.startsWith("|") && !raw.includes("|")) return false;
+      const parts = parseTableCells(trimmed);
+      return parts.length >= 2 && parts.every(p => /^:?-{3,}:?$/.test(p));
+    };
+
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i];
+      const trimmed = line.trim();
+      if (pendingTable) {
+        if (!trimmed || !trimmed.includes("|")) {
+          flushTable();
+        } else {
+          pendingTable.rows.push(parseTableCells(trimmed));
+          continue;
+        }
+      }
+      if (!trimmed) {
+        flushParagraph();
+        closeLists();
+        continue;
+      }
+
+      const nextLine = lines[i + 1] || "";
+      if (trimmed.includes("|") && isTableDivider(nextLine)) {
+        flushParagraph();
+        closeLists();
+        const header = parseTableCells(trimmed);
+        pendingTable = { header, rows: [] };
+        i += 1;
+        continue;
+      }
+
+      const headingMatch = trimmed.match(/^(#{1,3})\s+(.*)$/);
+      if (headingMatch) {
+        flushParagraph();
+        closeLists();
+        flushTable();
+        const level = headingMatch[1].length;
+        const tag = level === 1 ? "h3" : level === 2 ? "h4" : "h5";
+        html += `<${tag}>${applyInlineMarkdown(headingMatch[2])}</${tag}>`;
+        continue;
+      }
+
+      const quoteMatch = trimmed.match(/^>\s+(.*)$/);
+      if (quoteMatch) {
+        flushParagraph();
+        closeLists();
+        flushTable();
+        html += `<blockquote>${applyInlineMarkdown(quoteMatch[1])}</blockquote>`;
+        continue;
+      }
+
+      const ulMatch = trimmed.match(/^[-*]\s+(.*)$/);
+      if (ulMatch) {
+        flushParagraph();
+        flushTable();
+        if (inOl) {
+          html += "</ol>";
+          inOl = false;
+        }
+        if (!inUl) {
+          html += "<ul>";
+          inUl = true;
+        }
+        html += `<li>${applyInlineMarkdown(ulMatch[1])}</li>`;
+        continue;
+      }
+
+      const olMatch = trimmed.match(/^\d+\.\s+(.*)$/);
+      if (olMatch) {
+        flushParagraph();
+        flushTable();
+        if (inUl) {
+          html += "</ul>";
+          inUl = false;
+        }
+        if (!inOl) {
+          html += "<ol>";
+          inOl = true;
+        }
+        html += `<li>${applyInlineMarkdown(olMatch[1])}</li>`;
+        continue;
+      }
+
+      paragraph.push(line);
     }
-    return part.replace(/\n/g, '<br>');
-  }).join('');
+
+    flushParagraph();
+    closeLists();
+    flushTable();
+    return html;
+  };
+
+  let html = renderBlocks(escaped);
+
+  // Restore inline code and code blocks.
+  inlineCodePlaceholders.forEach((snippet, index) => {
+    html = html.replace(`__INLINE_CODE_${index}__`, snippet);
+  });
+  codeBlockPlaceholders.forEach((block, index) => {
+    html = html.replace(`__CODE_BLOCK_${index}__`, block);
+  });
+
+  return html;
 }
 
 function formatBytes(bytes) {
@@ -497,14 +654,14 @@ function setAssistantExtras(msgWrapper, { sources, context }) {
   if (sources && sources.length) {
     const d = document.createElement("details");
     d.open = false;
-    d.innerHTML = `<summary>Источники (${sources.length})</summary>${sourcesHtml(fmtSources(sources) || [])}`;
+    d.innerHTML = `<summary>Sources (${sources.length})</summary>${sourcesHtml(fmtSources(sources) || [])}`;
     meta.appendChild(d);
   }
 
   if (context && context.length) {
     const d = document.createElement("details");
     d.open = false;
-    d.innerHTML = `<summary>Контекст (retrieval) (${context.length})</summary>${retrievalHtml(context)}`;
+    d.innerHTML = `<summary>Context (retrieval) (${context.length})</summary>${retrievalHtml(context)}`;
     meta.appendChild(d);
   }
 
@@ -520,7 +677,7 @@ if (uploadBtn) uploadBtn.addEventListener("click", async () => {
   const fileEl = document.getElementById("file");
   const file = fileEl.files && fileEl.files[0];
   if (!file) {
-    alert("Выберите файл");
+    alert("Choose a file");
     return;
   }
 
@@ -533,14 +690,14 @@ if (uploadBtn) uploadBtn.addEventListener("click", async () => {
   const tags = document.getElementById("tags").value.trim();
   const project_id = document.getElementById("upload_collection").value.trim();
 
-  setUploadBusy(true, "Загрузка…");
+  setUploadBusy(true, "Uploading...");
   try {
     const data = await uploadDoc({ file, doc_id, title, uri, source, lang, tags, project_id });
     // Show the actually used doc_id (useful when input was empty and we auto-generated it)
     if (data && data.accepted && data.task_id) {
-      setUploadBusy(false, `Принято в очередь · task_id=${data.task_id} · doc_id=${doc_id}`);
+      setUploadBusy(false, `Queued | task_id=${data.task_id} | doc_id=${doc_id}`);
     } else {
-      setUploadBusy(false, `OK · doc_id=${doc_id}`);
+      setUploadBusy(false, `OK | doc_id=${doc_id}`);
     }
     // After each successful upload, generate a new doc_id in UI to avoid accidental overwrite
     if (docIdEl) docIdEl.value = randId();
@@ -551,8 +708,8 @@ if (uploadBtn) uploadBtn.addEventListener("click", async () => {
     // Refresh collections list (new collection might appear)
     loadCollections();
   } catch (e) {
-    setUploadBusy(false, "Ошибка");
-    alert(`Ошибка загрузки: ${e.message}`);
+    setUploadBusy(false, "Error");
+    alert(`Upload failed: ${e.message}`);
   }
 });
 
@@ -572,7 +729,7 @@ async function askStream() {
     qEl.focus();
   }
 
-  setBusy(true, "Запрос…");
+  setBusy(true, "Sending...");
   let answerText = "";
 
   try {
@@ -594,11 +751,11 @@ async function askStream() {
         const flags = [];
         if (data && data.partial) flags.push("partial");
         if (data && data.degraded && data.degraded.length) flags.push(`degraded=${data.degraded.join(",")}`);
-        setBusy(false, flags.length ? flags.join(" · ") : "OK");
+        setBusy(false, flags.length ? flags.join(" | ") : "OK");
       },
       error => {
-        if (assistant && assistant.bubbleText) assistant.bubbleText.innerHTML = escapeHtml(`Ошибка: ${error.message}`).replace(/\n/g, '<br>');
-        setBusy(false, "Ошибка");
+        if (assistant && assistant.bubbleText) assistant.bubbleText.innerHTML = escapeHtml(`Error: ${error.message}`).replace(/\n/g, '<br>');
+        setBusy(false, "Error");
       },
       data => {
         // retrieval
@@ -611,8 +768,8 @@ async function askStream() {
       }
     );
   } catch (e) {
-    if (assistant && assistant.bubbleText) assistant.bubbleText.innerHTML = escapeHtml(`Ошибка: ${e.message}`).replace(/\n/g, '<br>');
-    setBusy(false, "Ошибка");
+    if (assistant && assistant.bubbleText) assistant.bubbleText.innerHTML = escapeHtml(`Error: ${e.message}`).replace(/\n/g, '<br>');
+    setBusy(false, "Error");
   }
 }
 
@@ -686,7 +843,7 @@ async function loadDocuments() {
       await new Promise(r => setTimeout(r, 0));
     }
   } catch (e) {
-    container.innerHTML = `<div style="color: var(--error); text-align: center; padding: 40px;">Ошибка загрузки: ${escapeHtml(e.message)}</div>`;
+    container.innerHTML = `<div style="color: var(--error); text-align: center; padding: 40px;">Failed to load: ${escapeHtml(e.message)}</div>`;
   } finally {
     setDocsBusy(false);
     updateDocsMeta();
@@ -709,10 +866,10 @@ if (applyFilesFiltersBtn) applyFilesFiltersBtn.addEventListener("click", () => {
 const deleteAllBtn = document.getElementById("delete_all_docs");
 if (deleteAllBtn) deleteAllBtn.addEventListener("click", async () => {
   const ok = confirm(
-    "Удалить ВСЕ документы?\n\n" +
-      "- удалит файлы из document-storage\n" +
-      "- удалит чанки из retrieval индекса\n\n" +
-      "Операция необратима."
+    "Delete ALL documents?\n\n" +
+      "- removes files from document-storage\n" +
+      "- deletes chunks from the retrieval index\n\n" +
+      "This action cannot be undone."
   );
   if (!ok) return;
 
@@ -725,9 +882,9 @@ if (deleteAllBtn) deleteAllBtn.addEventListener("click", async () => {
     await loadDocuments();
     const partial = res && res.partial;
     const deleted = (res && res.deleted) || 0;
-    alert(partial ? `Удалено: ${deleted}. Есть деградации/ошибки — см. ответ API.` : `Удалено: ${deleted}.`);
+    alert(partial ? `Deleted: ${deleted}. Some degradations/errors occurred -- check the API response.` : `Deleted: ${deleted}.`);
   } catch (e) {
-    alert(`Ошибка удаления всех документов: ${e.message}`);
+    alert(`Failed to delete all documents: ${e.message}`);
   } finally {
     deleteAllBtn.disabled = false;
   }

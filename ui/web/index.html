@@ -1,41 +1,67 @@
 <!doctype html>
-<html lang="ru">
+<html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>RAG Chat</title>
     <style>
+      @import url("https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;700&family=Manrope:wght@300;400;500;600;700&display=swap");
+
       :root {
-        --bg-primary: #0f172a;
-        --bg-secondary: #1e293b;
-        --bg-card: rgba(30, 41, 59, 0.8);
-        --border-color: rgba(148, 163, 184, 0.2);
-        --text-primary: #f1f5f9;
-        --text-secondary: #cbd5e1;
-        --text: #f1f5f9;
-        --accent: #3b82f6;
-        --accent-hover: #2563eb;
-        --success: #10b981;
-        --warning: #f59e0b;
-        --error: #ef4444;
-        --danger: #ef4444;
-        color-scheme: dark;
+        --bg-primary: #f5efe6;
+        --bg-secondary: #efe4d3;
+        --bg-card: rgba(255, 255, 255, 0.88);
+        --border-color: rgba(74, 60, 46, 0.14);
+        --text-primary: #2c2a27;
+        --text-secondary: #6f675f;
+        --text: #2c2a27;
+        --accent: #0f766e;
+        --accent-hover: #115e59;
+        --success: #2f9e5f;
+        --warning: #c97a1e;
+        --error: #c2412a;
+        --danger: #c2412a;
+        color-scheme: light;
       }
       * { box-sizing: border-box; }
       html, body {
         height: 100%;
       }
       body {
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        font-family: "Manrope", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
         margin: 0;
-        background: var(--bg-primary);
+        background: radial-gradient(circle at top left, #fff7ec 0%, #f6efe6 55%, #e6dbc8 100%);
         color: var(--text-primary);
         line-height: 1.6;
+        position: relative;
+        overflow: hidden;
+      }
+      body::before,
+      body::after {
+        content: "";
+        position: fixed;
+        z-index: -1;
+        width: 520px;
+        height: 520px;
+        border-radius: 50%;
+        filter: blur(1px);
+        opacity: 0.5;
+      }
+      body::before {
+        top: -140px;
+        right: -120px;
+        background: radial-gradient(circle, rgba(15, 118, 110, 0.18), rgba(15, 118, 110, 0));
+      }
+      body::after {
+        bottom: -180px;
+        left: -160px;
+        background: radial-gradient(circle, rgba(201, 122, 30, 0.18), rgba(201, 122, 30, 0));
       }
       .app {
         height: 100%;
         display: flex;
         flex-direction: column;
+        position: relative;
       }
       .app-header {
         position: sticky;
@@ -46,9 +72,10 @@
         justify-content: space-between;
         gap: 12px;
         padding: 14px 18px;
-        background: rgba(15, 23, 42, 0.92);
+        background: rgba(255, 255, 255, 0.9);
         border-bottom: 1px solid var(--border-color);
-        backdrop-filter: blur(10px);
+        box-shadow: 0 6px 20px rgba(28, 21, 14, 0.08);
+        backdrop-filter: blur(12px);
       }
       .brand {
         display: flex;
@@ -59,6 +86,8 @@
         font-size: 16px;
         font-weight: 700;
         line-height: 1.2;
+        font-family: "Fraunces", "Manrope", serif;
+        letter-spacing: 0.4px;
       }
       .brand-subtitle {
         font-size: 12px;
@@ -74,22 +103,25 @@
       .card {
         background: var(--bg-card);
         border: 1px solid var(--border-color);
-        border-radius: 20px;
+        border-radius: 24px;
         padding: 28px;
-        backdrop-filter: blur(10px);
-        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+        backdrop-filter: blur(12px);
+        box-shadow: 0 18px 40px rgba(28, 21, 14, 0.16);
+        animation: float-in 0.5s ease;
       }
       h1 {
         font-size: 24px;
         font-weight: 700;
         margin: 0 0 8px;
         color: var(--text-primary);
+        font-family: "Fraunces", "Manrope", serif;
       }
       h2 {
         font-size: 18px;
         font-weight: 600;
         margin: 0 0 16px;
         color: var(--text-primary);
+        font-family: "Fraunces", "Manrope", serif;
       }
       .subtitle {
         font-size: 13px;
@@ -111,19 +143,20 @@
         width: 100%;
         padding: 12px;
         border: 1px solid var(--border-color);
-        border-radius: 8px;
-        background: rgba(15, 23, 42, 0.6);
+        border-radius: 12px;
+        background: rgba(255, 255, 255, 0.75);
         color: var(--text-primary);
         font-size: 14px;
         font-family: inherit;
         transition: border-color 0.2s, background 0.2s;
+        box-shadow: inset 0 1px 2px rgba(28, 21, 14, 0.08);
       }
       input:focus,
       textarea:focus,
       select:focus {
         outline: none;
         border-color: var(--accent);
-        background: rgba(15, 23, 42, 0.8);
+        background: rgba(255, 255, 255, 0.95);
       }
       textarea {
         min-height: 120px;
@@ -140,9 +173,9 @@
       button {
         padding: 12px 24px;
         border: none;
-        border-radius: 8px;
-        background: var(--accent);
-        color: white;
+        border-radius: 999px;
+        background: linear-gradient(135deg, var(--accent), #1a8f84);
+        color: #ffffff;
         font-weight: 600;
         font-size: 14px;
         cursor: pointer;
@@ -150,9 +183,10 @@
         display: inline-flex;
         align-items: center;
         gap: 8px;
+        box-shadow: 0 10px 20px rgba(15, 118, 110, 0.18);
       }
       button:hover:not(:disabled) {
-        background: var(--accent-hover);
+        background: linear-gradient(135deg, var(--accent-hover), #0f6b61);
         transform: translateY(-1px);
       }
       button:active:not(:disabled) {
@@ -163,11 +197,13 @@
         cursor: not-allowed;
       }
       .btn-secondary {
-        background: var(--bg-secondary);
+        background: rgba(74, 60, 46, 0.08);
         border: 1px solid var(--border-color);
+        color: var(--text-primary);
+        box-shadow: none;
       }
       .btn-secondary:hover:not(:disabled) {
-        background: rgba(30, 41, 59, 0.9);
+        background: rgba(74, 60, 46, 0.14);
       }
       .status {
         font-size: 13px;
@@ -180,7 +216,7 @@
       pre {
         white-space: pre-wrap;
         word-break: break-word;
-        background: rgba(15, 23, 42, 0.6);
+        background: rgba(255, 255, 255, 0.7);
         padding: 16px;
         border-radius: 8px;
         border: 1px solid var(--border-color);
@@ -196,14 +232,14 @@
       }
       .doc-item {
         padding: 16px;
-        background: rgba(15, 23, 59, 0.4);
+        background: rgba(255, 255, 255, 0.72);
         border: 1px solid var(--border-color);
         border-radius: 8px;
         margin-bottom: 12px;
         transition: background 0.2s, border-color 0.2s;
       }
       .doc-item:hover {
-        background: rgba(15, 23, 59, 0.6);
+        background: rgba(255, 255, 255, 0.92);
         border-color: var(--accent);
       }
       .doc-header {
@@ -239,51 +275,51 @@
         letter-spacing: 0.5px;
       }
       .badge.stored {
-        background: rgba(16, 185, 129, 0.2);
+        background: rgba(47, 158, 95, 0.15);
         color: var(--success);
-        border: 1px solid rgba(16, 185, 129, 0.3);
+        border: 1px solid rgba(47, 158, 95, 0.3);
       }
       .badge.indexed {
-        background: rgba(59, 130, 246, 0.2);
+        background: rgba(15, 118, 110, 0.15);
         color: var(--accent);
-        border: 1px solid rgba(59, 130, 246, 0.3);
+        border: 1px solid rgba(15, 118, 110, 0.3);
       }
       .badge.queued {
-        background: rgba(245, 158, 11, 0.2);
+        background: rgba(201, 122, 30, 0.15);
         color: var(--warning);
-        border: 1px solid rgba(245, 158, 11, 0.3);
+        border: 1px solid rgba(201, 122, 30, 0.3);
       }
       .badge.processing {
-        background: rgba(59, 130, 246, 0.2);
+        background: rgba(15, 118, 110, 0.15);
         color: var(--accent);
-        border: 1px solid rgba(59, 130, 246, 0.3);
+        border: 1px solid rgba(15, 118, 110, 0.3);
       }
       .badge.failed {
-        background: rgba(239, 68, 68, 0.2);
+        background: rgba(194, 65, 42, 0.16);
         color: var(--error);
-        border: 1px solid rgba(239, 68, 68, 0.3);
+        border: 1px solid rgba(194, 65, 42, 0.3);
       }
       .badge.not-indexed {
-        background: rgba(148, 163, 184, 0.2);
+        background: rgba(74, 60, 46, 0.08);
         color: var(--text-secondary);
         border: 1px solid var(--border-color);
       }
       .btn {
-        border: 1px solid rgba(255,255,255,0.14);
-        background: rgba(255,255,255,0.06);
+        border: 1px solid rgba(74, 60, 46, 0.2);
+        background: rgba(255, 255, 255, 0.7);
         color: var(--text);
         padding: 8px 12px;
         border-radius: 10px;
         cursor: pointer;
       }
-      .btn:hover { background: rgba(255,255,255,0.10); }
+      .btn:hover { background: rgba(255, 255, 255, 0.9); }
       .btn:disabled { opacity: 0.6; cursor: not-allowed; }
       .btn-danger {
-        border-color: rgba(255, 107, 107, 0.35);
-        background: rgba(255, 107, 107, 0.12);
+        border-color: rgba(194, 65, 42, 0.35);
+        background: rgba(194, 65, 42, 0.12);
         color: var(--danger);
       }
-      .btn-danger:hover { background: rgba(255, 107, 107, 0.18); }
+      .btn-danger:hover { background: rgba(194, 65, 42, 0.2); }
       .badges {
         display: flex;
         gap: 8px;
@@ -296,8 +332,8 @@
       }
       .tab {
         padding: 8px 12px;
-        background: rgba(255,255,255,0.06);
-        border: 1px solid rgba(255,255,255,0.12);
+        background: rgba(74, 60, 46, 0.06);
+        border: 1px solid rgba(74, 60, 46, 0.12);
         color: var(--text-secondary);
         cursor: pointer;
         font-weight: 500;
@@ -305,8 +341,8 @@
       }
       .tab.active {
         color: var(--text-primary);
-        border-color: rgba(59, 130, 246, 0.55);
-        background: rgba(59, 130, 246, 0.14);
+        border-color: rgba(15, 118, 110, 0.45);
+        background: rgba(15, 118, 110, 0.14);
       }
       .tab-content {
         display: none;
@@ -317,7 +353,7 @@
       }
       .source-item {
         padding: 12px;
-        background: rgba(15, 23, 42, 0.4);
+        background: rgba(255, 255, 255, 0.7);
         border-left: 3px solid var(--accent);
         border-radius: 4px;
         margin-bottom: 8px;
@@ -380,7 +416,7 @@
         padding: 10px;
         border: 1px solid var(--border-color);
         border-radius: 8px;
-        background: rgba(15, 23, 42, 0.6);
+        background: rgba(255, 255, 255, 0.75);
         color: var(--text-primary);
         font-size: 14px;
         font-family: inherit;
@@ -389,7 +425,7 @@
       .chat-collections-select:focus {
         outline: none;
         border-color: var(--accent);
-        background: rgba(15, 23, 42, 0.8);
+        background: rgba(255, 255, 255, 0.95);
       }
       .messages {
         flex: 1;
@@ -404,37 +440,38 @@
         width: 8px;
       }
       .messages::-webkit-scrollbar-track {
-        background: rgba(15, 23, 42, 0.3);
+        background: rgba(74, 60, 46, 0.12);
         border-radius: 4px;
       }
       .messages::-webkit-scrollbar-thumb {
-        background: rgba(148, 163, 184, 0.4);
+        background: rgba(74, 60, 46, 0.3);
         border-radius: 4px;
       }
       .messages::-webkit-scrollbar-thumb:hover {
-        background: rgba(148, 163, 184, 0.6);
+        background: rgba(74, 60, 46, 0.45);
       }
       .msg {
         display: flex;
         gap: 12px;
         align-items: flex-start;
+        animation: message-in 0.2s ease;
       }
       .msg.user { justify-content: flex-end; }
       .msg.assistant { justify-content: flex-start; }
       .bubble {
         max-width: min(900px, 95vw);
         border: 1px solid var(--border-color);
-        background: rgba(15, 23, 42, 0.65);
+        background: rgba(255, 255, 255, 0.8);
         border-radius: 16px;
         padding: 16px 18px;
         display: flex;
         flex-direction: column;
         gap: 12px;
-        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+        box-shadow: 0 6px 18px rgba(28, 21, 14, 0.12);
         transition: box-shadow 0.2s;
       }
       .bubble:hover {
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+        box-shadow: 0 10px 24px rgba(28, 21, 14, 0.16);
       }
       .bubble-text {
         white-space: pre-wrap;
@@ -442,19 +479,76 @@
         line-height: 1.7;
         font-size: 15px;
       }
+      .bubble-text p {
+        margin: 0 0 12px;
+      }
+      .bubble-text h3,
+      .bubble-text h4,
+      .bubble-text h5 {
+        margin: 16px 0 8px;
+        font-family: "Fraunces", "Manrope", serif;
+        color: var(--text-primary);
+      }
+      .bubble-text h3 { font-size: 18px; }
+      .bubble-text h4 { font-size: 16px; }
+      .bubble-text h5 { font-size: 15px; text-transform: uppercase; letter-spacing: 0.04em; }
+      .bubble-text ul,
+      .bubble-text ol {
+        margin: 8px 0 12px 20px;
+        padding-left: 16px;
+      }
+      .bubble-text li {
+        margin: 6px 0;
+      }
+      .bubble-text blockquote {
+        margin: 12px 0;
+        padding: 10px 14px;
+        border-left: 3px solid var(--accent);
+        background: rgba(15, 118, 110, 0.08);
+        border-radius: 10px;
+        color: var(--text-secondary);
+      }
+      .bubble-text a {
+        color: var(--accent);
+        text-decoration: none;
+        border-bottom: 1px solid rgba(15, 118, 110, 0.3);
+      }
+      .bubble-text a:hover {
+        color: var(--accent-hover);
+        border-bottom-color: rgba(15, 118, 110, 0.6);
+      }
+      .bubble-text .md-table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 12px 0 16px;
+        font-size: 14px;
+      }
+      .bubble-text .md-table th,
+      .bubble-text .md-table td {
+        border: 1px solid var(--border-color);
+        padding: 8px 10px;
+        text-align: left;
+      }
+      .bubble-text .md-table th {
+        background: rgba(15, 118, 110, 0.12);
+        font-weight: 600;
+      }
+      .bubble-text .md-table tr:nth-child(even) td {
+        background: rgba(74, 60, 46, 0.04);
+      }
       .bubble-text code {
-        background: rgba(0, 0, 0, 0.4);
+        background: rgba(15, 118, 110, 0.12);
         padding: 3px 7px;
         border-radius: 5px;
         font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Roboto Mono', 'Source Code Pro', 'Courier New', monospace;
         font-size: 0.9em;
-        color: #fbbf24;
-        border: 1px solid rgba(251, 191, 36, 0.2);
+        color: #0f766e;
+        border: 1px solid rgba(15, 118, 110, 0.2);
         font-weight: 500;
       }
       .bubble-text pre {
-        background: rgba(0, 0, 0, 0.5);
-        border: 1px solid rgba(148, 163, 184, 0.3);
+        background: rgba(44, 42, 39, 0.92);
+        border: 1px solid rgba(44, 42, 39, 0.4);
         border-radius: 10px;
         padding: 18px 20px;
         margin: 16px 0;
@@ -464,7 +558,7 @@
         line-height: 1.65;
         white-space: pre;
         word-break: normal;
-        box-shadow: inset 0 2px 10px rgba(0, 0, 0, 0.4), 0 1px 3px rgba(0, 0, 0, 0.2);
+        box-shadow: inset 0 2px 10px rgba(0, 0, 0, 0.3), 0 1px 3px rgba(0, 0, 0, 0.12);
         position: relative;
       }
       .bubble-text pre code {
@@ -492,19 +586,19 @@
         height: 8px;
       }
       .bubble-text pre::-webkit-scrollbar-track {
-        background: rgba(15, 23, 42, 0.3);
+        background: rgba(74, 60, 46, 0.25);
         border-radius: 4px;
       }
       .bubble-text pre::-webkit-scrollbar-thumb {
-        background: rgba(148, 163, 184, 0.4);
+        background: rgba(148, 139, 128, 0.5);
         border-radius: 4px;
       }
       .bubble-text pre::-webkit-scrollbar-thumb:hover {
-        background: rgba(148, 163, 184, 0.6);
+        background: rgba(148, 139, 128, 0.7);
       }
       .msg.user .bubble {
-        background: linear-gradient(135deg, rgba(59, 130, 246, 0.22), rgba(59, 130, 246, 0.16));
-        border-color: rgba(59, 130, 246, 0.4);
+        background: linear-gradient(135deg, rgba(15, 118, 110, 0.18), rgba(15, 118, 110, 0.1));
+        border-color: rgba(15, 118, 110, 0.4);
       }
       .bubble-meta {
         display: flex;
@@ -515,11 +609,11 @@
         border: 1px solid var(--border-color);
         border-radius: 12px;
         padding: 12px 14px;
-        background: rgba(15, 23, 42, 0.4);
+        background: rgba(255, 255, 255, 0.7);
         transition: background 0.2s;
       }
       details:hover {
-        background: rgba(15, 23, 42, 0.5);
+        background: rgba(255, 255, 255, 0.9);
       }
       details > summary {
         cursor: pointer;
@@ -577,6 +671,15 @@
       @media (max-width: 1100px) {
         .files-grid { grid-template-columns: 1fr; }
       }
+
+      @keyframes float-in {
+        from { opacity: 0; transform: translateY(8px); }
+        to { opacity: 1; transform: translateY(0); }
+      }
+      @keyframes message-in {
+        from { opacity: 0; transform: translateY(4px); }
+        to { opacity: 1; transform: translateY(0); }
+      }
     </style>
   </head>
   <body>
@@ -584,11 +687,11 @@
       <header class="app-header">
         <div class="brand">
           <div class="brand-title">RAG Chat</div>
-          <div class="brand-subtitle">чат поверх загруженных документов</div>
+          <div class="brand-subtitle">chat over your uploaded documents</div>
         </div>
-        <nav class="tabs" aria-label="Навигация">
-          <button class="tab active" id="tab_btn_chat" data-tab="chat" type="button">Чат</button>
-          <button class="tab" id="tab_btn_files" data-tab="files" type="button">Файлы</button>
+        <nav class="tabs" aria-label="Navigation">
+          <button class="tab active" id="tab_btn_chat" data-tab="chat" type="button">Chat</button>
+          <button class="tab" id="tab_btn_files" data-tab="files" type="button">Files</button>
         </nav>
       </header>
 
@@ -599,24 +702,24 @@
             <div class="chat-shell">
               <div class="chat-header">
                 <div>
-                  <label for="chat_collections" class="chat-header-label">Коллекции (опционально)</label>
+                  <label for="chat_collections" class="chat-header-label">Collections (optional)</label>
                   <select id="chat_collections" multiple class="chat-collections-select" style="height: 100px;"></select>
-                  <div class="hint" style="margin-top: 8px;">Если не выбрано — поиск по всем данным</div>
+                  <div class="hint" style="margin-top: 8px;">If empty, search across all data</div>
                 </div>
               </div>
 
-              <div id="messages" class="messages" aria-label="Сообщения"></div>
+              <div id="messages" class="messages" aria-label="Messages"></div>
 
-              <div class="composer" aria-label="Ввод сообщения">
+              <div class="composer" aria-label="Message composer">
                 <div>
-                  <label for="q" style="margin-top: 0;">Сообщение</label>
-                  <textarea id="q" placeholder="Напишите сообщение… (Enter — отправить, Shift+Enter — новая строка)"></textarea>
-                  <div class="hint">Подсказка: Ctrl/⌘+Enter — тоже отправляет</div>
+                  <label for="q" style="margin-top: 0;">Message</label>
+                  <textarea id="q" placeholder="Type a message... (Enter to send, Shift+Enter for a new line)"></textarea>
+                  <div class="hint">Tip: Ctrl/Cmd+Enter also sends</div>
                 </div>
                 <div class="composer-actions">
                   <button id="ask_stream" type="button" style="padding: 14px 28px; font-size: 15px;">
                     <span id="ask_stream_spinner" class="loading" style="display:none;"></span>
-                    <span id="ask_stream_label">Отправить</span>
+                    <span id="ask_stream_label">Send</span>
                   </button>
                   <div id="status" class="composer-status"></div>
                 </div>
@@ -630,59 +733,59 @@
           <div class="files-grid">
             <!-- Upload Document -->
             <div class="card">
-              <h1>Загрузка документа</h1>
-              <div class="subtitle">Загрузите документ в хранилище и проиндексируйте его</div>
+              <h1>Upload document</h1>
+              <div class="subtitle">Store a file and send it to indexing</div>
 
-              <label for="file">Файл</label>
+              <label for="file">File</label>
               <input id="file" type="file" accept=".txt,.md,.pdf,.docx" />
 
               <div class="grid-2">
                 <div>
                   <label for="doc_id">doc_id</label>
-                  <input id="doc_id" type="text" placeholder="например: kb:doc-001" />
+                  <input id="doc_id" type="text" placeholder="e.g. kb:doc-001" />
                   <div style="margin-top: 6px; font-size: 12px; color: var(--text-secondary);">
-                    Примечание: <b>doc_id уникален</b>. Если загрузить снова с тем же doc_id — запись в списке будет обновлена (это не баг).
+                    Note: <b>doc_id must be unique</b>. Re-uploading with the same doc_id updates the entry (by design).
                   </div>
                 </div>
                 <div>
-                  <label for="title">title (опционально)</label>
-                  <input id="title" type="text" placeholder="заголовок" />
+                  <label for="title">title (optional)</label>
+                  <input id="title" type="text" placeholder="title" />
                 </div>
               </div>
 
               <div class="grid-2">
                 <div>
-                  <label for="source">source (опционально)</label>
-                  <input id="source" type="text" placeholder="например: wiki" />
+                  <label for="source">source (optional)</label>
+                  <input id="source" type="text" placeholder="e.g. wiki" />
                 </div>
                 <div>
-                  <label for="uri">uri (опционально)</label>
+                  <label for="uri">uri (optional)</label>
                   <input id="uri" type="text" placeholder="https://..." />
                 </div>
               </div>
 
               <div class="grid-2">
                 <div>
-                  <label for="tags">tags (через запятую)</label>
+                  <label for="tags">tags (comma-separated)</label>
                   <input id="tags" type="text" placeholder="rag, llm, policies" />
                 </div>
                 <div>
-                  <label for="lang">lang (опционально)</label>
+                  <label for="lang">lang (optional)</label>
                   <input id="lang" type="text" placeholder="ru/en" />
                 </div>
               </div>
 
               <div class="grid-2">
                 <div>
-                  <label for="upload_collection">Коллекция</label>
-                  <input id="upload_collection" type="text" placeholder="например: itmo" list="collections_datalist" />
+                  <label for="upload_collection">Collection</label>
+                  <input id="upload_collection" type="text" placeholder="e.g. itmo" list="collections_datalist" />
                   <datalist id="collections_datalist"></datalist>
                 </div>
                 <div></div>
               </div>
 
               <div style="margin-top: 20px;">
-                <button id="upload" type="button">Загрузить</button>
+                <button id="upload" type="button">Upload</button>
                 <span class="status" id="upload_status"></span>
               </div>
             </div>
@@ -690,26 +793,26 @@
             <!-- Documents List -->
             <div class="card">
               <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; gap: 12px;">
-                <h2 style="margin: 0;">Загруженные документы</h2>
+                <h2 style="margin: 0;">Uploaded documents</h2>
                 <div style="display:flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: flex-end;">
                   <span id="docs_meta" style="color: var(--text-secondary); font-size: 12px;"></span>
-                  <button id="delete_all_docs" class="btn btn-danger" type="button">Удалить все</button>
-                  <button id="load_more_docs" class="btn-secondary" type="button">Загрузить ещё</button>
-                  <button id="refresh_docs" class="btn-secondary" type="button">Обновить</button>
+                  <button id="delete_all_docs" class="btn btn-danger" type="button">Delete all</button>
+                  <button id="load_more_docs" class="btn-secondary" type="button">Load more</button>
+                  <button id="refresh_docs" class="btn-secondary" type="button">Refresh</button>
                 </div>
               </div>
               <div style="display:flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 14px;">
                 <div style="min-width: 280px; flex: 1;">
-                  <label for="files_collections">Коллекции (фильтр)</label>
+                  <label for="files_collections">Collections (filter)</label>
                   <select id="files_collections" multiple style="height: 84px;"></select>
                 </div>
                 <div>
-                  <button id="apply_files_filters" class="btn-secondary" type="button">Применить фильтр</button>
+                  <button id="apply_files_filters" class="btn-secondary" type="button">Apply filter</button>
                 </div>
               </div>
               <div id="doc_list" class="doc-list">
                 <div style="color: var(--text-secondary); text-align: center; padding: 40px;">
-                  Загрузка...
+                  Loading...
                 </div>
               </div>
             </div>
