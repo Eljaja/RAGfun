@@ -54,12 +54,12 @@ class ProcessResponse(BaseModel):
     pages: int | None = None
     extracted_chars: int | None = None
     chunks: int | None = None
+    skipped: bool = False
     retrieval: dict[str, Any] | None = None
     partial: bool = False
     degraded: list[str] = Field(default_factory=list)
     error: str | None = None
     detail: Any | None = None
-
 
 
 

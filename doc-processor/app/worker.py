@@ -122,6 +122,27 @@ async def handle_index(
             resp = r.json()
     if resp.get("ok") is not True:
         raise RuntimeError(f"doc_processor_ok_false:{resp.get('error') or 'unknown'}")
+    if resp.get("skipped") is True:
+        now = time.time()
+        ingestion = {
+            "state": "done",
+            "type": "index",
+            "task_id": task_id,
+            "doc_id": doc_id,
+            "attempt": attempt,
+            "updated_at": now,
+            "stage": "skipped",
+            "result": {
+                "pages": resp.get("pages"),
+                "chunks": resp.get("chunks"),
+                "partial": resp.get("partial"),
+                "degraded": resp.get("degraded"),
+                "error": resp.get("error"),
+                "detail": resp.get("detail"),
+            },
+        }
+        await _patch_ingestion(storage, doc_id=doc_id, ingestion=ingestion)
+        return
     retrieval = resp.get("retrieval") if isinstance(resp, dict) else None
     retrieval_ok = True
     retrieval_partial = False

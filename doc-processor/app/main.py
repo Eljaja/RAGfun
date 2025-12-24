@@ -317,8 +317,19 @@ async def process(req: ProcessRequest):
             global_idx += 1
 
     if not chunks:
-        REQS.labels(endpoint="/v1/process", status="400").inc()
-        return ProcessResponse(ok=False, doc_id=doc_id, error="no_chunks", detail="no text extracted/chunked")
+        extracted_chars = sum(len(t) for t in pages_text if t)
+        REQS.labels(endpoint="/v1/process", status="200").inc()
+        return ProcessResponse(
+            ok=True,
+            doc_id=doc_id,
+            content_type=content_type,
+            pages=pages,
+            extracted_chars=extracted_chars,
+            chunks=0,
+            skipped=True,
+            error="no_chunks",
+            detail="no text extracted/chunked",
+        )
 
     upsert_payload = {
         "mode": "chunks",
@@ -375,7 +386,6 @@ async def process(req: ProcessRequest):
         partial=partial,
         degraded=degraded,
     )
-
 
 
 
