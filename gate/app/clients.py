@@ -234,6 +234,26 @@ class LLMClient:
             logger.error("llm_unexpected_response", extra={"extra": {"keys": list(data.keys())}})
             raise RuntimeError("llm_unexpected_response")
 
+    async def chat_stream(self, *, messages: list[dict[str, str]]):
+        if self._provider == "mock":
+            async for line in self._mock_stream(messages):
+                yield line
+            return
+        if self._provider != "openai_compat":
+            raise ValueError(f"unknown_llm_provider:{self._provider}")
+        assert self._base_url is not None
+        assert self._api_key is not None
+
+        headers = {"Authorization": f"Bearer {self._api_key}"}
+        payload = {"model": self._model, "messages": messages, "temperature": 0.2, "stream": True}
+        async with httpx.AsyncClient(timeout=self._timeout_s) as client:
+            async with client.stream("POST", f"{self._base_url}/chat/completions", json=payload, headers=headers) as r:
+                r.raise_for_status()
+                async for line in r.aiter_lines():
+                    if not line:
+                        continue
+                    yield line
+
     def _mock(self, messages: list[dict[str, str]]) -> str:
         # Deterministic-ish placeholder: summarizes question and number of context blocks.
         joined = "\n".join([m.get("content", "") for m in messages if m.get("role") != "system"]).strip()
@@ -247,4 +267,12 @@ class LLMClient:
             "Настрой `GATE_LLM_PROVIDER=openai_compat` и `GATE_LLM_API_KEY`, чтобы получать реальный ответ модели."
         )
 
+    async def _mock_stream(self, messages: list[dict[str, str]]):
+        text = self._mock(messages)
+        chunk_size = 24
+        for i in range(0, len(text), chunk_size):
+            chunk = text[i : i + chunk_size]
+            payload = {"choices": [{"delta": {"content": chunk}}]}
+            yield f"data: {json.dumps(payload)}"
+        yield "data: [DONE]"
 

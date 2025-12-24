@@ -144,13 +144,13 @@ def build_messages(
     sys = {
         "role": "system",
         "content": (
-            "Ты RAG-ассистент. Отвечай по-русски. "
-            "Используй предоставленный контекст, а если его недостаточно — честно скажи. "
-            "Не выдумывай факты."
+            "You are a RAG assistant. Always answer in the same language as the question. "
+            "Use the provided context, and if it is insufficient, say so plainly. "
+            "Do not fabricate facts."
         ),
     }
     if include_sources:
-        sys["content"] += " Если используешь факты из контекста, указывай ссылки вида [1], [2] на соответствующие блоки."
+        sys["content"] += " If you use facts from the context, include citations like [1], [2] for the corresponding blocks."
 
     msgs: list[dict[str, str]] = [sys]
     for m in history:
@@ -160,12 +160,11 @@ def build_messages(
             msgs.append({"role": role, "content": content})
 
     user = (
-        "Вопрос:\n"
+        "Question:\n"
         f"{query}\n\n"
-        "Контекст:\n"
-        f"{context_text if context_text else '(контекст не найден)'}"
+        "Context:\n"
+        f"{context_text if context_text else '(no context found)'}"
     )
     msgs.append({"role": "user", "content": user})
     return msgs
-
 
