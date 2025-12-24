@@ -78,7 +78,8 @@ async def handle_index(
     attempt = int(task.get("attempt") or 0)
     now = time.time()
 
-    # Exact deduplication: if this doc_id is marked as a duplicate in storage, skip indexing.
+    # Exact deduplication: document-storage may flag byte-identical duplicates via storage_id.
+    # We still index per-doc_id (doc_id is part of the retrieval contract), but we keep the info in ingestion metadata.
     try:
         meta = await storage.get_metadata(doc_id=doc_id)
         extra = (meta or {}).get("extra") if isinstance(meta, dict) else None
@@ -89,17 +90,16 @@ async def handle_index(
                 storage,
                 doc_id=doc_id,
                 ingestion={
-                    "state": "done",
+                    "state": "processing",
                     "type": "index",
                     "task_id": task_id,
                     "doc_id": doc_id,
                     "attempt": attempt,
                     "updated_at": now,
-                    "stage": "skipped_duplicate",
+                    "stage": "duplicate_detected",
                     "result": {"duplicate_of": str(duplicate_of)},
                 },
             )
-            return
     except Exception as e:
         # best-effort; if metadata can't be fetched, continue indexing
         logger.warning("dedup_metadata_check_failed", extra={"extra": {"doc_id": doc_id, "error": str(e)}})

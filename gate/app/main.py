@@ -1164,7 +1164,11 @@ async def upload_document(
         return text.strip()
 
     try:
-        # If storage reported this document as an exact duplicate (bytes-level), skip indexing.
+        # NOTE about exact (bytes-level) deduplication:
+        # document-storage may report this doc_id as a byte-identical duplicate of another doc_id.
+        # We MUST still index by *this* doc_id, because doc_id is part of the retrieval contract
+        # (filters, gold labels in benchmarks, user-facing identifiers, deletes, etc.).
+        # Keep the dedup info in metadata for observability, but do not skip indexing.
         if storage_ok and state.storage and (duplicate or duplicate_of):
             now = time.time()
             try:
@@ -1172,28 +1176,17 @@ async def upload_document(
                     doc_id=doc_id,
                     patch={
                         "ingestion": {
-                            "state": "done",
+                            "state": "processing",
                             "type": "index",
                             "doc_id": doc_id,
                             "updated_at": now,
-                            "stage": "skipped_duplicate",
+                            "stage": "duplicate_detected",
                             "result": {"duplicate_of": duplicate_of},
                         }
                     },
                 )
             except Exception:
                 pass
-            REQS.labels(endpoint="/v1/documents/upload", status="200").inc()
-            return {
-                "ok": True,
-                "accepted": False,
-                "skipped": "duplicate",
-                "doc_id": doc_id,
-                "duplicate_of": duplicate_of,
-                "storage": storage_result,
-                "filename": file.filename,
-                "bytes": stored_bytes,
-            }
 
         # Async ingestion path: store first, enqueue, return immediately.
         if state.publisher and state.storage and storage_ok:
@@ -1648,16 +1641,10 @@ async def get_document_status(doc_id: str):
     # Check indexing
     if state.retrieval:
         try:
-            search_result = await state.retrieval.search(
-                query="document",  # simple query to check if doc is indexed
-                mode="hybrid",
-                top_k=1,
-                rerank=None,
-                filters={"doc_ids": [doc_id]},
-                acl=[],
-                include_sources=False,
-            )
-            result["indexed"] = len(search_result.get("hits") or []) > 0
+            # Fast check: avoid embeddings/rerank/search by using index_exists endpoint.
+            ex = await state.retrieval.index_exists(doc_ids=[doc_id])
+            indexed_doc_ids = ex.get("indexed_doc_ids") or []
+            result["indexed"] = str(doc_id) in set([str(x) for x in indexed_doc_ids])
         except Exception as e:
             logger.warning("check_indexed_error", extra={"extra": {"doc_id": doc_id, "error": str(e)}})
 
