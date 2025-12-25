@@ -60,6 +60,66 @@ async function callChatStream(query, onToken, onComplete, onError, onRetrieval) 
   }
 }
 
+async function callAgentStream(query, onToken, onComplete, onError, onRetrieval, onTrace) {
+  const filters = buildChatFilters();
+  const r = await fetch("/agent-api/v1/agent/stream", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      query,
+      include_sources: true,
+      filters,
+    }),
+  });
+
+  if (!r.ok) {
+    const data = await r.json().catch(() => ({}));
+    const msg = (data && (data.detail || data.error)) || `HTTP ${r.status}`;
+    onError(new Error(msg));
+    return;
+  }
+
+  const reader = r.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        const dataStr = line.slice(6).trim();
+        if (!dataStr) continue;
+        try {
+          const data = JSON.parse(dataStr);
+          if (data.type === "token" && data.content) {
+            onToken(data.content);
+          } else if (data.type === "retrieval") {
+            if (typeof onRetrieval === "function") onRetrieval(data);
+          } else if (data.type === "trace") {
+            if (typeof onTrace === "function") onTrace(data);
+          } else if (data.type === "done") {
+            onComplete(data);
+          } else if (data.type === "error") {
+            onError(new Error(data.error));
+            return;
+          }
+        } catch (e) {
+          console.error("Failed to parse SSE data:", e, dataStr);
+        }
+      }
+    }
+  } catch (e) {
+    onError(e);
+  }
+}
+
 async function uploadDoc({ file, doc_id, title, uri, source, lang, tags, project_id }) {
   const fd = new FormData();
   fd.append("file", file);
@@ -639,6 +699,134 @@ function addMessage({ role, text }) {
   return { wrapper, bubble, bubbleText };
 }
 
+function ensureAgentTrace(msgWrapper) {
+  if (!msgWrapper) return null;
+  if (msgWrapper._agentTrace) return msgWrapper._agentTrace;
+
+  const bubble = msgWrapper.querySelector(".bubble");
+  if (!bubble) return null;
+
+  const trace = document.createElement("div");
+  trace.className = "agent-trace";
+
+  const details = document.createElement("details");
+  details.open = true;
+  const summary = document.createElement("summary");
+  summary.textContent = "Agent research";
+  details.appendChild(summary);
+
+  const log = document.createElement("div");
+  log.className = "trace-log";
+  details.appendChild(log);
+  trace.appendChild(details);
+  bubble.appendChild(trace);
+
+  msgWrapper._agentTrace = { log };
+  return msgWrapper._agentTrace;
+}
+
+function formatTracePayload(payload) {
+  if (payload === null || payload === undefined) return "";
+  if (typeof payload !== "object") return String(payload);
+  if (Array.isArray(payload)) {
+    return payload.map(item => `- ${formatTracePayload(item)}`).join("\n");
+  }
+  return Object.entries(payload)
+    .map(([key, value]) => {
+      if (value === null || value === undefined) return `${key}:`;
+      if (typeof value === "object") return `${key}: ${JSON.stringify(value)}`;
+      return `${key}: ${value}`;
+    })
+    .join("\n");
+}
+
+function startWaveText(traceState, el, text) {
+  if (!traceState || !el) return;
+  if (traceState.waveTimer) clearInterval(traceState.waveTimer);
+  const base = String(text || "");
+  if (!base) return;
+  let tick = 0;
+  traceState.waveTimer = setInterval(() => {
+    const out = base
+      .split("")
+      .map((ch, idx) => {
+        const phase = (idx + tick) % 6;
+        if (!/[a-zA-Z]/.test(ch)) return ch;
+        return phase < 3 ? ch.toUpperCase() : ch.toLowerCase();
+      })
+      .join("");
+    el.textContent = out;
+    tick = (tick + 1) % 12;
+  }, 120);
+}
+
+function addTraceItem(traceState, data) {
+  if (!traceState || !traceState.log) return;
+  const kind = data.kind || "thought";
+  const logEl = traceState.log;
+
+  logEl.innerHTML = "";
+  if (traceState.waveTimer) {
+    clearInterval(traceState.waveTimer);
+    traceState.waveTimer = null;
+  }
+
+  const item = document.createElement("div");
+  item.className = `trace-item ${kind}`;
+
+  const title = document.createElement("div");
+  title.className = "trace-title";
+  if (kind === "tool") {
+    title.textContent = `Tool: ${data.name || "unknown"}`;
+  } else if (kind === "thought") {
+    title.textContent = data.label || "думание";
+  } else {
+    title.textContent = data.label || kind;
+  }
+
+  const body = document.createElement("div");
+  body.className = "trace-body thinking";
+  body.textContent = data.content || "";
+
+  item.appendChild(title);
+  if (body.textContent) item.appendChild(body);
+
+  const spinner = document.createElement("span");
+  spinner.className = "loading";
+  spinner.style.marginLeft = "10px";
+  spinner.style.width = "12px";
+  spinner.style.height = "12px";
+  item.appendChild(spinner);
+
+  if (data.payload) {
+    const payloadText = formatTracePayload(data.payload);
+    if (payloadText) {
+      const payloadEl = document.createElement("div");
+      payloadEl.className = "trace-payload";
+      payloadEl.textContent = payloadText;
+      item.appendChild(payloadEl);
+    }
+  }
+
+  logEl.appendChild(item);
+  scrollMessagesToBottom();
+
+  if (body.textContent) startWaveText(traceState, body, body.textContent);
+  traceState.spinner = spinner;
+}
+
+function stopTraceSpinner(traceState) {
+  if (!traceState) return;
+  if (traceState.waveTimer) {
+    clearInterval(traceState.waveTimer);
+    traceState.waveTimer = null;
+  }
+  if (traceState.spinner && traceState.spinner.parentNode) {
+    traceState.spinner.parentNode.removeChild(traceState.spinner);
+    traceState.spinner = null;
+  }
+}
+
 function setAssistantExtras(msgWrapper, { sources, context }) {
   if (!msgWrapper) return;
   const bubble = msgWrapper.querySelector(".bubble");
@@ -721,6 +909,8 @@ async function askStream() {
   // Add user message + assistant placeholder
   addMessage({ role: "user", text: q });
   const assistant = addMessage({ role: "assistant", text: "" });
+  const agentToggle = document.getElementById("agent_research");
+  const agentMode = !!(agentToggle && agentToggle.checked);
   let latestContext = null;
 
   // Clear composer early (chat-like)
@@ -733,40 +923,87 @@ async function askStream() {
   let answerText = "";
 
   try {
-    await callChatStream(
-      q,
-      token => {
-        answerText += token;
-        if (assistant && assistant.bubbleText) {
-          assistant.bubbleText.innerHTML = formatMessageText(answerText);
-          scrollMessagesToBottom();
+    if (agentMode) {
+      await callAgentStream(
+        q,
+        token => {
+          answerText += token;
+          if (assistant && assistant.bubbleText) {
+            assistant.bubbleText.innerHTML = formatMessageText(answerText);
+            scrollMessagesToBottom();
+          }
+        },
+        data => {
+          if (data && data.answer) answerText = data.answer;
+          if (assistant && assistant.bubbleText) assistant.bubbleText.innerHTML = formatMessageText(answerText);
+          if (assistant && assistant.wrapper && data) {
+            setAssistantExtras(assistant.wrapper, { sources: data.sources, context: data.context || latestContext });
+          }
+          const flags = [];
+          if (data && data.partial) flags.push("partial");
+          if (data && data.degraded && data.degraded.length) flags.push(`degraded=${data.degraded.join(",")}`);
+          setBusy(false, flags.length ? flags.join(" | ") : "OK");
+          if (assistant && assistant.wrapper && assistant.wrapper._agentTrace) {
+            stopTraceSpinner(assistant.wrapper._agentTrace);
+          }
+        },
+        error => {
+          if (assistant && assistant.bubbleText) assistant.bubbleText.innerHTML = escapeHtml(`Error: ${error.message}`).replace(/\n/g, '<br>');
+          setBusy(false, "Error");
+        },
+        data => {
+          if (!assistant || !assistant.wrapper) return;
+          if (data && data.context) {
+            latestContext = data.context;
+            setAssistantExtras(assistant.wrapper, { sources: null, context: latestContext });
+          }
+        },
+        data => {
+          if (!assistant || !assistant.wrapper) return;
+          const traceState = ensureAgentTrace(assistant.wrapper);
+          addTraceItem(traceState, data);
         }
-      },
-      data => {
-        // done
-        if (assistant && assistant.bubbleText) assistant.bubbleText.innerHTML = formatMessageText(answerText);
-        if (assistant && assistant.wrapper && data) {
-          setAssistantExtras(assistant.wrapper, { sources: data.sources, context: data.context || latestContext });
+      );
+    } else {
+      await callChatStream(
+        q,
+        token => {
+          answerText += token;
+          if (assistant && assistant.bubbleText) {
+            assistant.bubbleText.innerHTML = formatMessageText(answerText);
+            scrollMessagesToBottom();
+          }
+        },
+        data => {
+          // done
+          if (data && data.answer) answerText = data.answer;
+          if (assistant && assistant.bubbleText) assistant.bubbleText.innerHTML = formatMessageText(answerText);
+          if (assistant && assistant.wrapper && data) {
+            setAssistantExtras(assistant.wrapper, { sources: data.sources, context: data.context || latestContext });
+          }
+          const flags = [];
+          if (data && data.partial) flags.push("partial");
+          if (data && data.degraded && data.degraded.length) flags.push(`degraded=${data.degraded.join(",")}`);
+          setBusy(false, flags.length ? flags.join(" | ") : "OK");
+          if (assistant && assistant.wrapper && assistant.wrapper._agentTrace) {
+            stopTraceSpinner(assistant.wrapper._agentTrace);
+          }
+        },
+        error => {
+          if (assistant && assistant.bubbleText) assistant.bubbleText.innerHTML = escapeHtml(`Error: ${error.message}`).replace(/\n/g, '<br>');
+          setBusy(false, "Error");
+        },
+        data => {
+          // retrieval
+          if (!assistant || !assistant.wrapper) return;
+          if (data && data.context) {
+            latestContext = data.context;
+            // Show retrieval as soon as it arrives (helps when done event doesn't include context)
+            setAssistantExtras(assistant.wrapper, { sources: null, context: latestContext });
+          }
         }
-        const flags = [];
-        if (data && data.partial) flags.push("partial");
-        if (data && data.degraded && data.degraded.length) flags.push(`degraded=${data.degraded.join(",")}`);
-        setBusy(false, flags.length ? flags.join(" | ") : "OK");
-      },
-      error => {
-        if (assistant && assistant.bubbleText) assistant.bubbleText.innerHTML = escapeHtml(`Error: ${error.message}`).replace(/\n/g, '<br>');
-        setBusy(false, "Error");
-      },
-      data => {
-        // retrieval
-        if (!assistant || !assistant.wrapper) return;
-        if (data && data.context) {
-          latestContext = data.context;
-          // Show retrieval as soon as it arrives (helps when done event doesn't include context)
-          setAssistantExtras(assistant.wrapper, { sources: null, context: latestContext });
-        }
-      }
-    );
+      );
+    }
   } catch (e) {
     if (assistant && assistant.bubbleText) assistant.bubbleText.innerHTML = escapeHtml(`Error: ${e.message}`).replace(/\n/g, '<br>');
     setBusy(false, "Error");

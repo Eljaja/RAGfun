@@ -176,7 +176,7 @@ services:
     environment:
       # Make the container see NVIDIA GPUs (requires NVIDIA Container Toolkit on host).
       # Pin embeddings service to GPU id 0.
-      - NVIDIA_VISIBLE_DEVICES=0
+      - NVIDIA_VISIBLE_DEVICES=4
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     networks:
       - rag-network
@@ -184,14 +184,18 @@ services:
       resources:
         reservations:
           devices:
-            - capabilities: [gpu]
+            - driver: nvidia
+              device_ids:
+                - "4"
+              capabilities:
+                - gpu
 
   # Stateless Hybrid Retrieval microservice (scale this one for multiple replicas)
   retrieval:
     build:
       context: ./service
-    ports:
-      - "8080:8080"
+    #ports:
+    #  - "8080:8080"
     environment:
       # =========================
       # Retrieval / Search quality knobs (RAG_*)
@@ -223,8 +227,8 @@ services:
       # Optional auth (if your embeddings endpoint needs it):
       # - RAG_EMBEDDING_API_KEY=...
       - RAG_EMBEDDING_TIMEOUT_S=10
-      - RAG_EMBEDDING_BATCH_SIZE=256
-      - RAG_EMBEDDING_CONCURRENCY=8
+      - RAG_EMBEDDING_BATCH_SIZE=1024
+      - RAG_EMBEDDING_CONCURRENCY=16
       - RAG_VECTOR_SIZE=1024
       # Contextual Chunk Headers (CCH) for embeddings (opt-in; requires re-index/re-embed when enabled)
       - RAG_EMBEDDING_CONTEXTUAL_HEADERS_ENABLED=true
@@ -357,8 +361,8 @@ services:
   doc-processor:
     build:
       context: ./doc-processor
-    ports:
-      - "8082:8082"
+    # ports:
+    #   - "8082:8082"
     environment:
       # =========================
       # Document processing (PROCESSOR_*)
@@ -436,8 +440,8 @@ services:
       - GATE_SERVICE_NAME=rag-gate
       - GATE_ENVIRONMENT=dev
       - GATE_LOG_LEVEL=INFO
-      # Use host-published retrieval port to avoid docker-network response issues
-      - GATE_RETRIEVAL_URL=http://host.docker.internal:8080
+      # Use docker network service name for retrieval (no public port required)
+      - GATE_RETRIEVAL_URL=http://retrieval:8080
       - GATE_RETRIEVAL_TIMEOUT_S=60
       - GATE_RETRIEVAL_MODE=hybrid
       # Default top_k for chat requests (ru_eval overrides per-request, but keeping this aligned helps).
@@ -499,6 +503,27 @@ services:
     networks:
       - rag-network
 
+  # Agentic search service (agent_cli as a microservice)
+  agent-search:
+    build:
+      context: ./agent-search
+    ports:
+      - "8091:8091"
+    environment:
+      - AGENT_GATE_URL=http://rag-gate:8090
+      - AGENT_GATE_TIMEOUT_S=60
+      - AGENT_LLM_BASE_URL=${GATE_LLM_BASE_URL:-https://inference.asicloud.cudos.org/v1}
+      - AGENT_LLM_MODEL=${GATE_LLM_MODEL:-openai/gpt-oss-120bt}
+      - AGENT_LLM_API_KEY=${GATE_LLM_API_KEY:-}
+      - AGENT_LLM_TIMEOUT_S=60
+    depends_on:
+      rag-gate:
+        condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - rag-network
+
   # Simple frontend (nginx static + proxy /api to rag-gate)
   ui:
     build:
@@ -518,9 +543,22 @@ services:
     image: michaelf34/infinity:latest
     container_name: infinity-rerank
     command: ["v2", "--model-id", "BAAI/bge-reranker-v2-m3", "--port", "7998"]
+    environment:
+      # Make the container see NVIDIA GPUs (requires NVIDIA Container Toolkit on host).
+      # Pin embeddings service to GPU id 0.
+      - NVIDIA_VISIBLE_DEVICES=4
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     networks:
       - rag-network
-
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids:
+                - "4"
+              capabilities:
+                - gpu
   prometheus:
     image: prom/prometheus:v2.55.0
     container_name: prometheus
@@ -637,4 +675,3 @@ networks:
     driver: bridge
   rustfs-network:
     driver: bridge
-
