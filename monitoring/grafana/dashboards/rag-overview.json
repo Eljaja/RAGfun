@@ -162,15 +162,23 @@
     {
       "id": 24,
       "type": "timeseries",
-      "title": "Storage capacity (docs / bytes)",
+      "title": "Storage capacity (docs)",
       "datasource": "Prometheus",
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 40 },
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 40 },
       "targets": [
-        { "refId": "A", "expr": "storage_docs_total", "legendFormat": "docs" },
-        { "refId": "B", "expr": "storage_bytes_total", "legendFormat": "bytes" }
+        { "refId": "A", "expr": "storage_docs_total", "legendFormat": "docs" }
+      ]
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "Storage capacity (MB)",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 40 },
+      "targets": [
+        { "refId": "A", "expr": "storage_bytes_total / 1024 / 1024", "legendFormat": "MB" }
       ]
     }
   ]
 }
-
 
