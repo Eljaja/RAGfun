@@ -9,7 +9,7 @@ The project is intentionally a work in progress and serves as a sandbox for test
 ### Prerequisites
 
 - Docker + Docker Compose v2 (`docker compose ...`)
-- (Optional but recommended) NVIDIA GPU for `vllm-docling` (document-to-text via VLM)
+- (Optional but recommended) NVIIA GPU for `vllm-docling` (document-to-text via VLM)
 - (Optional) Embeddings service on the host at `http://localhost:7997/embeddings` (the default `docker-compose.yml` expects it)
 
 ### Start
