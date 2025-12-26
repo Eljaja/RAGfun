@@ -14,6 +14,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Free disk space
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/lib/jvm
+          docker system prune -af || true
+          df -h
+
       - name: Start test compose stack
         run: docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --build
 
