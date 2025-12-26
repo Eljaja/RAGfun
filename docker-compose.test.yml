@@ -1,0 +1,116 @@
+version: "3.9"
+
+services:
+  opensearch:
+    image: opensearchproject/opensearch:latest
+    environment:
+      - discovery.type=single-node
+      - plugins.security.disabled=true
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_INITIAL_ADMIN_PASSWORD:-StrongPassword123!}
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - rag-e2e
+    volumes:
+      - opensearch-data-e2e:/usr/share/opensearch/data
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    environment:
+      - RUST_LOG=warn,actix_web=warn
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "bash",
+          "-lc",
+          "exec 3<>/dev/tcp/localhost/6333; printf 'GET /healthz HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3; head -n 1 <&3 | grep -q '200'"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - rag-e2e
+    volumes:
+      - qdrant-data-e2e:/qdrant/storage
+
+  retrieval:
+    build:
+      context: ./service
+    ports:
+      - "8080:8080"
+    environment:
+      - RAG_SERVICE_NAME=hybrid-retrieval
+      - RAG_ENVIRONMENT=test
+      - RAG_LOG_LEVEL=INFO
+      - RAG_OS_URL=http://opensearch:9200
+      - RAG_OS_INDEX_ALIAS=rag_chunks_e2e
+      - RAG_OS_INDEX_PREFIX=rag_chunks_e2e_v
+      - RAG_QDRANT_URL=http://qdrant:6333
+      - RAG_QDRANT_COLLECTION=rag_chunks_e2e
+      - RAG_VECTOR_DISTANCE=cosine
+      - RAG_VECTOR_SIZE=768
+      - RAG_EMBEDDING_PROVIDER=mock
+      - RAG_EMBEDDING_BATCH_SIZE=64
+      - RAG_EMBEDDING_CONCURRENCY=4
+      - RAG_RERANK_MODE=disabled
+      - RAG_DEFAULT_TOP_K=8
+      - RAG_BM25_TOP_K=50
+      - RAG_VECTOR_TOP_K=50
+      - RAG_MAX_CHUNKS_PER_DOC=3
+      - RAG_RRF_K=60
+      - RAG_WEIGHT_BM25=1.0
+      - RAG_WEIGHT_VECTOR=1.0
+      - RAG_REDACT_URI_MODE=none
+    depends_on:
+      opensearch:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    networks:
+      - rag-e2e
+
+  rag-gate:
+    build:
+      context: ./gate
+    ports:
+      - "8090:8090"
+    environment:
+      - GATE_SERVICE_NAME=rag-gate
+      - GATE_ENVIRONMENT=test
+      - GATE_LOG_LEVEL=INFO
+      - GATE_RETRIEVAL_URL=http://retrieval:8080
+      - GATE_RETRIEVAL_TIMEOUT_S=30
+      - GATE_RETRIEVAL_MODE=hybrid
+      - GATE_TOP_K=8
+      - GATE_LLM_PROVIDER=mock
+      - GATE_ROUTER_ENABLED=false
+      - GATE_MULTI_QUERY_ENABLED=false
+      - GATE_SEGMENT_STITCHING_ENABLED=false
+      - GATE_CORS_ALLOW_ORIGINS=*
+    depends_on:
+      retrieval:
+        condition: service_started
+    networks:
+      - rag-e2e
+
+networks:
+  rag-e2e:
+    driver: bridge
+
+volumes:
+  opensearch-data-e2e:
+    driver: local
+  qdrant-data-e2e:
+    driver: local

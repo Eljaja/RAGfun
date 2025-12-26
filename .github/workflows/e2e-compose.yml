@@ -1,0 +1,36 @@
+name: E2E Compose Smoke
+
+on:
+  pull_request:
+    branches:
+      - dev
+      - main
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Start test compose stack
+        run: docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --build
+
+      - name: Run smoke test
+        run: ./scripts/e2e-smoke.sh
+
+      - name: Collect logs
+        if: always()
+        run: docker compose -f docker-compose.yml -f docker-compose.test.yml logs --no-color > e2e-compose.log
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-compose-logs
+          path: e2e-compose.log
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.yml -f docker-compose.test.yml down -v
