@@ -1,0 +1,75 @@
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmqq
+    ports:
+      - "127.0.0.1:5676:5672"
+      - "15676:15672"
+      - "1883:1883"
+      - "15675:15675"
+    command: >
+      bash -lc "rabbitmq-plugins enable --offline rabbitmq_mqtt rabbitmq_web_mqtt &&
+                exec rabbitmq-server"
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin
+      # RABBITMQ_PLUGINS: "rabbitmq_mqtt"  # Enable MQTT plugin
+    networks:
+      - rustfs-net
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # webhook-bridge:
+  #   build:
+  #     context: .
+  #     dockerfile: webhook.Dockerfile
+  #   image: webhook-bridge:latest
+  #   container_name: webhook-bridge
+  #   ports:
+  #     - "127.0.0.1:9999:9999"
+  #   environment:
+  #     RABBITMQ_HOST: rabbitmqq
+  #     RABBITMQ_USER: admin
+  #     RABBITMQ_PASS: admin
+  #   networks:
+  #     - rustfs-net
+  #   depends_on:
+  #     - rabbitmq
+
+  rustfs:
+    image: rustfs/rustfs:1.0.0-alpha.76
+    command: /data
+    user: "0:0"
+    ports:
+      - "127.0.0.1:9004:9000"
+      - "127.0.0.1:9005:9001"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - rustfs-net
+    environment:
+      RUSTFS_ACCESS_KEY: rustfs
+      RUSTFS_SECRET_KEY: password
+      RUSTFS_NOTIFY_WEBHOOK_ENABLE_webhook: "on"
+      #RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_webhook: "http://webhook-bridge:9999/webhook"
+      RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_webhook: "http://202.181.159.221:9999/webhook"
+      RUSTFS_REGION: eu-central
+      # MQTT Notification Configuration
+      RUSTFS_NOTIFY_MQTT_ENABLE_primary: "on"
+      RUSTFS_NOTIFY_MQTT_BROKER_primary: "tcp://rabbitmqq:1883"
+      RUSTFS_NOTIFY_MQTT_TOPIC_primary: "rustfs/events"
+      RUSTFS_NOTIFY_MQTT_QOS_primary: "1"
+      RUSTFS_NOTIFY_MQTT_USERNAME_primary: "admin"
+      RUSTFS_NOTIFY_MQTT_PASSWORD_primary: "admin"
+      # Optional settings (uncomment if needed)
+      # RUSTFS_NOTIFY_MQTT_RECONNECT_INTERVAL: "5s"
+      # RUSTFS_NOTIFY_MQTT_KEEP_ALIVE_INTERVAL: "30s"
+      # RUSTFS_NOTIFY_MQTT_QUEUE_DIR: "/tmp/rustfs-mqtt-queue"
+      # RUSTFS_NOTIFY_MQTT_QUEUE_LIMIT: "100000"
+
+networks:
+  rustfs-net:

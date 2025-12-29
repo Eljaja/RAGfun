@@ -6,7 +6,7 @@ s3 = boto3.client(
     endpoint_url="http://localhost:9004",   # <-- your published port
     aws_access_key_id="rustfs",             # <-- your RustFS creds
     aws_secret_access_key="password",
-    region_name="eu-central",
+    # region_name="eu-central",
     config=Config(signature_version="s3v4"),
 )
 
@@ -15,7 +15,7 @@ s3.create_bucket(Bucket='uploads5')
 notification_config = {
     'QueueConfigurations': [{
         'Id': 'webhook-notification',
-        'QueueArn': 'webhook:webhook',  # Reference the 'webhook' target
+        'QueueArn': 'arn:rustfs:sqs:us-east-1:webhook:webhook',  # Reference the 'webhook' target
         'Events': ['s3:ObjectCreated:*', 's3:ObjectRemoved:*']
     }]
 }

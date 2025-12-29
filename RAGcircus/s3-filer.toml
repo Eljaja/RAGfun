@@ -1,8 +1,0 @@
-# s3-filer.toml
-[leveldb2]
-enabled = true
-dir = "/data/filerldb2"
-
-[notification.gocdk_pub_sub]
-enabled = true
-topic_url = "rabbit://s3-events?server=amqp://admin:admin@rabbitmq:5672/"

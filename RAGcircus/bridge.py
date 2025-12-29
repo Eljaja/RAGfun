@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 import json
 import os
 import threading
@@ -117,6 +117,66 @@ def startup():
 @app.get("/health")
 def health():
     return {"ok": True}
+
+@app.post("/webhook")
+async def webhook_endpoint(request: Request):
+    """
+    Webhook endpoint to receive notifications from rustfs.
+    This endpoint handles file system events and can forward them to RabbitMQ
+    or process them according to your business logic.
+    """
+    try:
+        request_data = await request.json()
+        print(request.headers)
+        # Log the incoming webhook
+        print(f"[WEBHOOK] Received notification: {json.dumps(request_data, indent=2)}")
+        
+        # Check if the event is suspicious
+        suspicious, reasons = is_suspicious(request_data)
+        label = "SUSPICIOUS" if suspicious else "OK"
+        print(f"[WEBHOOK:{label}] Processing webhook event")
+        
+        if reasons:
+            print(f"[WEBHOOK] Security concerns: {', '.join(reasons)}")
+        
+        # Here you can add your business logic:
+        # - Forward to RabbitMQ for further processing
+        # - Store in database
+        # - Send notifications
+        # - Trigger workflows, etc.
+        
+        # Example: Forward to RabbitMQ (uncomment if needed)
+        # try:
+        #     credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
+        #     params = pika.ConnectionParameters(
+        #         host=RABBITMQ_HOST,
+        #         port=RABBITMQ_PORT,
+        #         virtual_host=RABBITMQ_VHOST,
+        #         credentials=credentials,
+        #     )
+        #     connection = pika.BlockingConnection(params)
+        #     channel = connection.channel()
+        #     channel.basic_publish(
+        #         exchange=AMQP_EXCHANGE,
+        #         routing_key="rustfs.webhook.events",
+        #         body=json.dumps(request_data),
+        #         properties=pika.BasicProperties(delivery_mode=2)
+        #     )
+        #     connection.close()
+        #     print("[WEBHOOK] Event forwarded to RabbitMQ")
+        # except Exception as e:
+        #     print(f"[WEBHOOK] Failed to forward to RabbitMQ: {e}")
+        
+        return {
+            "status": "received",
+            "processed": True,
+            "suspicious": suspicious,
+            "reasons": reasons
+        }
+        
+    except Exception as e:
+        print(f"[WEBHOOK] Error processing webhook: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to process webhook: {e}")
 
 
 # --- RustFS / S3 config ---
