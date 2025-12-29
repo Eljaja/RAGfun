@@ -37,19 +37,6 @@ class Settings(BaseSettings):
     llm_model: str = "gpt-4o-mini"
     llm_timeout_s: float = 60.0
 
-    # Router (optional, auto-tunes retrieval knobs)
-    router_enabled: bool = False
-    router_dry_run: bool = False
-    # If true, router may override user-provided top_k/mode/rerank.
-    router_override_request_params: bool = False
-    router_llm_provider: Literal["mock", "openai_compat"] = "mock"
-    router_llm_base_url: AnyHttpUrl | None = None
-    router_llm_api_key: SecretStr | None = None
-    router_llm_model: str = "gpt-4o-mini"
-    router_llm_timeout_s: float = 10.0
-    router_llm_temperature: float = 0.0
-    router_llm_max_tokens: int = 220
-
     # RAG behavior
     retrieval_mode: Literal["bm25", "vector", "hybrid"] = "hybrid"
     top_k: int = 8
@@ -88,16 +75,6 @@ class Settings(BaseSettings):
                 "mode": self.retrieval_mode,
                 "top_k": self.top_k,
             },
-            "router": {
-                "enabled": bool(self.router_enabled),
-                "dry_run": bool(self.router_dry_run),
-                "override_request_params": bool(self.router_override_request_params),
-                "llm_provider": self.router_llm_provider,
-                "llm_base_url": str(self.router_llm_base_url) if self.router_llm_base_url else None,
-                "llm_model": self.router_llm_model,
-                "llm_api_key_set": self.router_llm_api_key is not None,
-                "llm_timeout_s": self.router_llm_timeout_s,
-            },
             "llm": {
                 "provider": self.llm_provider,
                 "base_url": str(self.llm_base_url) if self.llm_base_url else None,
@@ -129,8 +106,6 @@ def load_settings() -> Settings:
     # Normalize empty secrets from env (e.g. VAR="") to None
     if s.llm_api_key is not None and s.llm_api_key.get_secret_value().strip() == "":
         s.llm_api_key = None
-    if s.router_llm_api_key is not None and s.router_llm_api_key.get_secret_value().strip() == "":
-        s.router_llm_api_key = None
     if s.top_k <= 0:
         raise ValueError("GATE_TOP_K must be > 0")
     if s.max_context_chars <= 0:
@@ -143,8 +118,5 @@ def load_settings() -> Settings:
         raise ValueError("GATE_SEGMENT_STITCHING_MAX_CHUNKS must be > 0")
     if s.bm25_anchor_top_k <= 0:
         raise ValueError("GATE_BM25_ANCHOR_TOP_K must be > 0")
-    if s.router_llm_max_tokens <= 0:
-        raise ValueError("GATE_ROUTER_LLM_MAX_TOKENS must be > 0")
     return s
-
 
