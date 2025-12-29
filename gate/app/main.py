@@ -23,7 +23,6 @@ from app.logging_setup import setup_json_logging
 from app.models import ChatRequest, ChatResponse, ContextChunk, Source
 from app.queue import RabbitPublisher
 from app.rag import build_context_blocks, build_messages
-from app.router import build_router_messages, parse_router_decision
 from rapidfuzz import fuzz
 
 logger = logging.getLogger("gate")
@@ -479,6 +478,22 @@ def _unique_doc_count(hits: list[dict[str, Any]]) -> int:
     return len(s)
 
 
+def _inc_count(d: dict[str, int], key: str, *, n: int = 1) -> None:
+    if not key:
+        key = "unknown"
+    try:
+        d[key] = int(d.get(key) or 0) + int(n)
+    except Exception:
+        d[key] = int(n)
+
+
+def _ingestion_state_from_doc(doc: dict[str, Any]) -> str:
+    ing = (doc or {}).get("extra") or {}
+    ing = ing.get("ingestion") if isinstance(ing, dict) else None
+    state = (ing or {}).get("state")
+    return str(state).strip().lower() if state else "unknown"
+
+
 async def _enforce_citations_or_refuse(
     *,
     llm: LLMClient,
@@ -515,7 +530,6 @@ class AppState:
     config_error: str | None = None
     retrieval: RetrievalClient | None = None
     llm: LLMClient | None = None
-    router_llm: LLMClient | None = None
     storage: DocumentStorageClient | None = None
     doc_processor: DocProcessorClient | None = None
     publisher: RabbitPublisher | None = None
@@ -544,14 +558,6 @@ async def lifespan(app: FastAPI):
         model=state.settings.llm_model,
         timeout_s=state.settings.llm_timeout_s,
     )
-    if state.settings.router_enabled:
-        state.router_llm = LLMClient(
-            provider=state.settings.router_llm_provider,
-            base_url=str(state.settings.router_llm_base_url) if state.settings.router_llm_base_url else None,
-            api_key=state.settings.router_llm_api_key.get_secret_value() if state.settings.router_llm_api_key else None,
-            model=state.settings.router_llm_model,
-            timeout_s=state.settings.router_llm_timeout_s,
-        )
     if state.settings.storage_url:
         state.storage = DocumentStorageClient(base_url=str(state.settings.storage_url), timeout_s=state.settings.storage_timeout_s)
     if state.settings.doc_processor_url:
@@ -662,7 +668,7 @@ async def chat(payload: ChatRequest):
     assert state.retrieval is not None
     assert state.llm is not None
 
-    # Defaults (may be overridden by request payload and/or router)
+    # Defaults (may be overridden by request payload)
     mode = payload.retrieval_mode or state.settings.retrieval_mode
     top_k = payload.top_k or state.settings.top_k
     rerank = payload.rerank
@@ -670,72 +676,6 @@ async def chat(payload: ChatRequest):
     two_pass_enabled = bool(state.settings.two_pass_enabled)
     bm25_anchor_enabled = bool(state.settings.bm25_anchor_enabled)
     segment_stitching_enabled = bool(state.settings.segment_stitching_enabled)
-
-    # Optional query router: pick per-request retrieval knobs.
-    router_decision = None
-    if state.settings.router_enabled and state.router_llm is not None:
-        try:
-            with LAT.labels("router").time():
-                router_text = await state.router_llm.chat(
-                    messages=build_router_messages(query=payload.query),
-                    temperature=float(state.settings.router_llm_temperature),
-                    max_tokens=int(state.settings.router_llm_max_tokens),
-                )
-            router_decision = parse_router_decision(router_text)
-        except Exception as e:
-            logger.warning("router_failed", extra={"extra": {"error": str(e)}})
-            router_decision = None
-
-    if router_decision is not None:
-        try:
-            allow_override = bool(getattr(state.settings, "router_override_request_params", False))
-            # Only override mode/top_k/rerank if the caller didn't explicitly provide them.
-            if (allow_override or payload.retrieval_mode is None) and router_decision.retrieval_mode:
-                mode = router_decision.retrieval_mode
-            if (allow_override or payload.top_k is None) and (router_decision.top_k is not None):
-                top_k = max(1, min(40, int(router_decision.top_k)))
-            if (allow_override or payload.rerank is None) and (router_decision.rerank is not None):
-                rerank = bool(router_decision.rerank)
-
-            if router_decision.use_multi_query is not None:
-                multi_query_enabled = bool(router_decision.use_multi_query)
-            if router_decision.use_two_pass is not None:
-                two_pass_enabled = bool(router_decision.use_two_pass)
-            if router_decision.use_bm25_anchor is not None:
-                bm25_anchor_enabled = bool(router_decision.use_bm25_anchor)
-            if router_decision.use_segment_stitching is not None:
-                segment_stitching_enabled = bool(router_decision.use_segment_stitching)
-        except Exception:
-            # Never fail the request due to router parsing/apply issues.
-            router_decision = None
-
-    if router_decision is not None:
-        logger.info(
-            "router_decision",
-            extra={
-                "extra": {
-                    "dry_run": bool(state.settings.router_dry_run),
-                    "override_request_params": bool(getattr(state.settings, "router_override_request_params", False)),
-                    "mode": mode,
-                    "top_k": top_k,
-                    "rerank": rerank,
-                    "multi_query_enabled": multi_query_enabled,
-                    "two_pass_enabled": two_pass_enabled,
-                    "bm25_anchor_enabled": bm25_anchor_enabled,
-                    "segment_stitching_enabled": segment_stitching_enabled,
-                    "reason": getattr(router_decision, "reason", None),
-                }
-            },
-        )
-        # If dry-run, revert to settings-based behavior.
-        if state.settings.router_dry_run:
-            mode = payload.retrieval_mode or state.settings.retrieval_mode
-            top_k = payload.top_k or state.settings.top_k
-            rerank = payload.rerank
-            multi_query_enabled = bool(state.settings.multi_query_enabled)
-            two_pass_enabled = bool(state.settings.two_pass_enabled)
-            bm25_anchor_enabled = bool(state.settings.bm25_anchor_enabled)
-            segment_stitching_enabled = bool(state.settings.segment_stitching_enabled)
 
     filters = payload.filters.model_dump(exclude_none=True) if payload.filters else None
 
@@ -1374,6 +1314,128 @@ async def list_documents(
         return {"ok": False, "error": str(e), "documents": [], "total": 0}
 
 
+@app.get("/v1/documents/stats")
+async def documents_stats(
+    source: str | None = None,
+    tags: str | None = None,
+    lang: str | None = None,
+    collections: str | None = None,  # comma-separated project_ids ("collections")
+    page_size: int = 500,
+    max_docs: int = 200_000,
+):
+    """
+    Aggregate document stats server-side to avoid loading all docs in the UI.
+    """
+    if state.config_error:
+        REQS.labels(endpoint="/v1/documents/stats", status="503").inc()
+        return {"ok": False, "error": "config_error", "detail": state.config_error}
+    if not state.storage:
+        REQS.labels(endpoint="/v1/documents/stats", status="503").inc()
+        return {"ok": False, "error": "storage_unavailable"}
+
+    tags_list = [t.strip() for t in (tags or "").split(",") if t.strip()] if tags else None
+    collection_ids = [c.strip() for c in (collections or "").split(",") if c.strip()] if collections else None
+    page_size = max(1, min(int(page_size), 2000))
+    max_docs = max(1, min(int(max_docs), 1_000_000))
+
+    stats: dict[str, Any] = {
+        "ok": True,
+        "total": 0,
+        "docs_seen": 0,
+        "bytes": 0,
+        "partial": False,
+        "indexed": 0,
+        "not_indexed": 0,
+        "ingestion": {
+            "queued": 0,
+            "processing": 0,
+            "retrying": 0,
+            "failed": 0,
+            "completed": 0,
+            "unknown": 0,
+        },
+        "by_content_type": {},
+        "by_source": {},
+        "by_lang": {},
+        "by_collection": {},
+    }
+
+    offset = 0
+    indexed_available = bool(state.retrieval)
+    while stats["docs_seen"] < max_docs:
+        result = await state.storage.search_documents(
+            source=source,
+            tags=tags_list,
+            lang=lang,
+            project_ids=collection_ids,
+            limit=page_size,
+            offset=offset,
+        )
+        docs = list(result.get("documents") or [])
+        if "total" in result and isinstance(result.get("total"), int):
+            stats["total"] = int(result.get("total") or 0)
+
+        if not docs:
+            break
+
+        indexed_set: set[str] = set()
+        if state.retrieval:
+            doc_ids = [str(d.get("doc_id")) for d in docs if d.get("doc_id")]
+            if doc_ids:
+                try:
+                    exists = await state.retrieval.index_exists(doc_ids=doc_ids)
+                    indexed_set = set(str(x) for x in (exists.get("indexed_doc_ids") or []))
+                except Exception:
+                    indexed_set = set()
+                    indexed_available = False
+
+        for doc in docs:
+            if stats["docs_seen"] >= max_docs:
+                stats["partial"] = True
+                break
+            stats["docs_seen"] += 1
+            try:
+                stats["bytes"] += int(doc.get("size") or 0)
+            except Exception:
+                pass
+
+            content_type = (doc.get("content_type") or "unknown").strip() or "unknown"
+            _inc_count(stats["by_content_type"], content_type)
+
+            source_val = (doc.get("source") or "unknown").strip() or "unknown"
+            _inc_count(stats["by_source"], source_val)
+
+            lang_val = (doc.get("lang") or "unknown").strip() or "unknown"
+            _inc_count(stats["by_lang"], lang_val)
+
+            collection_val = (doc.get("project_id") or "unassigned").strip() or "unassigned"
+            _inc_count(stats["by_collection"], collection_val)
+
+            ing_state = _ingestion_state_from_doc(doc)
+            if ing_state in stats["ingestion"]:
+                stats["ingestion"][ing_state] += 1
+            else:
+                stats["ingestion"]["unknown"] += 1
+
+            doc_id = str(doc.get("doc_id") or "")
+            if indexed_available and doc_id:
+                if doc_id in indexed_set:
+                    stats["indexed"] += 1
+                else:
+                    stats["not_indexed"] += 1
+
+        offset += len(docs)
+        if len(docs) < page_size:
+            break
+
+    if stats["total"] and stats["docs_seen"] < stats["total"] and stats["docs_seen"] >= max_docs:
+        stats["partial"] = True
+
+    stats["indexed_available"] = indexed_available
+    REQS.labels(endpoint="/v1/documents/stats", status="200").inc()
+    return stats
+
+
 @app.get("/v1/collections")
 async def collections(tenant_id: str | None = None, limit: int = 1000):
     """Proxy: list distinct collections (project_id) from document-storage."""
@@ -1665,50 +1727,12 @@ async def chat_stream(payload: ChatRequest):
     assert state.retrieval is not None
     assert state.llm is not None
 
-    # Defaults (may be overridden by request payload and/or router)
+    # Defaults (may be overridden by request payload)
     mode = payload.retrieval_mode or state.settings.retrieval_mode
     top_k = payload.top_k or state.settings.top_k
     rerank = payload.rerank
     bm25_anchor_enabled = bool(state.settings.bm25_anchor_enabled)
     segment_stitching_enabled = bool(state.settings.segment_stitching_enabled)
-
-    # Optional query router: pick per-request retrieval knobs.
-    router_decision = None
-    if state.settings.router_enabled and state.router_llm is not None:
-        try:
-            with LAT.labels("router").time():
-                router_text = await state.router_llm.chat(
-                    messages=build_router_messages(query=payload.query),
-                    temperature=float(state.settings.router_llm_temperature),
-                    max_tokens=int(state.settings.router_llm_max_tokens),
-                )
-            router_decision = parse_router_decision(router_text)
-        except Exception as e:
-            logger.warning("router_failed", extra={"extra": {"error": str(e)}})
-            router_decision = None
-
-    if router_decision is not None:
-        try:
-            allow_override = bool(getattr(state.settings, "router_override_request_params", False))
-            if (allow_override or payload.retrieval_mode is None) and router_decision.retrieval_mode:
-                mode = router_decision.retrieval_mode
-            if (allow_override or payload.top_k is None) and (router_decision.top_k is not None):
-                top_k = max(1, min(40, int(router_decision.top_k)))
-            if (allow_override or payload.rerank is None) and (router_decision.rerank is not None):
-                rerank = bool(router_decision.rerank)
-            if router_decision.use_bm25_anchor is not None:
-                bm25_anchor_enabled = bool(router_decision.use_bm25_anchor)
-            if router_decision.use_segment_stitching is not None:
-                segment_stitching_enabled = bool(router_decision.use_segment_stitching)
-        except Exception:
-            router_decision = None
-
-    if router_decision is not None and state.settings.router_dry_run:
-        mode = payload.retrieval_mode or state.settings.retrieval_mode
-        top_k = payload.top_k or state.settings.top_k
-        rerank = payload.rerank
-        bm25_anchor_enabled = bool(state.settings.bm25_anchor_enabled)
-        segment_stitching_enabled = bool(state.settings.segment_stitching_enabled)
 
     filters = payload.filters.model_dump(exclude_none=True) if payload.filters else None
 
@@ -1825,5 +1849,3 @@ async def chat_stream(payload: ChatRequest):
             REQS.labels(endpoint="/v1/chat/stream", status="500").inc()
 
     return StreamingResponse(generate_stream(), media_type="text/event-stream")
-
-
