@@ -120,6 +120,68 @@ async function callAgentStream(query, onToken, onComplete, onError, onRetrieval,
   }
 }
 
+async function callDeepResearchStream(query, onToken, onComplete, onError, onRetrieval, onTrace, onProgress) {
+  const filters = buildChatFilters();
+  const r = await fetch("/deep-api/v1/deep-research/stream", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      query,
+      include_sources: true,
+      filters,
+    }),
+  });
+
+  if (!r.ok) {
+    const data = await r.json().catch(() => ({}));
+    const msg = (data && (data.detail || data.error)) || `HTTP ${r.status}`;
+    onError(new Error(msg));
+    return;
+  }
+
+  const reader = r.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        const dataStr = line.slice(6).trim();
+        if (!dataStr) continue;
+        try {
+          const data = JSON.parse(dataStr);
+          if (data.type === "token" && data.content) {
+            onToken(data.content);
+          } else if (data.type === "retrieval") {
+            if (typeof onRetrieval === "function") onRetrieval(data);
+          } else if (data.type === "trace") {
+            if (typeof onTrace === "function") onTrace(data);
+          } else if (data.type === "progress") {
+            if (typeof onProgress === "function") onProgress(data);
+          } else if (data.type === "done") {
+            onComplete(data);
+          } else if (data.type === "error") {
+            onError(new Error(data.error));
+            return;
+          }
+        } catch (e) {
+          console.error("Failed to parse SSE data:", e, dataStr);
+        }
+      }
+    }
+  } catch (e) {
+    onError(e);
+  }
+}
+
 async function uploadDoc({ file, doc_id, title, uri, source, lang, tags, project_id }) {
   const fd = new FormData();
   fd.append("file", file);
@@ -157,6 +219,18 @@ async function listDocuments() {
   return data;
 }
 
+async function fetchDocumentStats() {
+  const collections = getSelectedValues("files_collections");
+  const q = new URLSearchParams();
+  if (collections.length) q.set("collections", collections.join(","));
+  const r = await fetch(`/api/v1/documents/stats?${q.toString()}`);
+  const data = await r.json();
+  if (!r.ok) {
+    throw new Error(data.error || `HTTP ${r.status}`);
+  }
+  return data;
+}
+
 async function deleteDoc(doc_id) {
   const r = await fetch(`/api/v1/documents/${encodeURIComponent(doc_id)}`, { method: "DELETE" });
   const data = await r.json().catch(() => ({}));
@@ -180,9 +254,10 @@ async function deleteAllDocs() {
 const docsState = {
   items: [],
   total: 0,
-  // Page size for /api/v1/documents. We still auto-load all pages,
-  // but a larger limit reduces roundtrips.
-  limit: 500,
+  stats: null,
+  // Page size for /api/v1/documents.
+  limit: 100,
+  maxItems: 300,
   offset: 0,
 };
 
@@ -209,50 +284,19 @@ function updateDocsMeta() {
   const el = document.getElementById("docs_meta");
   if (!el) return;
   const shown = docsState.items.length;
-  const total = docsState.total || 0;
-  if (!shown) {
-    el.textContent = total ? `Shown: 0 of ${total}` : "";
+  const total = (docsState.stats && docsState.stats.total) || docsState.total || 0;
+  const limitNote = docsState.maxItems ? ` (showing up to ${docsState.maxItems})` : "";
+  if (!total && !shown) {
+    el.textContent = "";
   } else {
-    // Stats by status (based on already loaded docs; in this UI we auto-load all pages).
-    const stats = {
-      indexed: 0,
-      not_indexed: 0,
-      queued: 0,
-      processing: 0,
-      retrying: 0,
-      failed: 0,
-      unknown: 0,
-    };
-
-    for (const doc of docsState.items) {
-      const ing = doc && doc.extra && doc.extra.ingestion ? doc.extra.ingestion : null;
-      const st = ing && ing.state ? String(ing.state) : "";
-      if (st === "queued") stats.queued += 1;
-      else if (st === "processing") stats.processing += 1;
-      else if (st === "retrying") stats.retrying += 1;
-      else if (st === "failed") stats.failed += 1;
-      else if (doc && doc.indexed) stats.indexed += 1;
-      else if (doc && doc.indexed === false) stats.not_indexed += 1;
-      else stats.unknown += 1;
-    }
-
-    const left = total ? `Shown: ${shown} of ${total}` : `Shown: ${shown}`;
-    const parts = [
-      `Indexed: ${stats.indexed}`,
-      `Not indexed: ${stats.not_indexed}`,
-    ];
-    if (stats.queued) parts.push(`Queued: ${stats.queued}`);
-    if (stats.processing) parts.push(`Processing: ${stats.processing}`);
-    if (stats.retrying) parts.push(`Retrying: ${stats.retrying}`);
-    if (stats.failed) parts.push(`Error: ${stats.failed}`);
-    if (stats.unknown) parts.push(`Unknown: ${stats.unknown}`);
-
-    el.textContent = `${left} | ${parts.join(" | ")}`;
+    const left = total ? `Shown: ${shown} of ${total}${limitNote}` : `Shown: ${shown}${limitNote}`;
+    el.textContent = left;
   }
 
   const btn = document.getElementById("load_more_docs");
   if (btn) {
-    btn.disabled = !total || shown >= total;
+    const maxed = docsState.maxItems && shown >= docsState.maxItems;
+    btn.disabled = maxed || !total || shown >= total;
   }
 }
 
@@ -288,6 +332,33 @@ function setUploadBusy(busy, text) {
     statusEl.textContent = "";
     statusEl.className = "status";
   }
+}
+
+let deepProgressTimer = null;
+function setDeepProgress(percent, label) {
+  const wrap = document.getElementById("deep_progress");
+  const bar = document.getElementById("deep_progress_bar");
+  const labelEl = document.getElementById("deep_progress_label");
+  if (!wrap || !bar || !labelEl) return;
+  if (percent === null || percent === undefined) {
+    wrap.style.display = "none";
+    bar.style.width = "0%";
+    labelEl.textContent = "";
+    return;
+  }
+  if (deepProgressTimer) {
+    clearTimeout(deepProgressTimer);
+    deepProgressTimer = null;
+  }
+  const pct = Math.max(0, Math.min(1, percent));
+  wrap.style.display = "flex";
+  bar.style.width = `${Math.round(pct * 100)}%`;
+  labelEl.textContent = label || `${Math.round(pct * 100)}%`;
+}
+
+function finishDeepProgress(label) {
+  setDeepProgress(1, label || "Done");
+  deepProgressTimer = setTimeout(() => setDeepProgress(null), 1400);
 }
 
 function fmtSources(sources) {
@@ -401,6 +472,64 @@ function renderDocuments(docs) {
       }
     });
   });
+}
+
+function formatStatsPairs(items, maxItems) {
+  if (!items) return "";
+  const entries = Object.entries(items).sort((a, b) => b[1] - a[1]);
+  const sliced = typeof maxItems === "number" ? entries.slice(0, maxItems) : entries;
+  return sliced.map(([k, v]) => `${escapeHtml(k)}: ${v}`).join("<br>");
+}
+
+function renderDocStats(stats) {
+  const el = document.getElementById("docs_stats");
+  if (!el) return;
+  if (!stats || !stats.ok) {
+    el.innerHTML = '<div style="color: var(--text-secondary);">Stats unavailable</div>';
+    return;
+  }
+
+  const ing = stats.ingestion || {};
+  const indexedAvailable = stats.indexed_available !== false;
+  const indexLine = indexedAvailable
+    ? `Indexed: ${stats.indexed || 0}<br>Not indexed: ${stats.not_indexed || 0}`
+    : "Indexed: unavailable";
+
+  el.innerHTML = `
+    <div class="stats-grid">
+      <div class="stats-card">
+        <div class="stats-title">Overview</div>
+        <div class="stats-item">Total docs: ${stats.total || 0}</div>
+        <div class="stats-item">Total bytes: ${formatBytes(stats.bytes || 0)}</div>
+        <div class="stats-item">${indexLine}</div>
+      </div>
+      <div class="stats-card">
+        <div class="stats-title">Ingestion state</div>
+        <div class="stats-item">Queued: ${ing.queued || 0}</div>
+        <div class="stats-item">Processing: ${ing.processing || 0}</div>
+        <div class="stats-item">Retrying: ${ing.retrying || 0}</div>
+        <div class="stats-item">Failed: ${ing.failed || 0}</div>
+        <div class="stats-item">Completed: ${ing.completed || 0}</div>
+        <div class="stats-item">Unknown: ${ing.unknown || 0}</div>
+      </div>
+      <div class="stats-card">
+        <div class="stats-title">Content types</div>
+        <div class="stats-item">${formatStatsPairs(stats.by_content_type, 8) || "—"}</div>
+      </div>
+      <div class="stats-card">
+        <div class="stats-title">Sources</div>
+        <div class="stats-item">${formatStatsPairs(stats.by_source, 8) || "—"}</div>
+      </div>
+      <div class="stats-card">
+        <div class="stats-title">Languages</div>
+        <div class="stats-item">${formatStatsPairs(stats.by_lang, 8) || "—"}</div>
+      </div>
+      <div class="stats-card">
+        <div class="stats-title">Collections</div>
+        <div class="stats-item">${formatStatsPairs(stats.by_collection, 8) || "—"}</div>
+      </div>
+    </div>
+  `;
 }
 
 function escapeHtml(text) {
@@ -699,7 +828,7 @@ function addMessage({ role, text }) {
   return { wrapper, bubble, bubbleText };
 }
 
-function ensureAgentTrace(msgWrapper) {
+function ensureAgentTrace(msgWrapper, label) {
   if (!msgWrapper) return null;
   if (msgWrapper._agentTrace) return msgWrapper._agentTrace;
 
@@ -712,7 +841,7 @@ function ensureAgentTrace(msgWrapper) {
   const details = document.createElement("details");
   details.open = true;
   const summary = document.createElement("summary");
-  summary.textContent = "Agent research";
+  summary.textContent = label || "Research trace";
   details.appendChild(summary);
 
   const log = document.createElement("div");
@@ -742,22 +871,11 @@ function formatTracePayload(payload) {
 
 function startWaveText(traceState, el, text) {
   if (!traceState || !el) return;
-  if (traceState.waveTimer) clearInterval(traceState.waveTimer);
-  const base = String(text || "");
-  if (!base) return;
-  let tick = 0;
-  traceState.waveTimer = setInterval(() => {
-    const out = base
-      .split("")
-      .map((ch, idx) => {
-        const phase = (idx + tick) % 6;
-        if (!/[a-zA-Z]/.test(ch)) return ch;
-        return phase < 3 ? ch.toUpperCase() : ch.toLowerCase();
-      })
-      .join("");
-    el.textContent = out;
-    tick = (tick + 1) % 12;
-  }, 120);
+  if (traceState.waveTimer) {
+    clearInterval(traceState.waveTimer);
+    traceState.waveTimer = null;
+  }
+  el.textContent = String(text || "");
 }
 
 function addTraceItem(traceState, data) {
@@ -910,7 +1028,9 @@ async function askStream() {
   addMessage({ role: "user", text: q });
   const assistant = addMessage({ role: "assistant", text: "" });
   const agentToggle = document.getElementById("agent_research");
+  const deepToggle = document.getElementById("deep_research");
   const agentMode = !!(agentToggle && agentToggle.checked);
+  const deepMode = !!(deepToggle && deepToggle.checked);
   let latestContext = null;
 
   // Clear composer early (chat-like)
@@ -920,10 +1040,65 @@ async function askStream() {
   }
 
   setBusy(true, "Sending...");
+  if (deepMode) {
+    setDeepProgress(0.05, "Starting");
+  } else {
+    setDeepProgress(null);
+  }
   let answerText = "";
 
   try {
-    if (agentMode) {
+    if (deepMode) {
+      await callDeepResearchStream(
+        q,
+        token => {
+          answerText += token;
+          if (assistant && assistant.bubbleText) {
+            assistant.bubbleText.innerHTML = formatMessageText(answerText);
+            scrollMessagesToBottom();
+          }
+        },
+        data => {
+          if (data && data.answer) answerText = data.answer;
+          if (assistant && assistant.bubbleText) assistant.bubbleText.innerHTML = formatMessageText(answerText);
+          if (assistant && assistant.wrapper && data) {
+            setAssistantExtras(assistant.wrapper, { sources: data.sources, context: data.context || latestContext });
+          }
+          const flags = [];
+          if (data && data.partial) flags.push("partial");
+          if (data && data.degraded && data.degraded.length) flags.push(`degraded=${data.degraded.join(",")}`);
+          setBusy(false, flags.length ? flags.join(" | ") : "OK");
+          if (assistant && assistant.wrapper && assistant.wrapper._agentTrace) {
+            stopTraceSpinner(assistant.wrapper._agentTrace);
+          }
+          finishDeepProgress("Done");
+        },
+        error => {
+          if (assistant && assistant.bubbleText) assistant.bubbleText.innerHTML = escapeHtml(`Error: ${error.message}`).replace(/\n/g, '<br>');
+          setBusy(false, "Error");
+          setDeepProgress(null);
+        },
+        data => {
+          if (!assistant || !assistant.wrapper) return;
+          if (data && data.context) {
+            latestContext = data.context;
+            setAssistantExtras(assistant.wrapper, { sources: null, context: latestContext });
+          }
+        },
+        data => {
+          if (!assistant || !assistant.wrapper) return;
+          const traceState = ensureAgentTrace(assistant.wrapper, "Deep research");
+          addTraceItem(traceState, data);
+        },
+        data => {
+          if (!data) return;
+          const pct = typeof data.percent === "number" ? data.percent : null;
+          const label = data.message || null;
+          if (pct !== null) setDeepProgress(pct, label);
+        }
+      );
+    } else if (agentMode) {
+      setDeepProgress(null);
       await callAgentStream(
         q,
         token => {
@@ -960,11 +1135,12 @@ async function askStream() {
         },
         data => {
           if (!assistant || !assistant.wrapper) return;
-          const traceState = ensureAgentTrace(assistant.wrapper);
+          const traceState = ensureAgentTrace(assistant.wrapper, "agent-search");
           addTraceItem(traceState, data);
         }
       );
     } else {
+      setDeepProgress(null);
       await callChatStream(
         q,
         token => {
@@ -1007,11 +1183,23 @@ async function askStream() {
   } catch (e) {
     if (assistant && assistant.bubbleText) assistant.bubbleText.innerHTML = escapeHtml(`Error: ${e.message}`).replace(/\n/g, '<br>');
     setBusy(false, "Error");
+    setDeepProgress(null);
   }
 }
 
 const askBtn = document.getElementById("ask_stream");
 if (askBtn) askBtn.addEventListener("click", askStream);
+
+const agentToggle = document.getElementById("agent_research");
+const deepToggle = document.getElementById("deep_research");
+if (agentToggle && deepToggle) {
+  agentToggle.addEventListener("change", () => {
+    if (agentToggle.checked) deepToggle.checked = false;
+  });
+  deepToggle.addEventListener("change", () => {
+    if (deepToggle.checked) agentToggle.checked = false;
+  });
+}
 
 // Composer keybinds:
 // - Enter: send
@@ -1045,40 +1233,49 @@ async function loadDocuments() {
     if (deleteAllBtn) deleteAllBtn.disabled = busy;
   };
 
+  if (docsState.maxItems && docsState.items.length >= docsState.maxItems) {
+    updateDocsMeta();
+    return;
+  }
+
   try {
     setDocsBusy(true);
-
-    // Auto-load ALL documents, not only the first page.
-    // We render incrementally so the UI shows progress.
-    let safety = 0;
-    while (true) {
-      safety += 1;
-      if (safety > 10000) break; // safety valve against infinite loops
-
-      const data = await listDocuments();
-      const docs = data.documents || [];
-
-      if (typeof data.total === "number") docsState.total = data.total;
-
-      if (docsState.offset === 0) {
-        docsState.items = docs;
+    let data = null;
+    if (docsState.offset === 0) {
+      const res = await Promise.allSettled([fetchDocumentStats(), listDocuments()]);
+      const statsRes = res[0];
+      const docsRes = res[1];
+      if (statsRes.status === "fulfilled") {
+        docsState.stats = statsRes.value;
       } else {
-        // append next page; backend sorts by stored_at desc, so this is stable for browsing
-        docsState.items = docsState.items.concat(docs);
+        docsState.stats = null;
       }
-      docsState.offset += docs.length;
-
-      renderDocuments(docsState.items);
-      updateDocsMeta();
-
-      const total = docsState.total || 0;
-      if (!docs.length) break;
-      if (total && docsState.items.length >= total) break;
-      if (docs.length < docsState.limit) break;
-
-      // Let the browser paint between pages.
-      await new Promise(r => setTimeout(r, 0));
+      if (docsRes.status === "fulfilled") {
+        data = docsRes.value;
+      } else {
+        throw docsRes.reason || new Error("Failed to load documents");
+      }
+    } else {
+      data = await listDocuments();
     }
+
+    const docs = (data && data.documents) || [];
+    if (typeof data.total === "number") docsState.total = data.total;
+
+    if (docsState.offset === 0) {
+      docsState.items = docs;
+    } else {
+      docsState.items = docsState.items.concat(docs);
+    }
+    docsState.offset += docs.length;
+
+    if (docsState.maxItems && docsState.items.length > docsState.maxItems) {
+      docsState.items = docsState.items.slice(0, docsState.maxItems);
+    }
+
+    renderDocuments(docsState.items);
+    renderDocStats(docsState.stats);
+    updateDocsMeta();
   } catch (e) {
     container.innerHTML = `<div style="color: var(--error); text-align: center; padding: 40px;">Failed to load: ${escapeHtml(e.message)}</div>`;
   } finally {
@@ -1097,6 +1294,7 @@ const applyFilesFiltersBtn = document.getElementById("apply_files_filters");
 if (applyFilesFiltersBtn) applyFilesFiltersBtn.addEventListener("click", () => {
   docsState.offset = 0;
   docsState.items = [];
+  docsState.stats = null;
   loadDocuments();
 });
 
@@ -1116,6 +1314,7 @@ if (deleteAllBtn) deleteAllBtn.addEventListener("click", async () => {
     // Reset pagination and reload
     docsState.offset = 0;
     docsState.items = [];
+    docsState.stats = null;
     await loadDocuments();
     const partial = res && res.partial;
     const deleted = (res && res.deleted) || 0;
@@ -1175,9 +1374,8 @@ loadCollections();
 
 // Auto-refresh document list every 30 seconds
 setInterval(() => {
-  // Don't disrupt pagination browsing: only refresh the first page
-  if (docsState.offset <= docsState.limit) {
-    docsState.offset = 0;
-    loadDocuments();
-  }
+  docsState.offset = 0;
+  docsState.items = [];
+  docsState.stats = null;
+  loadDocuments();
 }, 30000);
