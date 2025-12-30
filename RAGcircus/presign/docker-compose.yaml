@@ -13,7 +13,6 @@ services:
     environment:
       RABBITMQ_DEFAULT_USER: admin
       RABBITMQ_DEFAULT_PASS: admin
-      # RABBITMQ_PLUGINS: "rabbitmq_mqtt"  # Enable MQTT plugin
     networks:
       - rustfs-net
     healthcheck:
@@ -21,23 +20,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-
-  # webhook-bridge:
-  #   build:
-  #     context: .
-  #     dockerfile: webhook.Dockerfile
-  #   image: webhook-bridge:latest
-  #   container_name: webhook-bridge
-  #   ports:
-  #     - "127.0.0.1:9999:9999"
-  #   environment:
-  #     RABBITMQ_HOST: rabbitmqq
-  #     RABBITMQ_USER: admin
-  #     RABBITMQ_PASS: admin
-  #   networks:
-  #     - rustfs-net
-  #   depends_on:
-  #     - rabbitmq
 
   rustfs:
     image: rustfs/rustfs:1.0.0-alpha.76
@@ -54,9 +36,6 @@ services:
     environment:
       RUSTFS_ACCESS_KEY: rustfs
       RUSTFS_SECRET_KEY: password
-      RUSTFS_NOTIFY_WEBHOOK_ENABLE_webhook: "on"
-      #RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_webhook: "http://webhook-bridge:9999/webhook"
-      RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_webhook: "http://202.181.159.221:9999/webhook"
       RUSTFS_REGION: eu-central
       # MQTT Notification Configuration
       RUSTFS_NOTIFY_MQTT_ENABLE_primary: "on"

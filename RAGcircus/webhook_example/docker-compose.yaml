@@ -1,43 +1,20 @@
 services:
-  rabbitmq:
-    image: rabbitmq:3-management
-    container_name: rabbitmqq
+  webhook-bridge:
+    build:
+      context: .
+      dockerfile: webhook.Dockerfile
+    image: webhook-bridge:latest
+    container_name: webhook-bridge
     ports:
-      - "127.0.0.1:5676:5672"
-      - "15676:15672"
-      - "1883:1883"
-      - "15675:15675"
-    command: >
-      bash -lc "rabbitmq-plugins enable --offline rabbitmq_mqtt rabbitmq_web_mqtt &&
-                exec rabbitmq-server"
+      - "127.0.0.1:9999:9999"
     environment:
-      RABBITMQ_DEFAULT_USER: admin
-      RABBITMQ_DEFAULT_PASS: admin
-      # RABBITMQ_PLUGINS: "rabbitmq_mqtt"  # Enable MQTT plugin
+      RABBITMQ_HOST: rabbitmqq
+      RABBITMQ_USER: admin
+      RABBITMQ_PASS: admin
     networks:
       - rustfs-net
-    healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  # webhook-bridge:
-  #   build:
-  #     context: .
-  #     dockerfile: webhook.Dockerfile
-  #   image: webhook-bridge:latest
-  #   container_name: webhook-bridge
-  #   ports:
-  #     - "127.0.0.1:9999:9999"
-  #   environment:
-  #     RABBITMQ_HOST: rabbitmqq
-  #     RABBITMQ_USER: admin
-  #     RABBITMQ_PASS: admin
-  #   networks:
-  #     - rustfs-net
-  #   depends_on:
-  #     - rabbitmq
+    depends_on:
+      - rabbitmq
 
   rustfs:
     image: rustfs/rustfs:1.0.0-alpha.76
