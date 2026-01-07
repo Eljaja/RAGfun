@@ -1,0 +1,21 @@
+{
+  "mode": "chunks",
+  "document": {
+    "doc_id": "smoke-doc-1",
+    "source": "smoke-test",
+    "title": "RAG Smoke Test Document",
+    "uri": "https://example.com/smoke-test"
+  },
+  "chunks": [
+    {
+      "chunk_id": "smoke-doc-1-chunk-0",
+      "doc_id": "smoke-doc-1",
+      "chunk_index": 0,
+      "text": "This is a smoke test document stored for end-to-end testing of the retrieval stack.",
+      "uri": "https://example.com/smoke-test#section-1",
+      "lang": "en",
+      "tags": ["smoke", "test"]
+    }
+  ],
+  "refresh": true
+}
