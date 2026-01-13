@@ -25,6 +25,8 @@ class Settings(BaseSettings):
 
     # Database (PostgreSQL for metadata)
     db_url: str = "postgresql://postgres:postgres@localhost:5432/document_storage"
+    db_pool_min: int = 1
+    db_pool_max: int = 10
 
     # Limits
     max_file_size_mb: int = 100
@@ -46,6 +48,8 @@ class Settings(BaseSettings):
             },
             "database": {
                 "url_set": bool(self.db_url),
+                "pool_min": self.db_pool_min,
+                "pool_max": self.db_pool_max,
             },
             "limits": {
                 "max_file_size_mb": self.max_file_size_mb,
@@ -61,4 +65,3 @@ class Settings(BaseSettings):
 
 def load_settings() -> Settings:
     return Settings()
-

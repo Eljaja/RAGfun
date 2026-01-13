@@ -66,7 +66,11 @@ async def lifespan(app: FastAPI):
 
     # Initialize database
     try:
-        state.db = DatabaseClient(state.settings.db_url)
+        state.db = DatabaseClient(
+            state.settings.db_url,
+            min_conn=state.settings.db_pool_min,
+            max_conn=state.settings.db_pool_max,
+        )
         state.db.ensure_schema()
         logger.info("database_initialized")
     except Exception as e:
@@ -699,4 +703,3 @@ async def list_collections(tenant_id: str | None = None, limit: int = 1000):
         REQS.labels(endpoint="/v1/collections", status="500").inc()
         ERRS.labels(stage="collections", kind="exception").inc()
         return {"ok": False, "error": str(e), "collections": []}
-
