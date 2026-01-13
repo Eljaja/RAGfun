@@ -154,4 +154,3 @@ class IndexExistsResponse(BaseModel):
     indexed_doc_ids: list[str] = Field(default_factory=list)
     counts: dict[str, int] = Field(default_factory=dict)
 
-

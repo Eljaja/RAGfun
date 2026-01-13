@@ -67,4 +67,3 @@ def hybrid_fusion(
         out[cid] = a * float(rrf.get(cid, 0.0)) + (1.0 - a) * float(sc.get(cid, 0.0))
     return out
 
-
