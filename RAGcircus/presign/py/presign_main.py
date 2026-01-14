@@ -2,13 +2,24 @@ from __future__ import annotations
 
 import os
 import re
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Optional
-from contextlib import asynccontextmanager, AsyncExitStack
 
-from fastapi import FastAPI, Request, Depends, HTTPException
 from aiobotocore.session import get_session
+from fastapi import Depends, FastAPI, HTTPException, Request
+
+
+from settings import Settings
+
 # from aiobotocore.config import Config
+
+
+
+# Routers with auth/no-auth
+# Exception handlers that map infra/buisness errors to http codes and messages for the user
+# and also create logs/traces and other things for us to investigate 
+
 
 
 # ----------------------------
@@ -16,12 +27,13 @@ from aiobotocore.session import get_session
 # ----------------------------
 
 _KEY_BAD_PATTERNS = [
-    r"^\s*$",          # empty / whitespace
-    r"\.\.",           # path traversal
-    r"\\",             # backslashes
-    r"[\x00-\x1f\x7f]" # control chars
+    r"^\s*$",  # empty / whitespace
+    r"\.\.",  # path traversal
+    r"\\",  # backslashes
+    r"[\x00-\x1f\x7f]",  # control chars
 ]
 _KEY_BAD_RE = re.compile("|".join(_KEY_BAD_PATTERNS))
+
 
 def validate_s3_key(key: str) -> None:
     """
@@ -44,30 +56,25 @@ class ObjectMetadata:
 # FastAPI lifespan (create client once)
 # ----------------------------
 
+
 @asynccontextmanager
 async def lifecycle(app: FastAPI):
-    """
-    Create one aiobotocore S3 client and close it on shutdown.
-    """
-    region = os.getenv("AWS_REGION", "eu-central-1")
+    settings = Settings()
 
-    # Credentials: in real deployments prefer IAM roles (ECS/EKS/EC2),
-    # otherwise use AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY(/AWS_SESSION_TOKEN)
     session = get_session()
 
     async with AsyncExitStack() as stack:
         s3 = await stack.enter_async_context(
             session.create_client(
                 "s3",
-                endpoint_url="http://localhost:9004",   # RustFS / MinIO endpoint
-                aws_access_key_id="rustfs",
-                aws_secret_access_key="password",
-                region_name="eu-central-1",             # optional but recommended
-                # config=Config(signature_version="s3v4"),
+                endpoint_url=settings.s3_endpoint_url,
+                aws_access_key_id=settings.aws_access_key_id,
+                aws_secret_access_key=settings.aws_secret_access_key,
+                region_name=settings.aws_region,
             )
         )
         app.state.s3 = s3
-        app.state.aws_region = region
+        app.state.settings = settings  # store for later use
         yield
 
     # stack closes the client
@@ -87,12 +94,13 @@ def get_s3(request: Request):
     return s3
 
 
+def get_settings(request: Request):
+    return request.app.state.settings
+
+
 # ----------------------------
 # Core ops you asked for
 # ----------------------------
-
-from typing import Any
-from fastapi import HTTPException
 
 
 async def create_collection(s3_cli, bucket_name: str, region: str) -> dict[str, Any]:
@@ -102,14 +110,17 @@ async def create_collection(s3_cli, bucket_name: str, region: str) -> dict[str, 
     """
     try:
         await s3_cli.head_bucket(Bucket=bucket_name)
-        raise HTTPException(status_code=400, detail={
-            "bucket": bucket_name,
-            "created": False,
-            "reason": "already-exists",
-            "notifications_set": False,
-        }) 
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "bucket": bucket_name,
+                "created": False,
+                "reason": "already-exists",
+                "notifications_set": False,
+            },
+        )
     except Exception:
-        # we assume the happy path where we do not 
+        # we assume the happy path where we do not
         pass
 
     await create_bucket(s3_cli, bucket_name=bucket_name, region=region)
@@ -134,9 +145,7 @@ async def create_bucket(s3_cli, bucket_name: str, region: str) -> None:
     """
     create_kwargs: dict[str, Any] = {"Bucket": bucket_name}
     if region != "us-east-1":
-        create_kwargs["CreateBucketConfiguration"] = {
-            "LocationConstraint": region
-        }
+        create_kwargs["CreateBucketConfiguration"] = {"LocationConstraint": region}
 
     try:
         await s3_cli.create_bucket(**create_kwargs)
@@ -180,7 +189,6 @@ async def subscribe_bucket_to_events(
         )
 
 
-
 async def add_object(s3_cli, obj_metadata: ObjectMetadata) -> dict[str, Any]:
     validate_s3_key(obj_metadata.key)
 
@@ -211,22 +219,28 @@ async def add_object(s3_cli, obj_metadata: ObjectMetadata) -> dict[str, Any]:
 # Stubs (as requested)
 # ----------------------------
 
+
 async def remove_collection(s3_cli, bucket_name: str):
     # TODO: delete all objects + delete bucket
     raise HTTPException(status_code=501, detail="Not implemented yet")
+
 
 async def list_collection(s3_cli):
     # TODO: list buckets
     raise HTTPException(status_code=501, detail="Not implemented yet")
 
+
 async def remove_object(request: Request):
     raise HTTPException(status_code=501, detail="Not implemented yet")
+
 
 async def download_object(request: Request):
     raise HTTPException(status_code=501, detail="Not implemented yet")
 
+
 async def list_object(request: Request):
     raise HTTPException(status_code=501, detail="Not implemented yet")
+
 
 def secure_download_object(request: Request):
     raise HTTPException(status_code=501, detail="Not implemented yet")
@@ -236,9 +250,14 @@ def secure_download_object(request: Request):
 # Tiny demo endpoints
 # ----------------------------
 
+
 @app.post("/collections/{bucket_name}")
-async def api_create_bucket(bucket_name: str, request: Request, s3=Depends(get_s3)):
-    region = request.app.state.aws_region
+async def api_create_bucket(
+    bucket_name: str,
+    s3=Depends(get_s3),
+    settings=Depends(get_settings),
+):
+    region = settings.aws_region
     return await create_collection(s3, bucket_name=bucket_name, region=region)
 
 
