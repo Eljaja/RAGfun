@@ -1,0 +1,7 @@
+{
+  "bucket": "my-bucket-name",
+  "key": "path/to/file.pdf",
+  "expires_seconds": 300,
+  "content_type": "application/pdf"
+}
+

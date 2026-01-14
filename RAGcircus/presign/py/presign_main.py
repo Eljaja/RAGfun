@@ -1,66 +1,64 @@
 from __future__ import annotations
 
-import os
-import re
+import logging
 from contextlib import AsyncExitStack, asynccontextmanager
-from dataclasses import dataclass
-from typing import Any, Optional
 
 from aiobotocore.session import get_session
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, Request
 
-
+from ops_bucket import create_collection, delete_collection, list_collections
+from exceptions import register_exception_handlers
+from models import (
+    CollectionCreateResponse,
+    CollectionDeleteResponse,
+    CollectionListResponse,
+    ObjectDeleteRequest,
+    ObjectDeleteResponse,
+    ObjectListRequest,
+    ObjectListResponse,
+    PresignDownloadRequest,
+    PresignDownloadResponse,
+    PresignPostResponse,
+    PresignPutResponse,
+    PresignUploadRequest,
+)
+from ops_object import (
+    delete_object,
+    generate_presigned_download_url,
+    generate_presigned_post,
+    generate_presigned_put_url,
+    list_objects,
+)
 from settings import Settings
 
-# from aiobotocore.config import Config
-
-
-
-# Routers with auth/no-auth
-# Exception handlers that map infra/buisness errors to http codes and messages for the user
-# and also create logs/traces and other things for us to investigate 
-
+logger = logging.getLogger(__name__)
 
 
 # ----------------------------
-# Models / validation helpers
+# Dependencies
 # ----------------------------
 
-_KEY_BAD_PATTERNS = [
-    r"^\s*$",  # empty / whitespace
-    r"\.\.",  # path traversal
-    r"\\",  # backslashes
-    r"[\x00-\x1f\x7f]",  # control chars
-]
-_KEY_BAD_RE = re.compile("|".join(_KEY_BAD_PATTERNS))
+def get_s3(request: Request):
+    """Fetch the S3 client from app state"""
+    s3 = getattr(request.app.state, "s3", None)
+    if s3 is None:
+        raise RuntimeError("S3 client not initialized")
+    return s3
 
 
-def validate_s3_key(key: str) -> None:
-    """
-    Basic "don't be weird" validation.
-    You can tighten this (allowed chars, max length, prefix rules, etc.).
-    """
-    if _KEY_BAD_RE.search(key):
-        raise HTTPException(status_code=400, detail="Invalid object key/filename.")
-
-
-@dataclass(frozen=True)
-class ObjectMetadata:
-    bucket: str
-    key: str
-    expires_seconds: int = 60
-    content_type: Optional[str] = None
+def get_settings(request: Request) -> Settings:
+    """Fetch settings from app state"""
+    return request.app.state.settings
 
 
 # ----------------------------
-# FastAPI lifespan (create client once)
+# Lifespan
 # ----------------------------
-
 
 @asynccontextmanager
 async def lifecycle(app: FastAPI):
+    """Initialize and cleanup S3 client"""
     settings = Settings()
-
     session = get_session()
 
     async with AsyncExitStack() as stack:
@@ -74,200 +72,114 @@ async def lifecycle(app: FastAPI):
             )
         )
         app.state.s3 = s3
-        app.state.settings = settings  # store for later use
+        app.state.settings = settings
         yield
 
-    # stack closes the client
+# ----------------------------
+# Routers
+# ----------------------------
 
-
-app = FastAPI(lifespan=lifecycle)
-
-
-def get_s3(request: Request):
-    """
-    Cheap dependency: fetch the singleton client from app.state.
-    (You *can* also put it on request.state in middleware, but app.state is simpler.)
-    """
-    s3 = getattr(request.app.state, "s3", None)
-    if s3 is None:
-        raise RuntimeError("S3 client not initialized")
-    return s3
-
-
-def get_settings(request: Request):
-    return request.app.state.settings
+public_router = APIRouter(prefix="/public", tags=["public"])
+protected_router = APIRouter(prefix="/api", tags=["protected"])
 
 
 # ----------------------------
-# Core ops you asked for
+# Public Endpoints (no auth)
 # ----------------------------
 
-
-async def create_collection(s3_cli, bucket_name: str, region: str) -> dict[str, Any]:
-    """
-    Orchestrator.
-    If bucket already exists, short-circuit and do NOT mutate it.
-    """
-    try:
-        await s3_cli.head_bucket(Bucket=bucket_name)
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "bucket": bucket_name,
-                "created": False,
-                "reason": "already-exists",
-                "notifications_set": False,
-            },
-        )
-    except Exception:
-        # we assume the happy path where we do not
-        pass
-
-    await create_bucket(s3_cli, bucket_name=bucket_name, region=region)
-    await subscribe_bucket_to_events(
-        s3_cli,
-        bucket_name=bucket_name,
-        queue_arn="arn:rustfs:sqs:us-east-1:webhook:webhook",
-        events=["s3:ObjectCreated:*", "s3:ObjectRemoved:*"],
-        config_id="webhook-notification",
-    )
-
-    return {
-        "bucket": bucket_name,
-        "created": True,
-        "notifications_set": True,
-    }
-
-
-async def create_bucket(s3_cli, bucket_name: str, region: str) -> None:
-    """
-    Create bucket only. No side effects beyond creation.
-    """
-    create_kwargs: dict[str, Any] = {"Bucket": bucket_name}
-    if region != "us-east-1":
-        create_kwargs["CreateBucketConfiguration"] = {"LocationConstraint": region}
-
-    try:
-        await s3_cli.create_bucket(**create_kwargs)
-    except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Failed to create bucket: {e}",
-        )
-
-
-async def subscribe_bucket_to_events(
-    s3_cli,
-    bucket_name: str,
-    queue_arn: str,
-    events: list[str],
-    config_id: str,
-) -> None:
-    """
-    Attach notifications to a freshly created bucket.
-    This MUST NOT be called for existing buckets.
-    """
-    notification_config = {
-        "QueueConfigurations": [
-            {
-                "Id": config_id,
-                "QueueArn": queue_arn,
-                "Events": events,
-            }
-        ]
-    }
-
-    try:
-        await s3_cli.put_bucket_notification_configuration(
-            Bucket=bucket_name,
-            NotificationConfiguration=notification_config,
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Failed to set bucket notification configuration: {e}",
-        )
-
-
-async def add_object(s3_cli, obj_metadata: ObjectMetadata) -> dict[str, Any]:
-    validate_s3_key(obj_metadata.key)
-
-    params: dict[str, Any] = {"Bucket": obj_metadata.bucket, "Key": obj_metadata.key}
-
-    # If you include ContentType in the signature, the uploader MUST send the same header.
-    if obj_metadata.content_type:
-        params["ContentType"] = obj_metadata.content_type
-
-    try:
-        # In aiobotocore, generate_presigned_url is available on the client.
-        url = await s3_cli.generate_presigned_url(
-            ClientMethod="put_object",
-            Params=params,
-            ExpiresIn=int(obj_metadata.expires_seconds),
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to presign: {e}")
-
-    return {
-        "method": "PUT",
-        "url": url,
-        "expires": int(obj_metadata.expires_seconds),
-    }
+@public_router.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "ok"}
 
 
 # ----------------------------
-# Stubs (as requested)
+# Protected Endpoints (require auth)
 # ----------------------------
 
 
-async def remove_collection(s3_cli, bucket_name: str):
-    # TODO: delete all objects + delete bucket
-    raise HTTPException(status_code=501, detail="Not implemented yet")
-
-
-async def list_collection(s3_cli):
-    # TODO: list buckets
-    raise HTTPException(status_code=501, detail="Not implemented yet")
-
-
-async def remove_object(request: Request):
-    raise HTTPException(status_code=501, detail="Not implemented yet")
-
-
-async def download_object(request: Request):
-    raise HTTPException(status_code=501, detail="Not implemented yet")
-
-
-async def list_object(request: Request):
-    raise HTTPException(status_code=501, detail="Not implemented yet")
-
-
-def secure_download_object(request: Request):
-    raise HTTPException(status_code=501, detail="Not implemented yet")
-
-
-# ----------------------------
-# Tiny demo endpoints
-# ----------------------------
-
-
-@app.post("/collections/{bucket_name}")
-async def api_create_bucket(
+# TOTHINK: might have more than one bucket creation op
+# OR: well bucket can have subfolders
+@protected_router.post("/collections/{bucket_name}", response_model=CollectionCreateResponse)
+async def api_create_collection(
     bucket_name: str,
     s3=Depends(get_s3),
-    settings=Depends(get_settings),
-):
-    region = settings.aws_region
-    return await create_collection(s3, bucket_name=bucket_name, region=region)
+    settings: Settings = Depends(get_settings),
+) -> CollectionCreateResponse:
+    """Create a new S3 bucket/collection with event notifications"""
+    return await create_collection(s3, bucket_name=bucket_name, settings=settings)
 
 
-@app.post("/objects/presign/put")
-async def api_presign_put(meta: dict, s3=Depends(get_s3)):
-    # quick-and-dirty parsing; replace with Pydantic if you want
-    obj = ObjectMetadata(
-        bucket=meta["bucket"],
-        key=meta["key"],
-        expires_seconds=int(meta.get("expires_seconds", 60)),
-        content_type=meta.get("content_type"),
-    )
-    return await add_object(s3, obj)
+@protected_router.delete("/collections/{bucket_name}", response_model=CollectionDeleteResponse)
+async def api_delete_collection(
+    bucket_name: str,
+    s3=Depends(get_s3),
+) -> CollectionDeleteResponse:
+    """Delete a bucket/collection and all objects within it (destructive operation)"""
+    return await delete_collection(s3, bucket_name=bucket_name)
+
+
+@protected_router.get("/collections", response_model=CollectionListResponse)
+async def api_list_collections(
+    s3=Depends(get_s3),
+) -> CollectionListResponse:
+    """List all buckets/collections"""
+    return await list_collections(s3)
+
+
+@protected_router.post("/objects/presign/upload", response_model=PresignPostResponse)
+async def api_presign_upload(
+    request: PresignUploadRequest,
+    s3=Depends(get_s3),
+) -> PresignPostResponse:
+    """
+    Generate presigned POST for object upload (recommended).
+    Supports file size limits and content-type validation.
+    """
+    return await generate_presigned_post(s3, request)
+
+
+@protected_router.post("/objects/presign/put", response_model=PresignPutResponse, tags=["legacy"])
+async def api_presign_put(
+    request: PresignUploadRequest,
+    s3=Depends(get_s3),
+) -> PresignPutResponse:
+    """Generate presigned PUT URL for object upload (legacy - prefer /upload)"""
+    return await generate_presigned_put_url(s3, request)
+
+
+@protected_router.post("/objects/presign/download", response_model=PresignDownloadResponse)
+async def api_presign_download(
+    request: PresignDownloadRequest,
+    s3=Depends(get_s3),
+) -> PresignDownloadResponse:
+    """Generate presigned GET URL for object download"""
+    return await generate_presigned_download_url(s3, request)
+
+
+@protected_router.post("/objects/delete", response_model=ObjectDeleteResponse)
+async def api_delete_object(
+    request: ObjectDeleteRequest,
+    s3=Depends(get_s3),
+) -> ObjectDeleteResponse:
+    """Delete an object from S3"""
+    return await delete_object(s3, request)
+
+
+@protected_router.post("/objects/list", response_model=ObjectListResponse)
+async def api_list_objects(
+    request: ObjectListRequest,
+    s3=Depends(get_s3),
+) -> ObjectListResponse:
+    """List objects in a bucket with optional prefix filter"""
+    return await list_objects(s3, request)
+
+
+# ----------------------------
+# App Initialization
+# ----------------------------
+
+app = FastAPI(lifespan=lifecycle, title="S3 Presign API")
+register_exception_handlers(app)
+app.include_router(public_router)
+app.include_router(protected_router)
