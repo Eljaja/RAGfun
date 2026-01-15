@@ -75,12 +75,7 @@ async def lifecycle(app: FastAPI):
         app.state.settings = settings
         yield
 
-# ----------------------------
-# Routers
-# ----------------------------
 
-public_router = APIRouter(prefix="/public", tags=["public"])
-protected_router = APIRouter(prefix="/api", tags=["protected"])
 
 
 # ----------------------------
@@ -176,10 +171,18 @@ async def api_list_objects(
 
 
 # ----------------------------
+# Routers
+# ----------------------------
+
+public_router = APIRouter(prefix="/public", tags=["public"])
+protected_router = APIRouter(prefix="/api", tags=["protected"])
+
+
+# ----------------------------
 # App Initialization
 # ----------------------------
 
-app = FastAPI(lifespan=lifecycle, title="S3 Presign API")
-register_exception_handlers(app)
-app.include_router(public_router)
-app.include_router(protected_router)
+# app = FastAPI(lifespan=lifecycle, title="S3 Presign API")
+# register_exception_handlers(app)
+# app.include_router(public_router)
+# app.include_router(protected_router)
