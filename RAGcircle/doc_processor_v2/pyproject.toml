@@ -4,4 +4,15 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "aio-pika>=9.5.8",
+    "aiobotocore>=3.1.0",
+    "fastapi>=0.128.0",
+    "httpx[http2]>=0.28.1",
+    "opensearch-py>=3.1.0",
+    "pydantic>=2.12.5",
+    "qdrant-client>=1.16.2",
+    "semchunk>=3.2.5",
+    "tiktoken>=0.12.0",
+    "uvicorn>=0.40.0",
+]

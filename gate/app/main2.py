@@ -6,7 +6,7 @@ import re
 import time
 import uuid
 import unicodedata
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 
 import httpx
 import json
@@ -1820,18 +1820,22 @@ async def chat_stream(payload: ChatRequest):
 
 
 
-@asynccontextmanager
-async def combined_lifespan(app: FastAPI):
-    async with AsyncExitStack() as stack:
-        # Enter all context managers
-        await stack.enter_async_context(lifespan())
-        await stack.enter_async_context(lifespan2())
-        # ... add more as needed
+# from object_interaction.presign_main import public_router  # noqa: E402
+
+
+# @asynccontextmanager
+# async def combined_lifespan(app: FastAPI):
+#     async with AsyncExitStack() as stack:
+#         # Enter all context managers
+#         await stack.enter_async_context(lifespan())
+#         await stack.enter_async_context(lifespan2())
+#         # ... add more as needed
         
-        yield
-        # All will be properly cleaned up even if errors occur
+#         yield
+#         # All will be properly cleaned up even if errors occur
 
 app = FastAPI(title="RAG Gate", version="0.1.0", lifespan=lifespan)
+# app.add_route(public_router)
 
 app.add_middleware(
     CORSMiddleware,

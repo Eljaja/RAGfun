@@ -9,7 +9,7 @@ import httpx
 
 logger = logging.getLogger("gate.clients")
 
-
+# TODO remove httpx.Httpclient from here (REFACTOR)
 class RetrievalClient:
     def __init__(self, *, base_url: str, timeout_s: float) -> None:
         self._base_url = base_url.rstrip("/")

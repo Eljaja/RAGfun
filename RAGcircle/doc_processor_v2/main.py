@@ -7,6 +7,7 @@ Document Processor Service v2
 
 import asyncio
 import json
+from multiprocessing import process
 import os
 from contextlib import asynccontextmanager
 
@@ -14,6 +15,8 @@ import aio_pika
 from aiobotocore.session import get_session
 from fastapi import FastAPI
 
+import tiktoken
+import semchunk
 # ----------------------------
 # Configuration
 # ----------------------------
@@ -38,49 +41,103 @@ S3_REGION = os.getenv("S3_REGION", "us-east-1")
 # ----------------------------
 # PDF Processing Logic
 # ----------------------------
+from dataclasses import dataclass
+
+
+
+
+
+
+
+@dataclass
+class Chunk:
+    text: str
+    source_id: str
+    chunk_index: int
+
+
+from embed_caller import Embedder
+from store import QdrantStore , BM25Store
+
+em = Embedder("http://localhost:8902", model="sentence-transformers/e5-base-v2")
+
+bm25 = BM25Store("http://localhost:8905", "basa2")
+
+store = QdrantStore("http://localhost:8903", "basa4", 768)
+# await store.ensure_collection()
 
 async def process_pdf(bucket: str, key: str, s3_client) -> dict:
+    from urllib.parse import unquote
     """
     Download PDF from S3 and process it.
     Simple processing: count bytes, could add text extraction, etc.
     """
-    try:
-        print(f"[PDF] Downloading {bucket}/{key}...")
+    #try:
+    print(f"[PDF] Downloading {bucket}/{key}...")
+    
+    # Download from S3
+    key = unquote(key)
+    response = await s3_client.get_object(Bucket=bucket, Key=key)
+    pdf_data = await response['Body'].read()
+    
+    file_size = len(pdf_data)
+    print(f"[PDF] Downloaded {key} - Size: {file_size:,} bytes")
+    
+    # TODO: Add real PDF processing here
+    # - Extract text with pypdf/pdfplumber
+    # - Extract metadata
+    # - Generate thumbnails
+    # - OCR if needed
+    # - Store results in database
+
+    encoding = "cl100k_base"
+    enc = tiktoken.get_encoding(encoding)
+    chunk_size = 512
+    chunker = semchunk.chunkerify(lambda t: len(enc.encode(t)), chunk_size)
+
+    # print(pdf_data)
+    chunks = chunker(pdf_data.decode('utf-8'))
+
+    processed_chunks = []
+    for i, chunk in enumerate(chunks):
+        print("****")
+        print(chunk)
+        print("****")
+        ch = Chunk(text=chunk, source_id="1234", chunk_index=i)
+        processed_chunks.append(ch)
+        vectors = await em.embed(texts=[chunk])
+        await store.upsert([ch], vectors)
+    #print(chunks)
+
+    await bm25.upsert(processed_chunks)
+
+    # for chunk in chunks:
+    #     print("----")
+    #     print(chunk)
+
+    # print([pdf_data.decode('utf-8')[offset[0]:offset[1]] for offset in offsets])
+    #print(list(chunks))
+    
+    result = {
+        "bucket": bucket,
+        "key": key,
+        "size": file_size,
+        "status": "processed",
+        "pages": None,  # TODO: extract page count
+        "text_preview": None,  # TODO: extract first N chars
+    }
+    
+    print(f"[PDF] ✓ Processed {key}")
+    return result
         
-        # Download from S3
-        response = await s3_client.get_object(Bucket=bucket, Key=key)
-        pdf_data = await response['Body'].read()
-        
-        file_size = len(pdf_data)
-        print(f"[PDF] Downloaded {key} - Size: {file_size:,} bytes")
-        
-        # TODO: Add real PDF processing here
-        # - Extract text with pypdf/pdfplumber
-        # - Extract metadata
-        # - Generate thumbnails
-        # - OCR if needed
-        # - Store results in database
-        
-        result = {
-            "bucket": bucket,
-            "key": key,
-            "size": file_size,
-            "status": "processed",
-            "pages": None,  # TODO: extract page count
-            "text_preview": None,  # TODO: extract first N chars
-        }
-        
-        print(f"[PDF] ✓ Processed {key}")
-        return result
-        
-    except Exception as e:
-        print(f"[PDF] ✗ Failed to process {bucket}/{key}: {e}")
-        return {
-            "bucket": bucket,
-            "key": key,
-            "status": "failed",
-            "error": str(e)
-        }
+    # except Exception as e:
+    #     print(f"[PDF] ✗ Failed to process {bucket}/{key}: {e}")
+    #     return {
+    #         "bucket": bucket,
+    #         "key": key,
+    #         "status": "failed",
+    #         "error": str(e)
+    #     }
 
 
 # ----------------------------
@@ -131,6 +188,10 @@ def extract_s3_event_info(event: dict) -> tuple[str | None, str | None, str | No
 
 
 async def handle_event(event: dict, s3_client):
+
+    from models import parse_rustfs_event
+
+    parse_rustfs_event(event)
     """Process incoming event from RabbitMQ"""
     bucket, key, event_name = extract_s3_event_info(event)
     
@@ -146,8 +207,8 @@ async def handle_event(event: dict, s3_client):
     print(f"[EVENT]   Key: {key}")
     
     # Handle ObjectCreated events for PDFs
-    if "ObjectCreated" in event_name and key.lower().endswith(".pdf"):
-        print(f"[PDF] New PDF detected: {bucket}/{key}")
+    if "ObjectCreated" in event_name and key.lower().endswith(".txt"):
+        print(f"[TXT] New TXT detected: {bucket}/{key}")
         _result = await process_pdf(bucket, key, s3_client)
         
         # TODO: Store processing result in database
@@ -166,11 +227,14 @@ async def on_message(message: aio_pika.IncomingMessage, s3_client):
     """Handle incoming RabbitMQ message"""
     async with message.process():
         try:
-            raw = message.body.decode("utf-8", errors="replace")
-            event = json.loads(raw) if raw.strip().startswith(("{", "[")) else {"raw": raw}
+            #raw = message.body.decode("utf-8", errors="replace")
+            event = json.loads(message.body.decode("ascii")) # if raw.strip().startswith(("{", "[")) else {"raw": raw}
             
-            print(f"[AMQP] Message received (routing_key={message.routing_key})")
-            print(f"[AMQP] Event preview: {json.dumps(event, indent=2)[:500]}")
+            # print(f"[AMQP] Message received (routing_key={message.routing_key})")
+            # print(f"[AMQP] Event preview: {json.dumps(event, indent=4)}")
+
+            print(message.body.decode("ascii"))
+
             
             if isinstance(event, dict):
                 await handle_event(event, s3_client)
@@ -180,8 +244,7 @@ async def on_message(message: aio_pika.IncomingMessage, s3_client):
         except json.JSONDecodeError:
             print("[AMQP] Failed to parse JSON message")
         except Exception as e:
-            print(f"[ERROR] Failed to process message: {e}")
-            # Message is auto-nacked if exception in process() context
+           print(f"[ERROR] Failed to process message: {e}")
 
 
 # ----------------------------
@@ -219,10 +282,11 @@ async def consume_rabbitmq(s3_client):
         except asyncio.CancelledError:
             print("[AMQP] Consumer cancelled, shutting down...")
             break
-        except Exception as e:
-            print(f"[AMQP] Connection error: {e}")
-            print("[AMQP] Reconnecting in 3 seconds...")
-            await asyncio.sleep(3)
+        # except Exception as e:
+        #     print(f"[AMQP] Connection error: {e}")
+            
+        #     print("[AMQP] Reconnecting in 3 seconds...")
+        #     await asyncio.sleep(3)
 
 
 # ----------------------------
@@ -233,6 +297,10 @@ async def consume_rabbitmq(s3_client):
 async def lifespan(app: FastAPI):
     """Setup S3 client and start RabbitMQ consumer"""
     print("[STARTUP] Initializing document processor v2...")
+    
+    #awful but hanging there
+    await store.ensure_collection()
+    
     
     # Create S3 client
     session = get_session()

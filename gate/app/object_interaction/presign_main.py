@@ -29,7 +29,6 @@ from .ops_object import (
     list_objects,
 )
 from .settings import Settings
-from .exceptions import register_exception_handlers
 
 logger = logging.getLogger(__name__)
 
@@ -184,7 +183,7 @@ async def api_list_objects(
 # App Initialization
 # ----------------------------
 
-app = FastAPI(lifespan=lifecycle, title="S3 Presign API")
-register_exception_handlers(app)
-app.include_router(public_router)
-app.include_router(protected_router)
+# app = FastAPI(lifespan=lifecycle, title="S3 Presign API")
+# register_exception_handlers(app)
+# app.include_router(public_router)
+# app.include_router(protected_router)
