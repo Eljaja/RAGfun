@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     os_password: SecretStr | None = None
     os_index_alias: str = "rag_chunks"
     os_index_prefix: str = "rag_chunks_v"
+    require_opensearch: bool = False
 
     # Qdrant
     qdrant_url: AnyHttpUrl = Field(default="http://localhost:6333")
@@ -25,6 +26,7 @@ class Settings(BaseSettings):
     qdrant_collection: str = "rag_chunks"
     vector_size: int = 768
     vector_distance: str = "cosine"  # cosine|dot|euclid
+    require_qdrant: bool = False
 
     # Embeddings
     embedding_provider: str = "http"  # http|mock
@@ -89,6 +91,7 @@ class Settings(BaseSettings):
                 "url": str(self.os_url),
                 "index_alias": self.os_index_alias,
                 "index_prefix": self.os_index_prefix,
+                "required": bool(self.require_opensearch),
                 "username_set": self.os_username is not None,
             },
             "qdrant": {
@@ -96,6 +99,7 @@ class Settings(BaseSettings):
                 "collection": self.qdrant_collection,
                 "vector_size": self.vector_size,
                 "vector_distance": self.vector_distance,
+                "required": bool(self.require_qdrant),
                 "api_key_set": self.qdrant_api_key is not None,
             },
             "embeddings": {

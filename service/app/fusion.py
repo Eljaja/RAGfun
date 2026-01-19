@@ -42,8 +42,6 @@ def score_fusion(
         for cid, s in cid2score.items():
             out[cid] = out.get(cid, 0.0) + w * (float(s) / max_s)
     return out
-
-
 def hybrid_fusion(
     *,
     ranked_lists: dict[str, list[str]],
@@ -66,4 +64,3 @@ def hybrid_fusion(
     for cid in keys:
         out[cid] = a * float(rrf.get(cid, 0.0)) + (1.0 - a) * float(sc.get(cid, 0.0))
     return out
-

@@ -147,10 +147,7 @@ class SearchResponse(BaseModel):
 
 class IndexExistsRequest(BaseModel):
     doc_ids: list[str] = Field(default_factory=list)
-
-
 class IndexExistsResponse(BaseModel):
     ok: bool = True
     indexed_doc_ids: list[str] = Field(default_factory=list)
     counts: dict[str, int] = Field(default_factory=dict)
-
