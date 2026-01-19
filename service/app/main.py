@@ -206,7 +206,13 @@ async def readyz(response: Response):
     # At least one retrieval backend should be available for readiness.
     os_ok = bool(state.deps.get("opensearch", {}).get("available"))
     qd_ok = bool(state.deps.get("qdrant", {}).get("available"))
+    os_required = bool(state.settings.require_opensearch)
+    qd_required = bool(state.settings.require_qdrant)
     ready = os_ok or qd_ok
+    if os_required and not os_ok:
+        ready = False
+    if qd_required and not qd_ok:
+        ready = False
     if not ready:
         response.status_code = 503
     return {"ready": ready, "deps": state.deps}
@@ -232,6 +238,17 @@ async def index_upsert(payload: IndexUpsertRequest):
         REQS.labels(endpoint="/v1/index/upsert", status="503").inc()
         return {"ok": False, "error": "config_error", "detail": state.config_error}
     assert state.embedder is not None
+
+    os_required = bool(state.settings.require_opensearch)
+    qd_required = bool(state.settings.require_qdrant)
+    os_ok = bool(state.deps.get("opensearch", {}).get("available"))
+    qd_ok = bool(state.deps.get("qdrant", {}).get("available"))
+    if os_required and not os_ok:
+        REQS.labels(endpoint="/v1/index/upsert", status="503").inc()
+        return {"ok": False, "error": "opensearch_unavailable", "detail": "OpenSearch is required but unavailable"}
+    if qd_required and not qd_ok:
+        REQS.labels(endpoint="/v1/index/upsert", status="503").inc()
+        return {"ok": False, "error": "qdrant_unavailable", "detail": "Qdrant is required but unavailable"}
     
     # Add timeout wrapper for large documents (15 minutes max)
     try:
