@@ -5,7 +5,7 @@ services:
     ports:
       - "127.0.0.1:5676:5672"
       - "15676:15672"
-      - "1883:1883"
+      - "1883:1883" # should I even open it?
       - "15675:15675"
     command: >
       bash -lc "rabbitmq-plugins enable --offline rabbitmq_mqtt rabbitmq_web_mqtt &&

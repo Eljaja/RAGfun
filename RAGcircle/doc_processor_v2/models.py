@@ -3,6 +3,41 @@ from typing import Literal, Any
 from pydantic import BaseModel, Field, HttpUrl
 
 
+
+
+
+class DocumentMeta(BaseModel):
+    doc_id: str
+    source: str | None = None
+    title: str | None = None
+    uri: str | None = None
+    lang: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    acl: list[str] = Field(default_factory=list)
+    tenant_id: str | None = None
+    project_id: str | None = None
+
+
+class Locator(BaseModel):
+    page: int | None = None
+
+
+class ChunkMeta(BaseModel):
+    chunk_id: str
+    doc_id: str
+    chunk_index: int
+    text: str
+    locator: Locator | None = None
+    title: str | None = None
+    uri: str | None = None
+    lang: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    acl: list[str] = Field(default_factory=list)
+    source: str | None = None
+    tenant_id: str | None = None
+    project_id: str | None = None
+
+
 class RustfsUserIdentity(BaseModel):
     principalId: str = ""
 
