@@ -16,8 +16,14 @@ logger = logging.getLogger("storage.files")
 class StorageBackend:
     """Abstract storage backend interface."""
 
-    def store(self, doc_id: str, content: bytes, content_type: str | None = None) -> str:
-        """Store file and return storage_id."""
+    def store(
+        self,
+        doc_id: str,
+        fileobj: BinaryIO,
+        content_type: str | None = None,
+        max_size_bytes: int | None = None,
+    ) -> tuple[str, int, str]:
+        """Store file stream and return (storage_id, size_bytes, content_hash)."""
         raise NotImplementedError
 
     def retrieve(self, storage_id: str) -> bytes | None:
@@ -50,21 +56,51 @@ class LocalStorageBackend(StorageBackend):
             return self.storage_path / subdir / storage_id
         return self.storage_path / storage_id
 
-    def store(self, doc_id: str, content: bytes, content_type: str | None = None) -> str:
-        """Store file locally and return storage_id."""
-        # Generate deterministic storage_id from content hash
-        content_hash = hashlib.sha256(content).hexdigest()
-        storage_id = f"{content_hash[:2]}/{content_hash}"
+    @staticmethod
+    def _storage_id_for_doc_id(doc_id: str) -> str:
+        # Deterministic, safe key derived from doc_id (not content hash).
+        return hashlib.sha256(doc_id.encode("utf-8")).hexdigest()
 
+    def store(
+        self,
+        doc_id: str,
+        fileobj: BinaryIO,
+        content_type: str | None = None,
+        max_size_bytes: int | None = None,
+    ) -> tuple[str, int, str]:
+        """Store file locally from stream and return (storage_id, size_bytes, content_hash)."""
+        tmp_dir = self.storage_path / ".tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = tmp_dir / f"{uuid.uuid4().hex}.tmp"
+
+        hasher = hashlib.sha256()
+        size = 0
+        try:
+            with open(tmp_path, "wb") as out:
+                while True:
+                    chunk = fileobj.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if max_size_bytes is not None and size > max_size_bytes:
+                        raise ValueError("file_too_large")
+                    hasher.update(chunk)
+                    out.write(chunk)
+        except Exception:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
+
+        content_hash = hasher.hexdigest()
+        storage_id = self._storage_id_for_doc_id(doc_id)
         file_path = self._get_path(storage_id)
         file_path.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(tmp_path, file_path)
 
-        # Write file
-        with open(file_path, "wb") as f:
-            f.write(content)
-
-        logger.info("local_storage_stored", extra={"doc_id": doc_id, "storage_id": storage_id, "size": len(content)})
-        return storage_id
+        logger.info("local_storage_stored", extra={"doc_id": doc_id, "storage_id": storage_id, "size": size})
+        return storage_id, size, content_hash
 
     def retrieve(self, storage_id: str) -> bytes | None:
         """Retrieve file from local storage."""
@@ -144,27 +180,85 @@ class S3StorageBackend(StorageBackend):
                 logger.error("s3_bucket_create_error", extra={"bucket": self.bucket, "error": str(e)})
                 raise
 
-    def store(self, doc_id: str, content: bytes, content_type: str | None = None) -> str:
-        """Store file in S3 and return storage_id."""
-        # Generate deterministic storage_id from content hash
-        content_hash = hashlib.sha256(content).hexdigest()
-        storage_id = f"{content_hash[:2]}/{content_hash}"
+    def store(
+        self,
+        doc_id: str,
+        fileobj: BinaryIO,
+        content_type: str | None = None,
+        max_size_bytes: int | None = None,
+    ) -> tuple[str, int, str]:
+        """Store file in S3 from stream and return (storage_id, size_bytes, content_hash)."""
+        storage_id = hashlib.sha256(doc_id.encode("utf-8")).hexdigest()
+        hasher = hashlib.sha256()
+        size = 0
+        upload_id = None
+        parts: list[dict[str, str | int]] = []
+        part_number = 1
+        part_size = 8 * 1024 * 1024
 
         try:
             extra_args = {}
             if content_type:
                 extra_args["ContentType"] = content_type
 
-            self.s3_client.put_object(
-                Bucket=self.bucket,
-                Key=storage_id,
-                Body=content,
-                **extra_args,
-            )
-            logger.info("s3_storage_stored", extra={"doc_id": doc_id, "storage_id": storage_id, "size": len(content)})
-            return storage_id
+            resp = self.s3_client.create_multipart_upload(Bucket=self.bucket, Key=storage_id, **extra_args)
+            upload_id = resp["UploadId"]
+
+            while True:
+                chunk = fileobj.read(part_size)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if max_size_bytes is not None and size > max_size_bytes:
+                    raise ValueError("file_too_large")
+                hasher.update(chunk)
+                up = self.s3_client.upload_part(
+                    Bucket=self.bucket,
+                    Key=storage_id,
+                    PartNumber=part_number,
+                    UploadId=upload_id,
+                    Body=chunk,
+                )
+                parts.append({"ETag": up["ETag"], "PartNumber": part_number})
+                part_number += 1
+
+            if parts:
+                self.s3_client.complete_multipart_upload(
+                    Bucket=self.bucket,
+                    Key=storage_id,
+                    UploadId=upload_id,
+                    MultipartUpload={"Parts": parts},
+                )
+            else:
+                # Empty file fallback
+                if upload_id:
+                    self.s3_client.abort_multipart_upload(
+                        Bucket=self.bucket,
+                        Key=storage_id,
+                        UploadId=upload_id,
+                    )
+                    upload_id = None
+                self.s3_client.put_object(Bucket=self.bucket, Key=storage_id, Body=b"", **extra_args)
+
+            content_hash = hasher.hexdigest()
+            logger.info("s3_storage_stored", extra={"doc_id": doc_id, "storage_id": storage_id, "size": size})
+            return storage_id, size, content_hash
         except Exception as e:
             logger.error("s3_storage_store_error", extra={"doc_id": doc_id, "error": str(e)})
+            if upload_id:
+                try:
+                    self.s3_client.abort_multipart_upload(
+                        Bucket=self.bucket,
+                        Key=storage_id,
+                        UploadId=upload_id,
+                    )
+                except Exception:
+                    pass
+            # best-effort cleanup of partial object
+            try:
+                self.s3_client.delete_object(Bucket=self.bucket, Key=storage_id)
+            except Exception:
+                pass
             raise
 
     def retrieve(self, storage_id: str) -> bytes | None:
