@@ -1,0 +1,7 @@
+{
+  "query": "Summarize the smoke test document content.",
+  "history": [],
+  "retrieval_mode": "hybrid",
+  "top_k": 3,
+  "include_sources": true
+}

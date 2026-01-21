@@ -1,0 +1,7 @@
+{
+  "query": "What document is used for the smoke test?",
+  "mode": "hybrid",
+  "top_k": 3,
+  "include_sources": true,
+  "sources_level": "basic"
+}
