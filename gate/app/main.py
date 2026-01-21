@@ -15,6 +15,7 @@ from app.models import ChatRequest, ChatResponse, ContextChunk, Source
 from app.queue import RabbitPublisher
 from app.rag import build_context_blocks, build_messages
 from rapidfuzz import fuzz
+from typing import Any
 
 logger = logging.getLogger("gate")
 
@@ -437,26 +438,39 @@ def _extract_hint_terms_from_hits(hits: list[dict[str, Any]], *, max_terms: int)
     Best-effort: extract a few 'anchor' terms from top hits to build a follow-up query.
     Keep it conservative to avoid query drift.
     """
-    cand: list[str] = []
-    for h in hits[:8]:
-        t = str(h.get("text") or "")
-        # Pull years and capitalized-ish tokens (in practice, proper nouns in English pages)
-        cand.extend(_YEAR_RE.findall(t))
-        cand.extend([x for x in _TOKEN_RE.findall(t) if len(x) >= 4][:20])
-    # Normalize and prefer longer distinct terms; dedupe with fuzzy matching
-    cand = [c.strip() for c in cand if c and c.strip()]
-    cand = sorted(set(cand), key=lambda s: (-len(s), s))[: max_terms * 3]
-    # Keep only a few, fuzzy-deduped
-    uniq: list[str] = []
-    for x in cand:
-        nx = _norm_query(x)
-        if not nx:
-            continue
-        if any(fuzz.token_set_ratio(nx, _norm_query(u)) >= 92 for u in uniq):
-            continue
-        uniq.append(x)
-        if len(uniq) >= max_terms:
-            break
+    # Gather raw candidate terms from the first few hits
+    raw_candidates = [
+        term
+        for h in hits[:8]
+        for term in (
+            _YEAR_RE.findall(str(h.get("text") or ""))
+            + [t for t in _TOKEN_RE.findall(str(h.get("text") or "")) if len(t) >= 4][:20]
+        )
+    ]
+
+    # Normalise, strip empties, dedupe exact matches and keep the longest ones
+    candidates = sorted(
+        {c.strip() for c in raw_candidates if c and c.strip()},
+        key=lambda s: (-len(s), s),
+    )[: max_terms * 3]
+
+    # Helper to decide fuzzy similarity
+    def _is_similar(a: str, b: str) -> bool:
+        return fuzz.token_set_ratio(_norm_query(a), _norm_query(b)) >= 92
+
+    # Build a list of distinct terms in a functional style (no mutation, no break)
+    from functools import reduce
+
+    def _reducer(acc: list[str], cand: str) -> list[str]:
+        norm = _norm_query(cand)
+        if not norm:
+            return acc
+        if any(_is_similar(cand, u) for u in acc):
+            return acc
+        # Return a new list with the candidate added
+        return acc + [cand]
+
+    uniq = reduce(_reducer, candidates, [])[:max_terms]
     return uniq
 
 
