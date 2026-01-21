@@ -1362,17 +1362,13 @@ function initTabs() {
     const h = (window.location.hash || "").replace("#", "");
     setActiveTab(h === "files" ? "files" : "chat");
   });
-}
-
-// Init
+}// Init
 initTabs();
 const docIdEl = document.getElementById("doc_id");
 if (docIdEl) docIdEl.value = randId();
 docsState.offset = 0;
 loadDocuments();
-loadCollections();
-
-// Auto-refresh document list every 30 seconds
+loadCollections();// Auto-refresh document list every 30 seconds
 setInterval(() => {
   docsState.offset = 0;
   docsState.items = [];
