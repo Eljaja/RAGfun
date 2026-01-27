@@ -248,18 +248,6 @@ async def store_document(
         return StoreDocumentResponse(ok=False, doc_id=doc_id, error="service_unavailable")
 
     try:
-        with LAT.labels(stage="read_file").time():
-            content = await file.read()
-
-        # Validate file size
-        max_size_bytes = state.settings.max_file_size_mb * 1024 * 1024
-        if len(content) > max_size_bytes:
-            REQS.labels(endpoint="/v1/documents/store", status="413").inc()
-            ERRS.labels(stage="store", kind="file_too_large").inc()
-            return StoreDocumentResponse(
-                ok=False, doc_id=doc_id, error=f"File size exceeds {state.settings.max_file_size_mb}MB"
-            )
-
         # Validate content type
         content_type = file.content_type or "application/octet-stream"
         if content_type not in state.settings.allowed_content_types_list:
@@ -286,18 +274,16 @@ async def store_document(
             **metadata_dict,
         }
 
-        # Store file
+        # Store file (streamed to backend; size validated during streaming)
+        max_size_bytes = state.settings.max_file_size_mb * 1024 * 1024
         with LAT.labels(stage="store_file").time():
-            storage_id = await _run_sync(state.storage.store, doc_id, content, content_type)
-
-        # Deduplication (exact, bytes-level): storage_id is deterministic (sha256-based) for both local and s3 backends.
-        duplicate_of: str | None = None
-        try:
-            duplicate_of = await _run_sync(state.db.find_any_doc_id_by_storage_id, storage_id=storage_id, exclude_doc_id=doc_id)
-        except Exception as e:
-            # best-effort: never fail uploads due to dedup bookkeeping
-            logger.warning("dedup_lookup_failed", extra={"doc_id": doc_id, "storage_id": storage_id, "error": str(e)})
-            duplicate_of = None
+            storage_id, size_bytes, content_hash = await _run_sync(
+                state.storage.store,
+                doc_id,
+                file.file,
+                content_type,
+                max_size_bytes,
+            )
 
         # Store metadata
         with LAT.labels(stage="store_metadata").time():
@@ -308,10 +294,11 @@ async def store_document(
                     existing_extra = v
 
             dedup_extra = {
-                "is_duplicate": bool(duplicate_of),
-                "duplicate_of": duplicate_of,
+                "is_duplicate": False,
+                "duplicate_of": None,
                 "storage_id": storage_id,
-                "method": "storage_id_sha256",
+                "content_hash": content_hash,
+                "method": "content_hash_sha256",
             }
             doc_meta = await _run_sync(
                 state.db.store_metadata,
@@ -319,24 +306,31 @@ async def store_document(
                 storage_id=storage_id,
                 metadata={**full_metadata, "extra": {**existing_extra, "dedup": dedup_extra}},
                 content_type=content_type,
-                size=len(content),
+                size=size_bytes,
             )
 
         REQS.labels(endpoint="/v1/documents/store", status="200").inc()
-        # Dedup metrics (based on DB lookup result)
-        outcome = "duplicate" if bool(duplicate_of) else "unique"
-        STORAGE_DEDUP.labels(outcome=outcome).inc()
-        STORAGE_UPLOAD_BYTES.labels(outcome=outcome).inc(len(content))
+        # Dedup metrics (dedup check is deferred)
+        STORAGE_DEDUP.labels(outcome="unique").inc()
+        STORAGE_UPLOAD_BYTES.labels(outcome="unique").inc(size_bytes)
         return StoreDocumentResponse(
             ok=True,
             storage_id=storage_id,
             doc_id=doc_id,
-            size=len(content),
+            size=size_bytes,
             content_type=content_type,
             stored_at=doc_meta.stored_at or datetime.utcnow(),
-            duplicate=bool(duplicate_of),
-            duplicate_of=duplicate_of,
+            duplicate=False,
+            duplicate_of=None,
         )
+    except ValueError as e:
+        if str(e) == "file_too_large":
+            REQS.labels(endpoint="/v1/documents/store", status="413").inc()
+            ERRS.labels(stage="store", kind="file_too_large").inc()
+            return StoreDocumentResponse(
+                ok=False, doc_id=doc_id, error=f"File size exceeds {state.settings.max_file_size_mb}MB"
+            )
+        raise
 
     except Exception as e:
         logger.error("store_document_error", extra={"doc_id": doc_id, "error": str(e)})
