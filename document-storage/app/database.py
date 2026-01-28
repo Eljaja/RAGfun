@@ -46,7 +46,10 @@ class DatabaseClient:
         conn = self.pool.getconn()
         try:
             with conn.cursor() as cur:
-                cur.execute("""
+                # Serialize schema creation across processes to avoid pg_type race.
+                cur.execute("SELECT pg_advisory_lock(hashtext('document_storage_schema'))")
+                try:
+                    cur.execute("""
                     CREATE TABLE IF NOT EXISTS document_metadata (
                         doc_id VARCHAR(255) PRIMARY KEY,
                         storage_id VARCHAR(255) NOT NULL,
@@ -72,11 +75,20 @@ class DatabaseClient:
                     CREATE INDEX IF NOT EXISTS idx_doc_project ON document_metadata(project_id);
                     CREATE INDEX IF NOT EXISTS idx_doc_stored_at ON document_metadata(stored_at);
                     CREATE INDEX IF NOT EXISTS idx_doc_tags ON document_metadata USING GIN(tags);
-                """)
-                conn.commit()
-                logger.info("database_schema_ensured")
+                    """)
+                    cur.execute("SELECT pg_advisory_unlock(hashtext('document_storage_schema'))")
+                    conn.commit()
+                    logger.info("database_schema_ensured")
+                except Exception:
+                    conn.rollback()
+                    try:
+                        with conn.cursor() as unlock_cur:
+                            unlock_cur.execute("SELECT pg_advisory_unlock(hashtext('document_storage_schema'))")
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                    raise
         except Exception as e:
-            conn.rollback()
             logger.error("database_schema_error", extra={"error": str(e)})
             raise
         finally:
@@ -243,60 +255,64 @@ class DatabaseClient:
         finally:
             self.pool.putconn(conn)
 
+    def _build_where_clause(self, req: DocumentSearchRequest) -> tuple[str, dict[str, Any]]:
+        conditions = []
+        params: dict[str, Any] = {}
+
+        if req.source:
+            conditions.append("source = %(source)s")
+            params["source"] = req.source
+
+        if req.lang:
+            conditions.append("lang = %(lang)s")
+            params["lang"] = req.lang
+
+        if req.tenant_id:
+            conditions.append("tenant_id = %(tenant_id)s")
+            params["tenant_id"] = req.tenant_id
+
+        # Collections: support both project_id (single) and project_ids (multi).
+        proj_ids: list[str] = []
+        if req.project_id:
+            proj_ids.append(req.project_id)
+        if getattr(req, "project_ids", None):
+            proj_ids.extend([x for x in (req.project_ids or []) if x])
+        # de-dup while preserving order
+        seen: set[str] = set()
+        proj_ids_norm: list[str] = []
+        for x in proj_ids:
+            if x in seen:
+                continue
+            seen.add(x)
+            proj_ids_norm.append(x)
+        if proj_ids_norm:
+            if len(proj_ids_norm) == 1:
+                conditions.append("project_id = %(project_id)s")
+                params["project_id"] = proj_ids_norm[0]
+            else:
+                conditions.append("project_id = ANY(%(project_ids)s)")
+                params["project_ids"] = proj_ids_norm
+
+        if req.tags:
+            conditions.append("tags && %(tags)s")
+            params["tags"] = req.tags
+
+        if req.date_range:
+            if "from" in req.date_range:
+                conditions.append("stored_at >= %(date_from)s")
+                params["date_from"] = req.date_range["from"]
+            if "to" in req.date_range:
+                conditions.append("stored_at <= %(date_to)s")
+                params["date_to"] = req.date_range["to"]
+
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+        return where_clause, params
+
     def search_metadata(self, req: DocumentSearchRequest) -> tuple[list[DocumentMetadata], int]:
         """Search documents by metadata filters."""
         conn = self.pool.getconn()
         try:
-            conditions = []
-            params: dict[str, Any] = {}
-
-            if req.source:
-                conditions.append("source = %(source)s")
-                params["source"] = req.source
-
-            if req.lang:
-                conditions.append("lang = %(lang)s")
-                params["lang"] = req.lang
-
-            if req.tenant_id:
-                conditions.append("tenant_id = %(tenant_id)s")
-                params["tenant_id"] = req.tenant_id
-
-            # Collections: support both project_id (single) and project_ids (multi).
-            proj_ids: list[str] = []
-            if req.project_id:
-                proj_ids.append(req.project_id)
-            if getattr(req, "project_ids", None):
-                proj_ids.extend([x for x in (req.project_ids or []) if x])
-            # de-dup while preserving order
-            seen: set[str] = set()
-            proj_ids_norm: list[str] = []
-            for x in proj_ids:
-                if x in seen:
-                    continue
-                seen.add(x)
-                proj_ids_norm.append(x)
-            if proj_ids_norm:
-                if len(proj_ids_norm) == 1:
-                    conditions.append("project_id = %(project_id)s")
-                    params["project_id"] = proj_ids_norm[0]
-                else:
-                    conditions.append("project_id = ANY(%(project_ids)s)")
-                    params["project_ids"] = proj_ids_norm
-
-            if req.tags:
-                conditions.append("tags && %(tags)s")
-                params["tags"] = req.tags
-
-            if req.date_range:
-                if "from" in req.date_range:
-                    conditions.append("stored_at >= %(date_from)s")
-                    params["date_from"] = req.date_range["from"]
-                if "to" in req.date_range:
-                    conditions.append("stored_at <= %(date_to)s")
-                    params["date_to"] = req.date_range["to"]
-
-            where_clause = " AND ".join(conditions) if conditions else "1=1"
+            where_clause, params = self._build_where_clause(req)
 
             # Count total
             with conn.cursor() as cur:
@@ -320,6 +336,87 @@ class DatabaseClient:
 
         except Exception as e:
             logger.error("database_search_metadata_error", extra={"error": str(e)})
+            raise
+        finally:
+            self.pool.putconn(conn)
+
+    def get_stats(self, req: DocumentSearchRequest) -> dict[str, Any]:
+        """
+        Aggregate document stats with DB-side GROUP BY to avoid fetching all rows.
+        """
+        conn = self.pool.getconn()
+        try:
+            where_clause, params = self._build_where_clause(req)
+
+            def _group_counts(expr: str) -> dict[str, int]:
+                sql = f"""
+                    SELECT {expr} AS key, COUNT(*)::bigint AS count
+                    FROM document_metadata
+                    WHERE {where_clause}
+                    GROUP BY key
+                """
+                with conn.cursor() as cur:
+                    cur.execute(sql, params)
+                    rows = cur.fetchall() or []
+                out: dict[str, int] = {}
+                for r in rows:
+                    try:
+                        k = str(r.get("key") or "").strip()
+                        if not k:
+                            k = "unknown"
+                        out[k] = int(r.get("count") or 0)
+                    except Exception:
+                        continue
+                return out
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT COUNT(*)::bigint AS total,
+                           COALESCE(SUM(size), 0)::bigint AS bytes
+                    FROM document_metadata
+                    WHERE {where_clause}
+                    """,
+                    params,
+                )
+                row = cur.fetchone() or {}
+                total = int(row.get("total") or 0)
+                total_bytes = int(row.get("bytes") or 0)
+
+            by_content_type = _group_counts("COALESCE(NULLIF(content_type, ''), 'unknown')")
+            by_source = _group_counts("COALESCE(NULLIF(source, ''), 'unknown')")
+            by_lang = _group_counts("COALESCE(NULLIF(lang, ''), 'unknown')")
+            by_collection = _group_counts("COALESCE(NULLIF(project_id, ''), 'unassigned')")
+            ing_raw = _group_counts("COALESCE(NULLIF(lower(extra->'ingestion'->>'state'), ''), 'unknown')")
+
+            ingestion = {
+                "queued": 0,
+                "processing": 0,
+                "retrying": 0,
+                "failed": 0,
+                "completed": 0,
+                "unknown": 0,
+            }
+            for state, cnt in ing_raw.items():
+                if state in ingestion:
+                    ingestion[state] += int(cnt)
+                else:
+                    ingestion["unknown"] += int(cnt)
+
+            return {
+                "ok": True,
+                "total": total,
+                "docs_seen": total,
+                "bytes": total_bytes,
+                "partial": False,
+                "ingestion": ingestion,
+                "by_content_type": by_content_type,
+                "by_source": by_source,
+                "by_lang": by_lang,
+                "by_collection": by_collection,
+            }
+        except Exception as e:
+            logger.error("database_get_stats_error", extra={"error": str(e)})
             raise
         finally:
             self.pool.putconn(conn)
