@@ -1322,6 +1322,8 @@ async def documents_stats(
     collections: str | None = None,  # comma-separated project_ids ("collections")
     page_size: int = 500,
     max_docs: int = 200_000,
+    include_indexed: bool = True,
+    max_indexed_docs: int = 50_000,
 ):
     """
     Aggregate document stats server-side to avoid loading all docs in the UI.
@@ -1337,99 +1339,75 @@ async def documents_stats(
     collection_ids = [c.strip() for c in (collections or "").split(",") if c.strip()] if collections else None
     page_size = max(1, min(int(page_size), 2000))
     max_docs = max(1, min(int(max_docs), 1_000_000))
+    max_indexed_docs = max(1, min(int(max_indexed_docs), 1_000_000))
 
-    stats: dict[str, Any] = {
-        "ok": True,
-        "total": 0,
-        "docs_seen": 0,
-        "bytes": 0,
-        "partial": False,
-        "indexed": 0,
-        "not_indexed": 0,
-        "ingestion": {
-            "queued": 0,
-            "processing": 0,
-            "retrying": 0,
-            "failed": 0,
-            "completed": 0,
-            "unknown": 0,
-        },
-        "by_content_type": {},
-        "by_source": {},
-        "by_lang": {},
-        "by_collection": {},
-    }
-
-    offset = 0
-    indexed_available = bool(state.retrieval)
-    while stats["docs_seen"] < max_docs:
-        result = await state.storage.search_documents(
+    try:
+        stats = await state.storage.documents_stats(
             source=source,
             tags=tags_list,
             lang=lang,
             project_ids=collection_ids,
-            limit=page_size,
-            offset=offset,
         )
-        docs = list(result.get("documents") or [])
-        if "total" in result and isinstance(result.get("total"), int):
-            stats["total"] = int(result.get("total") or 0)
+    except Exception as e:
+        REQS.labels(endpoint="/v1/documents/stats", status="500").inc()
+        logger.error("documents_stats_error", extra={"extra": {"error": str(e)}})
+        return {"ok": False, "error": str(e)}
 
-        if not docs:
-            break
+    if not isinstance(stats, dict) or not stats.get("ok"):
+        REQS.labels(endpoint="/v1/documents/stats", status="500").inc()
+        return {"ok": False, "error": "storage_stats_failed"}
 
-        indexed_set: set[str] = set()
-        if state.retrieval:
-            doc_ids = [str(d.get("doc_id")) for d in docs if d.get("doc_id")]
-            if doc_ids:
-                try:
-                    exists = await state.retrieval.index_exists(doc_ids=doc_ids)
-                    indexed_set = set(str(x) for x in (exists.get("indexed_doc_ids") or []))
-                except Exception:
-                    indexed_set = set()
-                    indexed_available = False
+    stats.setdefault("indexed", 0)
+    stats.setdefault("not_indexed", 0)
 
-        for doc in docs:
-            if stats["docs_seen"] >= max_docs:
-                stats["partial"] = True
-                break
-            stats["docs_seen"] += 1
-            try:
-                stats["bytes"] += int(doc.get("size") or 0)
-            except Exception:
-                pass
+    indexed_available = bool(state.retrieval)
+    total_docs = int(stats.get("total") or 0)
+    if include_indexed and indexed_available:
+        if total_docs > max_indexed_docs:
+            indexed_available = False
+            stats["indexed_skipped"] = True
+        else:
+            offset = 0
+            indexed = 0
+            not_indexed = 0
+            while offset < total_docs and offset < max_docs:
+                result = await state.storage.search_documents(
+                    source=source,
+                    tags=tags_list,
+                    lang=lang,
+                    project_ids=collection_ids,
+                    limit=page_size,
+                    offset=offset,
+                )
+                docs = list(result.get("documents") or [])
+                if not docs:
+                    break
+                doc_ids = [str(d.get("doc_id")) for d in docs if d.get("doc_id")]
+                indexed_set: set[str] = set()
+                if doc_ids:
+                    try:
+                        exists = await state.retrieval.index_exists(doc_ids=doc_ids)
+                        indexed_set = set(str(x) for x in (exists.get("indexed_doc_ids") or []))
+                    except Exception:
+                        indexed_set = set()
+                        indexed_available = False
+                        break
 
-            content_type = (doc.get("content_type") or "unknown").strip() or "unknown"
-            _inc_count(stats["by_content_type"], content_type)
+                for doc_id in doc_ids:
+                    if doc_id in indexed_set:
+                        indexed += 1
+                    else:
+                        not_indexed += 1
 
-            source_val = (doc.get("source") or "unknown").strip() or "unknown"
-            _inc_count(stats["by_source"], source_val)
+                offset += len(docs)
+                if len(docs) < page_size:
+                    break
 
-            lang_val = (doc.get("lang") or "unknown").strip() or "unknown"
-            _inc_count(stats["by_lang"], lang_val)
-
-            collection_val = (doc.get("project_id") or "unassigned").strip() or "unassigned"
-            _inc_count(stats["by_collection"], collection_val)
-
-            ing_state = _ingestion_state_from_doc(doc)
-            if ing_state in stats["ingestion"]:
-                stats["ingestion"][ing_state] += 1
-            else:
-                stats["ingestion"]["unknown"] += 1
-
-            doc_id = str(doc.get("doc_id") or "")
-            if indexed_available and doc_id:
-                if doc_id in indexed_set:
-                    stats["indexed"] += 1
-                else:
-                    stats["not_indexed"] += 1
-
-        offset += len(docs)
-        if len(docs) < page_size:
-            break
-
-    if stats["total"] and stats["docs_seen"] < stats["total"] and stats["docs_seen"] >= max_docs:
-        stats["partial"] = True
+            if indexed_available:
+                stats["indexed"] = indexed
+                stats["not_indexed"] = not_indexed
+            elif total_docs > max_indexed_docs:
+                stats["indexed_skipped"] = True
 
     stats["indexed_available"] = indexed_available
     REQS.labels(endpoint="/v1/documents/stats", status="200").inc()
