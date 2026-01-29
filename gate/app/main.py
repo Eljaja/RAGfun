@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 import httpx
 import json
 from collections import Counter as CollCounter
-from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi import APIRouter, FastAPI, File, Form, Depends, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
@@ -23,6 +23,8 @@ from app.logging_setup import setup_json_logging
 from app.models import ChatRequest, ChatResponse, ContextChunk, Source
 from app.queue import RabbitPublisher
 from app.rag import build_context_blocks, build_messages
+
+from app.auth import authenticated
 from rapidfuzz import fuzz
 
 logger = logging.getLogger("gate")
@@ -578,6 +580,16 @@ async def lifespan(app: FastAPI):
         await state.publisher.close()
 
 
+user_router = APIRouter(
+    prefix="/v1",
+    tags=["user"],
+    dependencies=[Depends(authenticated)]
+)
+public_router = APIRouter(
+    tags=['public']
+)
+
+
 app = FastAPI(title="RAG Gate", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
@@ -627,12 +639,12 @@ async def http_metrics(request: Request, call_next):
         HTTP_INFLIGHT.labels(method=method, route=route).dec()
 
 
-@app.get("/v1/healthz")
+@public_router.get("/v1/healthz")
 async def healthz():
     return {"ok": True}
 
 
-@app.get("/v1/readyz")
+@public_router.get("/v1/readyz")
 async def readyz(response: Response):
     if state.config_error:
         response.status_code = 503
@@ -645,20 +657,20 @@ async def readyz(response: Response):
     return {"ready": ready, "retrieval": r}
 
 
-@app.get("/v1/version")
+@public_router.get("/v1/version")
 async def version():
     if state.settings is None:
         return {"service": {"name": "rag-gate"}, "config_error": state.config_error}
     return {"service": {"name": state.settings.service_name}, "config": state.settings.safe_summary()}
 
 
-@app.get("/v1/metrics")
+@public_router.get("/v1/metrics")
 async def metrics():
     data = generate_latest()
     return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
 
-@app.post("/v1/chat", response_model=ChatResponse)
+@user_router.post("/chat", response_model=ChatResponse)
 async def chat(payload: ChatRequest):
     if state.config_error:
         REQS.labels(endpoint="/v1/chat", status="503").inc()
@@ -989,7 +1001,7 @@ async def chat(payload: ChatRequest):
     )
 
 
-@app.post("/v1/documents/upload")
+@user_router.post("/documents/upload")
 async def upload_document(
     response: Response,
     file: UploadFile = File(...),
@@ -1262,7 +1274,7 @@ async def upload_document(
     return {"ok": True, "result": r, "storage": storage_result, "filename": file.filename, "bytes": len(raw)}
 
 
-@app.get("/v1/documents")
+@user_router.get("/documents")
 async def list_documents(
     source: str | None = None,
     tags: str | None = None,
@@ -1314,7 +1326,7 @@ async def list_documents(
         return {"ok": False, "error": str(e), "documents": [], "total": 0}
 
 
-@app.get("/v1/documents/stats")
+@user_router.get("/documents/stats")
 async def documents_stats(
     source: str | None = None,
     tags: str | None = None,
@@ -1414,7 +1426,7 @@ async def documents_stats(
     return stats
 
 
-@app.get("/v1/collections")
+@user_router.get("/collections")
 async def collections(tenant_id: str | None = None, limit: int = 1000):
     """Proxy: list distinct collections (project_id) from document-storage."""
     if state.config_error:
@@ -1433,7 +1445,7 @@ async def collections(tenant_id: str | None = None, limit: int = 1000):
         return {"ok": False, "error": str(e), "collections": []}
 
 
-@app.delete("/v1/documents/{doc_id:path}")
+@user_router.delete("/documents/{doc_id:path}")
 async def delete_document(doc_id: str, response: Response):
     """
     Deletes document from storage (if configured) and removes its chunks from retrieval index.
@@ -1527,7 +1539,7 @@ async def delete_document(doc_id: str, response: Response):
     }
 
 
-@app.delete("/v1/documents")
+@user_router.delete("/documents")
 async def delete_all_documents(
     confirm: bool = False,
     batch_size: int = 200,
@@ -1658,7 +1670,7 @@ async def delete_all_documents(
     }
 
 
-@app.get("/v1/documents/{doc_id:path}/status")
+@user_router.get("/documents/{doc_id:path}/status")
 async def get_document_status(doc_id: str):
     """Get document status including storage and indexing status."""
     if state.config_error:
@@ -1692,7 +1704,7 @@ async def get_document_status(doc_id: str):
     return {"ok": True, **result}
 
 
-@app.post("/v1/chat/stream")
+@user_router.post("/chat/stream")
 async def chat_stream(payload: ChatRequest):
     """Streaming chat endpoint using SSE."""
     if state.config_error:
@@ -1827,3 +1839,10 @@ async def chat_stream(payload: ChatRequest):
             REQS.labels(endpoint="/v1/chat/stream", status="500").inc()
 
     return StreamingResponse(generate_stream(), media_type="text/event-stream")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Register routers AFTER all routes are defined
+# ════════════════════════════════════════════════════════════════════════════════
+app.include_router(public_router)
+app.include_router(user_router)

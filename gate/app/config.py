@@ -7,7 +7,16 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="GATE_", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="GATE_",
+        env_file=".env",           # Load from .env file in cwd
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # Auth check 
+    auth_server: str
+    admin_secret_token: str
 
     # Service
     service_name: str = "rag-gate"
