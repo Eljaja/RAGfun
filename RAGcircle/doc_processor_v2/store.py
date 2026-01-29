@@ -62,6 +62,7 @@ class QdrantStore:
                 with_payload=["chunk_id", "content_hash"],
             )
             result = {}
+
             for p in points:
                 if p.payload:
                     cid = p.payload.get("chunk_id")
@@ -167,3 +168,8 @@ class BM25Store:
 
     async def close(self):
         await self.client.close()
+
+    async def get(self, doc_id: str) -> dict | None:
+        resp = await self.client.get(index=self.index, id=doc_id)
+        print("THIS IS RESP", resp)
+        return resp["_source"]

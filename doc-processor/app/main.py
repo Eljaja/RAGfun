@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -11,9 +10,9 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, ge
 from app.chunking import chunk_text_chars
 from app.clients import RetrievalClient, StorageClient, VLMClient
 from app.config import Settings, load_settings
-from app.extraction import extract_text_non_vlm, normalize_to_pdf, pdf_to_page_pngs
 from app.logging_setup import setup_json_logging
 from app.models import ChunkMeta, Locator, ProcessRequest, ProcessResponse
+from app.processing import get_processor, NonVLMProcessor
 
 logger = logging.getLogger("processor")
 
@@ -206,73 +205,21 @@ async def process(req: ProcessRequest):
         REQS.labels(endpoint="/v1/process", status="400").inc()
         return ProcessResponse(ok=False, doc_id=doc_id, error="empty_file", detail="empty content from storage")
 
-    # Decide path: PDF/DOC/DOCX -> VLM; XML -> parse; else -> utf-8 fallback.
-    pdf_bytes, norm_ct = None, None
+    # Choose processing strategy based on file type
+    processor = get_processor(state, content_type, filename)
     try:
-        with LAT.labels("normalize").time():
-            pdf_bytes, norm_ct = normalize_to_pdf(raw, content_type, filename)
-    except Exception as e:
-        degraded.append("office_convert_failed")
-        partial = True
-        pdf_bytes = None
-        logger.warning("normalize_to_pdf_failed", extra={"extra": {"doc_id": doc_id, "error": str(e)}})
-
-    pages_text: list[str] = []
-    pages = None
-
-    if pdf_bytes is None:
-        # Non-VLM fallback (XML/plain)
-        with LAT.labels("extract_non_vlm").time():
-            ed = extract_text_non_vlm(raw, content_type, filename)
-        pages_text = ed.pages_text
-        pages = len(pages_text)
-        content_type = ed.content_type or content_type
-        degraded.append("vlm_skipped")
-        PROCESSOR_PATH.labels("non_vlm").inc()
-    else:
-        # VLM path: render pages -> ask VLM per page.
-        with LAT.labels("pdf_render").time():
-            pngs = pdf_to_page_pngs(
-                pdf_bytes,
-                max_pages=state.settings.max_pages,
-                max_side_px=state.settings.max_image_side_px,
-            )
-        pages = len(pngs)
-        if pages == 0:
-            REQS.labels(endpoint="/v1/process", status="400").inc()
-            return ProcessResponse(ok=False, doc_id=doc_id, content_type=norm_ct, error="no_pages", detail="no pages rendered")
-
-        async def one(i: int, b: bytes) -> tuple[int, str]:
-            t = await state.vlm.page_to_text(png_bytes=b)
-            return (i, t)
-
-        with LAT.labels("vlm").time():
-            # bounded parallelism
-            sem = asyncio.Semaphore(4)
-
-            async def run_one(i: int, b: bytes):
-                async with sem:
-                    return await one(i, b)
-
-            results = await asyncio.gather(*(run_one(i, b) for i, b in enumerate(pngs)), return_exceptions=True)
-
-        for r in results:
-            if isinstance(r, Exception):
-                degraded.append("vlm_page_failed")
-                partial = True
-                continue
-            i, t = r
-            if t:
-                # 1-based page number in locator
-                while len(pages_text) < i + 1:
-                    pages_text.append("")
-                pages_text[i] = t
-
-        # Ensure list length
-        if len(pages_text) < pages:
-            pages_text.extend([""] * (pages - len(pages_text)))
-
-        if all(not t.strip() for t in pages_text):
+        pages_text, norm_ct = await processor.to_text(raw, filename, content_type)
+        # Update content_type with any normalization performed
+        content_type = norm_ct or content_type
+        pages = len(pages_text) if pages_text is not None else None
+        # Record which path was taken for metrics
+        if isinstance(processor, NonVLMProcessor):
+            degraded.append("vlm_skipped")
+            PROCESSOR_PATH.labels("non_vlm").inc()
+        else:
+            PROCESSOR_PATH.labels("vlm").inc()
+        # If no text was extracted, return an error similar to the original behaviour
+        if not pages_text or all(not t.strip() for t in pages_text):
             REQS.labels(endpoint="/v1/process", status="400").inc()
             return ProcessResponse(
                 ok=False,
@@ -280,13 +227,22 @@ async def process(req: ProcessRequest):
                 content_type=norm_ct,
                 pages=pages,
                 error="empty_text",
-                detail="VLM returned empty text for all pages",
+                detail="No text extracted from document",
                 partial=partial,
                 degraded=degraded,
             )
-
-        content_type = norm_ct
-        PROCESSOR_PATH.labels("vlm").inc()
+    except Exception as e:
+        # Any exception during VLM processing is considered a degradation.
+        degraded.append("vlm_page_failed")
+        partial = True
+        logger.warning("processing_failed", extra={"extra": {"doc_id": doc_id, "error": str(e)}})
+        # Fallback to non‑VLM processor
+        fallback = NonVLMProcessor()
+        pages_text, norm_ct = await fallback.to_text(raw, filename, content_type)
+        content_type = norm_ct or content_type
+        pages = len(pages_text) if pages_text else None
+        degraded.append("vlm_skipped")
+        PROCESSOR_PATH.labels("non_vlm").inc()
 
     # Build chunks (preserve page in locator when we have pages)
     chunks: list[ChunkMeta] = []
