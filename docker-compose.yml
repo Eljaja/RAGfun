@@ -195,8 +195,8 @@ services:
   retrieval:
     build:
       context: ./service
-    #ports:
-    #  - "8080:8080"
+    ports:
+      - "8080:8080"
     environment:
       # =========================
       # Retrieval / Search quality knobs (RAG_*)
@@ -296,7 +296,7 @@ services:
       - STORAGE_LOG_LEVEL=INFO
       - STORAGE_STORAGE_BACKEND=s3
       - STORAGE_STORAGE_PATH=/data/documents
-      - STORAGE_S3_ENDPOINT=http://rustfs:9000
+      - STORAGE_S3_ENDPOINT=${STORAGE_S3_ENDPOINT:-http://presign-rustfs-1:9000}
       - STORAGE_S3_BUCKET=${STORAGE_S3_BUCKET:-documents}
       - STORAGE_S3_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
       - STORAGE_S3_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfsadmin}
@@ -314,11 +314,9 @@ services:
         condition: service_healthy
       pgbouncer:
         condition: service_started
-      rustfs:
-        condition: service_healthy
     networks:
       - rag-network
-      - rustfs-network
+      - presign_rustfs-net
 
   # vLLM (OpenAI-compatible) hosting Granite-Docling VLM for document-to-text extraction.
   # NOTE: requires NVIDIA GPU + drivers on the host.
@@ -680,3 +678,5 @@ networks:
     driver: bridge
   rustfs-network:
     driver: bridge
+  presign_rustfs-net:
+    external: true
