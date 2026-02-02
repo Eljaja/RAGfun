@@ -325,7 +325,7 @@ services:
   vllm-docling:
     image: vllm/vllm-openai:latest
     container_name: vllm-docling
-    command: ["--model", "ibm-granite/granite-docling-258M", "--port", "8123"]
+    command: ["--model", "ibm-granite/granite-docling-258M", "--port", "8123", "--gpu-memory-utilization", "0.4"]
     ports:
       - "8123:8123"
     volumes:
@@ -339,7 +339,11 @@ services:
       resources:
         reservations:
           devices:
-            - capabilities: [gpu]
+          - driver: nvidia
+            device_ids:
+              - "0"
+            capabilities:
+              - gpu
 
   # Document Processor Service (pulls files from document-storage, uses Granite-Docling via vLLM, indexes into retrieval)
   doc-processor:

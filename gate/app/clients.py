@@ -178,6 +178,31 @@ class DocumentStorageClient:
             r.raise_for_status()
             return r.json()
 
+    async def documents_stats(
+        self,
+        *,
+        source: str | None = None,
+        tags: list[str] | None = None,
+        lang: str | None = None,
+        tenant_id: str | None = None,
+        project_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, str] = {}
+        if source is not None:
+            params["source"] = source
+        if tags:
+            params["tags"] = ",".join([t for t in tags if t])
+        if lang is not None:
+            params["lang"] = lang
+        if tenant_id is not None:
+            params["tenant_id"] = tenant_id
+        if project_ids:
+            params["collections"] = ",".join([c for c in project_ids if c])
+        async with httpx.AsyncClient(timeout=self._timeout_s) as client:
+            r = await client.get(f"{self._base_url}/v1/documents/stats", params=params)
+            r.raise_for_status()
+            return r.json()
+
     async def list_collections(self, *, tenant_id: str | None = None, limit: int = 1000) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=self._timeout_s) as client:
             r = await client.get(f"{self._base_url}/v1/collections", params={"tenant_id": tenant_id, "limit": int(limit)})
