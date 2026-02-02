@@ -866,8 +866,7 @@ async def chat(payload: ChatRequest):
             answer = await _enforce_citations_or_refuse(llm=state.llm, messages=messages, answer=answer, refs=refs)
         else:
             # ru_eval runs with include_sources=False. For short factoid answers:
-            # 1) If the answer doesn't appear in the provided context, expand within top docs and retry once.
-            # 2) Enforce "verbatim span from sources" (or refuse) to avoid entity hallucinations.
+            # If the answer doesn't appear in the provided context, expand within top docs and retry once.
             if _is_factoid_like_question(payload.query):
                 if not _answer_is_in_context(answer=answer, context_text=context_text):
                     # Expand inside the top doc(s) to fetch a more relevant chunk from the same page.
@@ -937,13 +936,6 @@ async def chat(payload: ChatRequest):
                                 sources = sources2
                                 messages = messages2
                                 answer = answer2
-
-                answer = await _enforce_extractive_or_refuse(
-                    llm=state.llm,
-                    messages=messages,
-                    answer=answer,
-                    context_text=context_text,
-                )
 
     ref_by_key = {(str(s.get("doc_id")), s.get("uri")): s.get("ref") for s in (sources or [])}
 
