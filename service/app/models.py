@@ -88,6 +88,19 @@ class IndexDeleteResponse(BaseModel):
     errors: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class IndexDeleteBatchRequest(BaseModel):
+    doc_ids: list[str]
+    refresh: bool = False
+    batch_size: int = 500  # max doc_ids per internal batch
+
+
+class IndexDeleteBatchResponse(BaseModel):
+    ok: bool
+    deleted: int = 0
+    partial: bool = False
+    errors: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class SearchFilters(BaseModel):
     source: str | None = None
     tags: list[str] | None = None

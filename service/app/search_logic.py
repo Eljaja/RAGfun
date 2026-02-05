@@ -11,7 +11,7 @@ from qdrant_client.http import models as qm
 from app.clients.embeddings import EmbeddingsClient
 from app.clients.opensearch import OpenSearchClient
 from app.clients.qdrant import QdrantFacade
-from app.clients.rerank import RerankClient
+from app.clients.rerank import Reranker
 from app.fusion import hybrid_fusion, rrf_fusion
 from app.metrics import CAND, DEP_DEGRADED, ERRS, LAT, RAG_PAGE_DEDUP_SAVED, RAG_PARENT_PAGES, RAG_PARTIAL, RAG_RERANK
 from app.models import SearchFilters, SearchHit, SearchRequest, SearchResponse, SourceObj
@@ -203,13 +203,14 @@ async def search(
     os_client: OpenSearchClient | None,
     qdrant: QdrantFacade | None,
     embedder: EmbeddingsClient,
-    reranker: RerankClient | None,
+    reranker: Reranker | None,
     rerank_mode: str,
     rerank_timeout_s: float,
     rerank_max_candidates: int,
     rerank_auto_min_query_tokens: int,
     rerank_auto_min_intersection: int,
     top_k_default: int,
+    retrieval_candidates: int,
     bm25_top_k: int,
     vector_top_k: int,
     rrf_k: int,
@@ -224,6 +225,10 @@ async def search(
     top_k = req.top_k or top_k_default
     max_per_doc = req.max_chunks_per_doc or max_chunks_per_doc
 
+    logger.info(
+        "rag_search_start",
+        extra={"query_len": len(req.query), "mode": req.mode, "top_k": top_k, "retrieval_candidates": retrieval_candidates},
+    )
     degraded: list[str] = []
     partial = False
     partial_rerank = False
@@ -272,6 +277,7 @@ async def search(
                 )
             )
         CAND.labels("bm25").observe(len(hits))
+        logger.debug("rag_stage_bm25", extra={"hits": len(hits), "query_preview": req.query[:80]})
         return hits, {cid: float(i + 1) for i, cid in enumerate(rank_ids)}
 
     async def do_vector() -> tuple[list[SearchHit], dict[str, float]]:
@@ -301,6 +307,7 @@ async def search(
                 )
             )
         CAND.labels("vector").observe(len(hits))
+        logger.debug("rag_stage_vector", extra={"hits": len(hits), "query_preview": req.query[:80]})
         return hits, {cid: float(i + 1) for i, cid in enumerate(rank_ids)}
 
     bm25_hits: list[SearchHit] = []
@@ -341,9 +348,18 @@ async def search(
         else:
             vec_hits, vec_rank = res[1]
 
-    # If rerank is enabled, build a larger candidate pool before truncating to final top_k.
+    # If rerank is enabled, retrieve top retrieval_candidates (e.g. 20) before rerank, then take top_k.
     do_rerank = want_rerank(bm25_hits=bm25_hits, vec_hits=vec_hits) and reranker is not None
-    pre_k = max(top_k, int(rerank_max_candidates)) if do_rerank else top_k
+    pre_k = max(top_k, retrieval_candidates, int(rerank_max_candidates)) if do_rerank else top_k
+    logger.debug(
+        "rag_retrieval_done",
+        extra={
+            "bm25_hits": len(bm25_hits),
+            "vector_hits": len(vec_hits),
+            "do_rerank": do_rerank,
+            "pre_k": pre_k,
+        },
+    )
 
     # Build fused ranks
     src_lists: dict[str, list[str]] = {}
@@ -373,6 +389,7 @@ async def search(
                     alpha=fusion_alpha,
                 )
         fused_order = sorted(fused_scores.keys(), key=lambda cid: fused_scores[cid], reverse=True)[:pre_k]
+        logger.debug("rag_stage_fusion", extra={"fused_count": len(fused_order), "pre_k": pre_k})
 
     # Merge payloads: prefer OS for highlight, fallback to Qdrant
     by_id: dict[str, SearchHit] = {}
@@ -418,6 +435,10 @@ async def search(
                         if h.rerank_score is not None:
                             h.score = h.rerank_score
                     rerank_outcome = "applied"
+                    logger.debug(
+                        "rag_stage_rerank",
+                        extra={"candidates": len(candidates), "query_preview": req.query[:80]},
+                    )
                 except Exception as e:
                     ERRS.labels("rerank", type(e).__name__).inc()
                     partial_rerank = True
@@ -485,6 +506,14 @@ async def search(
             except Exception:
                 pass
 
+        logger.info(
+            "rag_search_done",
+            extra={
+                "hits_returned": len(out),
+                "partial": partial,
+                "rerank_outcome": rerank_outcome,
+            },
+        )
         # sources
         sources_out: list[SourceObj] | None = None
         if req.include_sources:

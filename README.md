@@ -10,7 +10,6 @@ This repository implements a full-featured RAG system with:
 - **VLM-Powered Document Processing**: Uses Vision-Language Models (Granite-Docling) for accurate document-to-text extraction
 - **Stateless Microservices**: Horizontally scalable services with clear separation of concerns
 - **Advanced Features**: Multi-query expansion, two-pass retrieval, reranking, segment stitching, auto-tuning
-- **Agentic Search**: Multi-turn research-style queries with streaming responses
 - **Full Observability**: Prometheus metrics, Grafana dashboards, structured logging
 - **Async Processing**: RabbitMQ-based ingestion pipeline with retry/DLQ
 
@@ -99,7 +98,6 @@ The system consists of **8 microservices** organized into application, ML, and i
 - **retrieval** (`:8080`) - Hybrid search engine (BM25 + vectors); stateless and horizontally scalable
 - **document-storage** (`:8081`) - Stores document bytes (S3-compatible) and metadata (Postgres)
 - **doc-processor** (`:8082`) - Async worker for document extraction, chunking, and indexing
-- **agent-search** (`:8091`) - Agentic multi-turn research queries with execution traces
 - **ui** (`:3300`) - Nginx-served SPA with SSE streaming support
 
 #### ML/Embedding Services
@@ -141,7 +139,6 @@ The system consists of **8 microservices** organized into application, ML, and i
 - **VLM Extraction**: High-accuracy document-to-text via Vision-Language Models
 - **Async Ingestion**: RabbitMQ-based pipeline with retry and dead-letter queue
 - **Streaming Chat**: Server-Sent Events (SSE) for real-time responses
-- **Agentic Search**: Multi-turn research queries with execution trace display
 - **Auto-Tuning**: Optional LLM-based parameter optimization via router
 - **Full Observability**: Prometheus metrics, Grafana dashboards, structured logs
 
@@ -149,7 +146,7 @@ The system consists of **8 microservices** organized into application, ML, and i
 
 - ✅ Hybrid retrieval (BM25 + vectors) with RRF fusion
 - ✅ VLM-based document extraction (Granite-Docling)
-- ✅ Agentic search with streaming and traces
+- ✅ SOTA improvements: semantic chunking, contextual headers, local reranker
 - ✅ Advanced retrieval features (multi-query, two-pass, reranking)
 - ✅ Full observability stack (Prometheus, Grafana, structured logging)
 - 🔄 Exploring GraphRAG approaches and continuous knowledge graph updates
@@ -192,10 +189,10 @@ python -m app.main
 - Update `service/app/fusion.py` (RRF fusion and reranking)
 
 **Changing chunking:**
-- Update `service/app/chunking.py` or `doc-processor/app/chunker.py`
+- Update `service/app/chunking.py` or `doc-processor/app/chunking.py`
 
 **Adding API endpoints:**
-- Update `gate/app/router.py` for new routes
+- Update `gate/app/main.py` for new routes
 - Modify respective service `main.py` files
 
 **Modifying embeddings:**
@@ -203,21 +200,16 @@ python -m app.main
 
 ### Testing
 
-**Run E2E tests:**
+**BRIGHT benchmark** — см. [docs/BRIGHT_VALIDATION.md](docs/BRIGHT_VALIDATION.md):
 ```bash
-cd pipeline-tests
-pytest tests/
+# Внешний скрипт run_bright_validation.sh
+/home/ubuntu/run_bright_validation.sh --stack rugfunsota --domain biology --limit 50
 ```
 
-**Run BRIGHT benchmark:**
+**BEIR eval** (direct / full pipeline):
 ```bash
-cd pipeline-tests/bench
-python bright_eval.py --config config.yaml
-```
-
-**Evaluate on custom dataset:**
-```bash
-./run_dataset_evals.sh
+python eval/run_rag_baseline.py --gate-url http://localhost:8092 --dataset data/beir/fiqa/queries.jsonl --format beir --output results.json
+python eval/run_rag_ir_metrics.py --results results.json --qrels data/beir/fiqa/qrels_test.tsv --output metrics.json
 ```
 
 ### Monitoring & Debugging
@@ -312,21 +304,6 @@ Content-Type: application/json
 }
 ```
 
-### Agent Search
-
-**Agentic Search:**
-```bash
-POST /agent/search
-Content-Type: application/json
-
-{
-  "query": "Research the benefits of hybrid retrieval",
-  "stream": true
-}
-
-Response: SSE with execution traces
-```
-
 ## Configuration
 
 ### Environment Variables
@@ -378,11 +355,11 @@ Services that scale horizontally:
 
 ## Documentation
 
-- **[AGENTS.md](./AGENTS.md)** - Comprehensive guide for developers and AI agents
-- **[docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)** - System architecture deep dive
-- **[docs/DATAFLOW.md](./docs/DATAFLOW.md)** - API flows with Mermaid diagrams
-- **[docs/TESTING_AND_BENCHMARKS.md](./docs/TESTING_AND_BENCHMARKS.md)** - Testing and benchmark guides
-- **[docs/PLANNED_ARCHITECTURE.md](./docs/PLANNED_ARCHITECTURE.md)** - Future improvements
+- **[RUN_RUGFUNSOTA.md](./RUN_RUGFUNSOTA.md)** — Запуск rugfunsota (SOTA-стек)
+- **[docs/RAG_DIFF_OUR_VS_OLD.md](./docs/RAG_DIFF_OUR_VS_OLD.md)** — Отличия SOTA от baseline
+- **[docs/BRIGHT_VALIDATION.md](./docs/BRIGHT_VALIDATION.md)** — Валидация на BRIGHT
+- **[docs/INGESTION_FLOW.md](./docs/INGESTION_FLOW.md)** — Полный пайплайн индексации
+- **[docs/gate/GATE_API.md](./docs/gate/GATE_API.md)** — API Gate
 
 ## Technology Stack
 
@@ -422,7 +399,7 @@ Services that scale horizontally:
 2. Check timeout settings: `DOCLING_TIMEOUT`
 3. Monitor vLLM service health: `curl http://localhost:8123/health`
 
-For detailed troubleshooting, see [AGENTS.md - Debug Checklist](./AGENTS.md#debug-checklist).
+Для rugfunsota см. [RUN_RUGFUNSOTA.md](./RUN_RUGFUNSOTA.md).
 
 ## Status
 
@@ -430,7 +407,7 @@ For detailed troubleshooting, see [AGENTS.md - Debug Checklist](./AGENTS.md#debu
 
 - ✅ Core hybrid retrieval pipeline functional
 - ✅ VLM-based document processing working
-- ✅ Agentic search implemented
+- ✅ SOTA improvements (semantic chunking, CCH, local reranker)
 - ✅ Full monitoring stack deployed
 - 🔄 Exploring GraphRAG integration
 - 🔄 Expanding benchmark coverage

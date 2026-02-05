@@ -18,3 +18,6 @@ opentelemetry-exporter-otlp==1.29.0
 opentelemetry-instrumentation-fastapi==0.50b0
 opentelemetry-instrumentation-httpx==0.50b0
 
+# Optional: for RAG_RERANK_PROVIDER=local (in-process CPU reranker)
+sentence-transformers>=3.0.0
+

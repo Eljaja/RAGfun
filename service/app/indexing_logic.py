@@ -8,12 +8,21 @@ from typing import TypeVar
 from opentelemetry import trace
 from qdrant_client.http import models as qm
 
-from app.chunking import chunk_text
+from app.chunking import chunk_by_strategy
 from app.clients.embeddings import EmbeddingsClient
 from app.clients.opensearch import OpenSearchClient
 from app.clients.qdrant import QdrantFacade
 from app.metrics import ERRS, LAT
-from app.models import ChunkMeta, DocumentMeta, IndexDeleteRequest, IndexDeleteResponse, IndexUpsertRequest, IndexUpsertResponse
+from app.models import (
+    ChunkMeta,
+    DocumentMeta,
+    IndexDeleteBatchRequest,
+    IndexDeleteBatchResponse,
+    IndexDeleteRequest,
+    IndexDeleteResponse,
+    IndexUpsertRequest,
+    IndexUpsertResponse,
+)
 from app.qdrant_ids import point_id_for_chunk_id
 from app.utils import sha256_hex
 
@@ -112,6 +121,7 @@ async def upsert(
     os_client: OpenSearchClient | None,
     qdrant: QdrantFacade | None,
     embedder: EmbeddingsClient,
+    chunk_strategy: str,
     max_tokens: int,
     overlap_tokens: int,
     embedding_batch_size: int = 32,
@@ -123,7 +133,12 @@ async def upsert(
         if not req.document or req.text is None:
             return IndexUpsertResponse(ok=False, partial=True, errors=[{"error": "document mode requires document+text"}])
         chs = []
-        for idx, ctext, tcnt in chunk_text(req.text, max_tokens=max_tokens, overlap_tokens=overlap_tokens):
+        for idx, ctext, tcnt in chunk_by_strategy(
+            req.text,
+            strategy=chunk_strategy,
+            max_tokens=max_tokens,
+            overlap_tokens=overlap_tokens,
+        ):
             chs.append(
                 ChunkMeta(
                     chunk_id=_chunk_id(req.document.doc_id, idx),
@@ -417,3 +432,44 @@ async def delete(
     return IndexDeleteResponse(ok=not partial, deleted=deleted, partial=partial, errors=errors)
 
 
+async def delete_batch(
+    *,
+    req: IndexDeleteBatchRequest,
+    os_client: OpenSearchClient | None,
+    qdrant: QdrantFacade | None,
+) -> IndexDeleteBatchResponse:
+    """
+    Delete all chunks for multiple doc_ids in bulk.
+    Uses OpenSearch terms query and Qdrant MatchAny filter for efficiency.
+    """
+    doc_ids = [str(d) for d in req.doc_ids if d]
+    if not doc_ids:
+        return IndexDeleteBatchResponse(ok=True, deleted=0)
+
+    errors: list[dict[str, Any]] = []
+    partial = False
+    deleted = 0
+    bs = max(1, min(int(req.batch_size), 2000))
+
+    if os_client is not None:
+        try:
+            r = await asyncio.to_thread(os_client.delete_by_doc_ids, doc_ids, req.refresh, batch_size=bs)
+            deleted += int(r.get("deleted") or 0)
+        except Exception as e:
+            partial = True
+            errors.append({"stage": "opensearch", "error": str(e)})
+    else:
+        partial = True
+        errors.append({"stage": "opensearch", "error": "not_configured"})
+
+    if qdrant is not None:
+        try:
+            await asyncio.to_thread(qdrant.delete_by_doc_ids, doc_ids, batch_size=bs)
+        except Exception as e:
+            partial = True
+            errors.append({"stage": "qdrant", "error": str(e)})
+    else:
+        partial = True
+        errors.append({"stage": "qdrant", "error": "not_configured"})
+
+    return IndexDeleteBatchResponse(ok=not partial, deleted=deleted, partial=partial, errors=errors)
