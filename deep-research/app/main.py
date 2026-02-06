@@ -10,11 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
-import queue
-import time
 import logging
-from typing import Any, Dict, List, TypedDict, AsyncIterator
+import os
+import time
+from typing import Any, AsyncIterator, Dict, List, TypedDict
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -29,14 +28,14 @@ from agent_common import (
     DEEP_FACT_QUERIES,
     DEEP_HYDE,
     DEEP_KEYWORD_QUERIES,
-    SyncGateClient,
+    AsyncGateClient,
     build_context,
     context_from_hits,
     merge_hits,
     quality_is_poor,
     sources_from_context,
 )
-from agent_common.web_search import web_search_sync
+from agent_common.web_search import web_search_async
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 
 DEEP_REQUESTS = Counter("deep_research_requests_total", "Deep research stream requests")
@@ -139,13 +138,13 @@ class MCPServerConfig(BaseModel):
 
 
 class EventEmitter:
-    def __init__(self, event_queue: queue.Queue[object]) -> None:
+    def __init__(self, event_queue: asyncio.Queue[object]) -> None:
         self._queue = event_queue
 
     def emit(self, event: dict[str, Any]) -> None:
         if event.get("type") in {"progress", "trace", "retrieval"}:
             logger.info("event.emit", extra={"type": event.get("type"), "stage": event.get("stage")})
-        self._queue.put(event)
+        self._queue.put_nowait(event)
 
 
 SENTINEL = object()
@@ -209,8 +208,26 @@ def _llm_text(llm, prompt: str) -> str:
     return str(result or "")
 
 
+async def _llm_text_async(llm, prompt: str) -> str:
+    try:
+        result = await llm.ainvoke(prompt)
+    except Exception:
+        logger.exception("llm.ainvoke failed")
+        return ""
+    if hasattr(result, "content"):
+        return str(result.content or "")
+    return str(result or "")
+
+
 def _llm_json(llm, prompt: str) -> dict[str, Any]:
     raw = _llm_text(llm, prompt)
+    if not raw:
+        return {}
+    return _safe_json(raw)
+
+
+async def _llm_json_async(llm, prompt: str) -> dict[str, Any]:
+    raw = await _llm_text_async(llm, prompt)
     if not raw:
         return {}
     return _safe_json(raw)
@@ -228,13 +245,13 @@ def _default_plan(question: str) -> list[str]:
     return ["Background", "Key findings", "Implications", "Risks", "Next steps"]
 
 
-def _plan_retrieval(llm, question: str) -> dict[str, Any]:
+async def _plan_retrieval_async(llm, question: str) -> dict[str, Any]:
     prompt = (
         "You are a retrieval strategist for a RAG system. Return JSON only.\n"
         "Fields: retrieval_mode (bm25|vector|hybrid), top_k (1..40), rerank (true|false), use_hyde (true|false), reason.\n"
         f"Question: {question}"
     )
-    data = _llm_json(llm, prompt)
+    data = await _llm_json_async(llm, prompt)
     return {
         "retrieval_mode": str(data.get("retrieval_mode") or "hybrid"),
         "top_k": int(data.get("top_k") or 8),
@@ -264,6 +281,12 @@ def _make_hyde(llm, query: str) -> str:
     return _llm_text(llm, prompt)
 
 
+async def _make_hyde_async(llm, query: str) -> str:
+    lang = _infer_query_lang(query)
+    prompt = DEEP_HYDE.format(query=query, lang=lang)
+    return await _llm_text_async(llm, prompt)
+
+
 def _fact_queries(llm, query: str) -> list[str]:
     prompt = DEEP_FACT_QUERIES.format(query=query)
     data = _llm_json(llm, prompt)
@@ -271,9 +294,23 @@ def _fact_queries(llm, query: str) -> list[str]:
     return [str(q).strip() for q in out if str(q).strip()]
 
 
+async def _fact_queries_async(llm, query: str) -> list[str]:
+    prompt = DEEP_FACT_QUERIES.format(query=query)
+    data = await _llm_json_async(llm, prompt)
+    out = data.get("fact_queries") or []
+    return [str(q).strip() for q in out if str(q).strip()]
+
+
 def _keyword_queries(llm, query: str) -> list[str]:
     prompt = DEEP_KEYWORD_QUERIES.format(query=query)
     data = _llm_json(llm, prompt)
+    out = data.get("keywords") or []
+    return [str(q).strip() for q in out if str(q).strip()]
+
+
+async def _keyword_queries_async(llm, query: str) -> list[str]:
+    prompt = DEEP_KEYWORD_QUERIES.format(query=query)
+    data = await _llm_json_async(llm, prompt)
     out = data.get("keywords") or []
     return [str(q).strip() for q in out if str(q).strip()]
 
@@ -402,7 +439,8 @@ def _dedupe_queries(queries: list[str], cap: int) -> list[str]:
 
 def _build_graph(
     llm,
-    gate: SyncGateClient,
+    gate: AsyncGateClient,
+    client: httpx.AsyncClient,
     emitter: EventEmitter,
     template: str,
 ) -> Any:
@@ -432,7 +470,7 @@ def _build_graph(
             }
         )
 
-    def plan_node(state: dict[str, Any]) -> dict[str, Any]:
+    async def plan_node(state: dict[str, Any]) -> dict[str, Any]:
         t0 = time.perf_counter()
         max_iters = int(state.get("max_iterations") or 0)
         emit_progress("plan", 0, max_iters, "Plan: choosing retrieval settings")
@@ -446,7 +484,7 @@ def _build_graph(
             "reason": "",
         }
         try:
-            data = _plan_retrieval(llm, state.get("question") or "")
+            data = await _plan_retrieval_async(llm, state.get("question") or "")
             mode = str(data.get("retrieval_mode") or defaults["retrieval_mode"])
             top_k = int(data.get("top_k") or defaults["top_k"])
             rerank = bool(data.get("rerank") if data.get("rerank") is not None else defaults["rerank"])
@@ -484,7 +522,8 @@ def _build_graph(
             "question": state.get("question") or "",  # preserve for downstream
         }
 
-    def scope_node(state: dict[str, Any]) -> dict[str, Any]:
+    async def scope_node(state: dict[str, Any]) -> dict[str, Any]:
+        t0 = time.perf_counter()
         max_iters = int(state.get("max_iterations") or 0)
         emit_progress("scope", 0, max_iters, "Scope: drafting plan")
         logger.info("scope.start")
@@ -505,9 +544,9 @@ def _build_graph(
             f"Report template:\n{template}\n"
         )
         try:
-            out = llm.with_structured_output(ScopeOutput).invoke(prompt)
+            out = await llm.with_structured_output(ScopeOutput).ainvoke(prompt)
             if out is None:
-                raw = llm.invoke(prompt).content
+                raw = (await llm.ainvoke(prompt)).content
                 logger.warning("scope.raw_fallback", extra={"chars": len(str(raw))})
                 data = _safe_json(str(raw))
                 plan = list(data.get("plan") or [])
@@ -544,7 +583,7 @@ def _build_graph(
             "use_web_search": state.get("use_web_search"),
         }
 
-    def research_node(state: dict[str, Any]) -> dict[str, Any]:
+    async def research_node(state: dict[str, Any]) -> dict[str, Any]:
         t0 = time.perf_counter()
         iteration = int(state.get("iteration") or 0) + 1
         max_iters = int(state.get("max_iterations") or 0)
@@ -627,7 +666,7 @@ def _build_graph(
                         "content": "Generating a hypothetical passage for retrieval.",
                     }
                 )
-                hyde = _make_hyde(llm, q)
+                hyde = await _make_hyde_async(llm, q)
                 if hyde.strip():
                     search_query = hyde.strip()
             emitter.emit(
@@ -645,7 +684,8 @@ def _build_graph(
             )
             history = state.get("history") or []
             DEEP_GATE_CALLS.inc()
-            primary = gate.chat(
+            primary = await gate.chat(
+                client,
                 search_query,
                 history=history,
                 retrieval_mode=mode,
@@ -670,7 +710,7 @@ def _build_graph(
                         "content": "Search looks weak. Expanding into fact queries.",
                     }
                 )
-                fact_qs = _fact_queries(llm, q)
+                fact_qs = await _fact_queries_async(llm, q)
                 for fq in fact_qs:
                     emitter.emit(
                         {
@@ -687,19 +727,26 @@ def _build_graph(
                             "payload": {"query": fq, "retrieval_mode": mode, "top_k": max(4, top_k // 2), "rerank": rerank},
                         }
                     )
-                    DEEP_GATE_CALLS.inc()
-                    r2 = gate.chat(
-                        fq,
-                        history=history,
-                        retrieval_mode=mode,
-                        top_k=max(4, top_k // 2),
-                        rerank=rerank,
-                        filters=filters,
-                        include_sources=include_sources,
-                    )
-                    responses.append(r2)
-                    degraded.update(r2.get("degraded") or [])
-                    partial = partial or bool(r2.get("partial"))
+                if fact_qs:
+                    fact_tasks = [
+                        gate.chat(
+                            client,
+                            fq,
+                            history=history,
+                            retrieval_mode=mode,
+                            top_k=max(4, top_k // 2),
+                            rerank=rerank,
+                            filters=filters,
+                            include_sources=include_sources,
+                        )
+                        for fq in fact_qs
+                    ]
+                    fact_results = await asyncio.gather(*fact_tasks)
+                    for r2 in fact_results:
+                        DEEP_GATE_CALLS.inc()
+                        responses.append(r2)
+                        degraded.update(r2.get("degraded") or [])
+                        partial = partial or bool(r2.get("partial"))
 
                 if mode != "hybrid":
                     emitter.emit(
@@ -710,7 +757,8 @@ def _build_graph(
                             "payload": {"query": search_query, "retrieval_mode": "hybrid", "top_k": top_k, "rerank": rerank},
                         }
                     )
-                    alt = gate.chat(
+                    alt = await gate.chat(
+                        client,
                         search_query,
                         history=history,
                         retrieval_mode="hybrid",
@@ -722,9 +770,8 @@ def _build_graph(
                     responses.append(alt)
                     degraded.update(alt.get("degraded") or [])
                     partial = partial or bool(alt.get("partial"))
-                for alt_mode in ("bm25", "vector"):
-                    if alt_mode == mode:
-                        continue
+                alt_modes = [m for m in ("bm25", "vector") if m != mode]
+                for alt_mode in alt_modes:
                     emitter.emit(
                         {
                             "type": "trace",
@@ -733,25 +780,32 @@ def _build_graph(
                             "payload": {"query": search_query, "retrieval_mode": alt_mode, "top_k": top_k, "rerank": rerank},
                         }
                     )
-                    DEEP_GATE_CALLS.inc()
-                    alt = gate.chat(
-                        search_query,
-                        history=history,
-                        retrieval_mode=alt_mode,
-                        top_k=top_k,
-                        rerank=rerank,
-                        filters=filters,
-                        include_sources=include_sources,
-                    )
-                    responses.append(alt)
-                    degraded.update(alt.get("degraded") or [])
-                    partial = partial or bool(alt.get("partial"))
+                if alt_modes:
+                    alt_tasks = [
+                        gate.chat(
+                            client,
+                            search_query,
+                            history=history,
+                            retrieval_mode=alt_mode,
+                            top_k=top_k,
+                            rerank=rerank,
+                            filters=filters,
+                            include_sources=include_sources,
+                        )
+                        for alt_mode in alt_modes
+                    ]
+                    alt_results = await asyncio.gather(*alt_tasks)
+                    for alt in alt_results:
+                        DEEP_GATE_CALLS.inc()
+                        responses.append(alt)
+                        degraded.update(alt.get("degraded") or [])
+                        partial = partial or bool(alt.get("partial"))
 
                 hits = merge_hits(responses, cap=max(12, top_k))
                 context_chunks = context_from_hits(hits, context_chunks)
 
                 if not hits:
-                    keyword_qs = _keyword_queries(llm, q)
+                    keyword_qs = await _keyword_queries_async(llm, q)
                     for kw in keyword_qs:
                         emitter.emit(
                             {
@@ -761,17 +815,24 @@ def _build_graph(
                                 "payload": {"query": kw, "retrieval_mode": mode, "top_k": max(4, top_k // 2), "rerank": rerank},
                             }
                         )
-                        DEEP_GATE_CALLS.inc()
-                        r3 = gate.chat(
-                            kw,
-                            history=history,
-                            retrieval_mode=mode,
-                            top_k=max(4, top_k // 2),
-                            rerank=rerank,
-                            filters=filters,
-                            include_sources=include_sources,
-                        )
-                        responses.append(r3)
+                    if keyword_qs:
+                        kw_tasks = [
+                            gate.chat(
+                                client,
+                                kw,
+                                history=history,
+                                retrieval_mode=mode,
+                                top_k=max(4, top_k // 2),
+                                rerank=rerank,
+                                filters=filters,
+                                include_sources=include_sources,
+                            )
+                            for kw in keyword_qs
+                        ]
+                        kw_results = await asyncio.gather(*kw_tasks)
+                        for r3 in kw_results:
+                            DEEP_GATE_CALLS.inc()
+                            responses.append(r3)
                     hits = merge_hits(responses, cap=max(12, top_k))
                     context_chunks = context_from_hits(hits, context_chunks)
 
@@ -785,7 +846,7 @@ def _build_graph(
                 web_timeout = float(state.get("web_search_timeout_s") or _env_get("WEB_SEARCH_TIMEOUT_S", "15"))
                 if web_query:
                     emitter.emit({"type": "trace", "kind": "tool", "name": "web.search", "payload": {"query": web_query, "provider": web_provider, "num": web_num}})
-                web_hits = web_search_sync(web_query, provider=web_provider, api_key=web_key, num=web_num, timeout_s=web_timeout)
+                web_hits = await web_search_async(web_query, provider=web_provider, api_key=web_key, num=web_num, timeout_s=web_timeout)
                 if web_hits:
                     responses.append({"hits": web_hits})
                     hits = merge_hits(responses, cap=max(16, top_k + len(web_hits)))
@@ -843,9 +904,9 @@ def _build_graph(
         )
 
         try:
-            step_out = llm.with_structured_output(ResearchStepOutput).invoke(prompt)
+            step_out = await llm.with_structured_output(ResearchStepOutput).ainvoke(prompt)
             if step_out is None:
-                raw = llm.invoke(prompt).content
+                raw = (await llm.ainvoke(prompt)).content
                 logger.warning("research.raw_fallback", extra={"iteration": iteration, "chars": len(str(raw))})
                 data = _safe_json(str(raw))
                 notes = list(data.get("distilled_notes") or [])
@@ -897,7 +958,7 @@ def _build_graph(
             return "write"
         return "research"
 
-    def write_node(state: dict[str, Any]) -> dict[str, Any]:
+    async def write_node(state: dict[str, Any]) -> dict[str, Any]:
         t0 = time.perf_counter()
         iteration = int(state.get("iteration") or 0)
         max_iters = int(state.get("max_iterations") or 0)
@@ -950,7 +1011,7 @@ def _build_graph(
             f"- Follow this template:\n{template}\n"
         )
         report_parts: list[str] = []
-        for chunk in llm.stream(prompt):
+        async for chunk in llm.astream(prompt):
             content = chunk.content if hasattr(chunk, "content") else str(chunk)
             if content:
                 emitter.emit({"type": "token", "content": content})
@@ -990,14 +1051,17 @@ def _build_graph(
     return compiled
 
 
-def _run_graph(payload: DeepResearchRequest, event_queue: queue.Queue[object]) -> ResearchState:
+async def _run_graph_async(
+    payload: DeepResearchRequest,
+    event_queue: asyncio.Queue[object],
+) -> dict[str, Any]:
     emitter = EventEmitter(event_queue)
     template = os.environ.get("DEEP_RESEARCH_TEMPLATE", DEFAULT_REPORT_TEMPLATE)
     llm = _build_llm()
 
     mcp_config = _load_mcp_config()
     gate_timeout = float(_env_get("DEEP_GATE_TIMEOUT_S", "60"))
-    gate = SyncGateClient(mcp_config.base_url, timeout_s=gate_timeout)
+    gate = AsyncGateClient(mcp_config.base_url, timeout_s=gate_timeout)
     logger.info(
         "graph.init gate_url=%s max_iterations=%s include_sources=%s question=%s",
         mcp_config.base_url,
@@ -1059,26 +1123,27 @@ def _run_graph(payload: DeepResearchRequest, event_queue: queue.Queue[object]) -
     }
 
     logger.info("graph.build.start initial_queries=%s", initial_state.get("queries"))
-    graph = _build_graph(llm, gate, emitter, template)
-    logger.info("graph.build.done")
-    emitter.emit(
-        {
-            "type": "progress",
-            "stage": "compiled",
-            "iteration": 0,
-            "max_iterations": payload.max_iterations,
-            "percent": 0.03,
-            "message": "Graph compiled",
-        }
-    )
-    try:
-        logger.info("graph.invoke.start")
-        result = graph.invoke(initial_state)
-        logger.info("graph.invoke.done")
-        logger.info("graph.done", extra={"iteration": result.get("iteration", 0)})
-        return result
-    finally:
-        event_queue.put(SENTINEL)
+    async with httpx.AsyncClient() as client:
+        graph = _build_graph(llm, gate, client, emitter, template)
+        logger.info("graph.build.done")
+        emitter.emit(
+            {
+                "type": "progress",
+                "stage": "compiled",
+                "iteration": 0,
+                "max_iterations": payload.max_iterations,
+                "percent": 0.03,
+                "message": "Graph compiled",
+            }
+        )
+        try:
+            logger.info("graph.ainvoke.start")
+            result = await graph.ainvoke(initial_state)
+            logger.info("graph.ainvoke.done")
+            logger.info("graph.done", extra={"iteration": result.get("iteration", 0)})
+            return result
+        finally:
+            event_queue.put_nowait(SENTINEL)
 
 
 app = FastAPI(
@@ -1108,14 +1173,14 @@ async def deep_research_stream(request: Request, payload: DeepResearchRequest) -
     if not (payload.query or "").strip():
         raise HTTPException(status_code=400, detail="query is required")
     async def event_stream() -> AsyncIterator[str]:
-        event_queue: queue.Queue[object] = queue.Queue()
+        event_queue: asyncio.Queue[object] = asyncio.Queue()
         logger.info("stream.open")
-        task = asyncio.create_task(asyncio.to_thread(_run_graph, payload, event_queue))
+        task = asyncio.create_task(_run_graph_async(payload, event_queue))
 
         while True:
             try:
-                event = await asyncio.to_thread(event_queue.get, True, 1.0)
-            except queue.Empty:
+                event = await asyncio.wait_for(event_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
                 if await request.is_disconnected():
                     logger.info("stream.client_disconnected")
                     task.cancel()

@@ -104,7 +104,7 @@ The system consists of **8 microservices** organized into application, ML, and i
 - **document-storage** (`:8081`) - Stores document bytes (S3-compatible) and metadata (Postgres)
 - **doc-processor** (`:8082`) - Async worker for document extraction, chunking, and indexing
 - **agent-search** (`:8093`, profile `agent-search`) - LLM-driven search: plan, HyDE, fact queries, retry
-- **deep-research** (`:8094`, profile `agent-search`) - Iterative research (LangGraph)
+- **deep-research** (`:8094`, profile `agent-search`) - Iterative research (LangGraph). Async Gate client, parallel fact/alt-mode calls, cancellation on disconnect.
 - **ui** (`:3300`) - Nginx-served SPA with SSE streaming support
 
 #### ML/Embedding Services
@@ -156,9 +156,9 @@ Two LLM-driven services extend RAG with intelligent query planning and iterative
 | Service | Port | Description |
 |---------|------|-------------|
 | **agent-search** | 8093 | Plan → Gate.chat → quality check → fact queries → answer (with optional web search) |
-| **deep-research** | 8094 | LangGraph: plan → scope → research loop → streaming report (with optional web search) |
+| **deep-research** | 8094 | LangGraph: plan → scope → research loop → streaming report. Async Gate, parallel calls, cancellation on disconnect. |
 
-**Features:** Web search (Serper/Tavily), citation [1][2], per-request limits (`max_llm_calls`, `max_fact_queries`), feature flags (`use_hyde`, `use_fact_queries`, `use_retry`), Prometheus metrics.
+**Features:** Web search (Serper/Tavily), citation [1][2], per-request limits (`max_llm_calls`, `max_fact_queries`), feature flags (`use_hyde`, `use_fact_queries`, `use_retry`), mode presets (`minimal`/`conservative`/`aggressive`), Prometheus metrics. Deep-research uses async Gate client and parallelizes fact queries and alt-mode retrieval.
 
 See **[docs/AGENT_SEARCH_AND_DEEP_RESEARCH.md](./docs/AGENT_SEARCH_AND_DEEP_RESEARCH.md)** for API reference, parameters, and configuration.
 
@@ -336,10 +336,13 @@ docker compose --profile agent-search up -d
 # 2. Full verification: retrieval, gate, agent-search, deep-research
 python scripts/verify_agent_queries.py
 
-# 3. Smoke test (retrieval)
+# 3. Async concurrency test (parallel deep-research + agent, cancellation)
+python scripts/test_async_concurrent.py
+
+# 4. Smoke test (retrieval)
 python scripts/smoke_test.py
 
-# 4. Pipeline e2e (upload → chat → delete)
+# 5. Pipeline e2e (upload → chat → delete)
 docker build -t rugfunsota-pipeline-tests -f pipeline-tests/Dockerfile pipeline-tests/
 docker run --rm --network rugfunsota_rag-network \
   -e GATE_BASE_URL=http://rag-gate:8090 \

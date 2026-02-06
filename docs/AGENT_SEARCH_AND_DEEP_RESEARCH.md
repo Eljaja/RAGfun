@@ -7,7 +7,7 @@ LLM-driven retrieval services that extend the RAG stack with intelligent query p
 | Service        | Port | Description                                                                 |
 |----------------|------|-----------------------------------------------------------------------------|
 | **agent-search**  | 8093 | LLM-driven search: plan → Gate.chat → quality check → fact queries → answer |
-| **deep-research** | 8094 | Iterative research: LangGraph (plan → scope → research loop → write)        |
+| **deep-research** | 8094 | Iterative research: LangGraph (plan → scope → research loop → write). Async Gate + parallel calls. |
 
 Both services run on top of the Gate API and support **web search** (Serper/Tavily) for queries requiring current events or external knowledge.
 
