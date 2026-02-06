@@ -5,3 +5,4 @@ httpx==0.28.1
 orjson==3.10.12
 python-json-logger==3.2.0
 tenacity==9.0.0
+prometheus-client==0.21.1

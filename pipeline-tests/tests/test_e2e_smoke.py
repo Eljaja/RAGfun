@@ -54,22 +54,27 @@ def test_e2e_upload_chat_status_delete():
 
     with httpx.Client(timeout=60.0) as c:
         r = c.post(f"{GATE_BASE_URL}/v1/documents/upload", files=files, data=data)
-        assert r.status_code == 200, r.text
+        assert r.status_code in (200, 202), r.text
         j = r.json()
         assert j.get("ok") is True, j
         # storage is best-effort; in our e2e compose it must succeed
         assert j.get("storage") and j["storage"].get("ok") is True, j
-        assert j.get("result") and j["result"].get("ok") in (True, False), j
+        # 200: legacy path has result; 202: async path has accepted, no result
+        if r.status_code == 200:
+            assert j.get("result") and j["result"].get("ok") in (True, False), j
 
-        # status
-        s = c.get(f"{GATE_BASE_URL}/v1/documents/{doc_id}/status")
-        assert s.status_code == 200, s.text
-        sj = s.json()
-        assert sj.get("ok") is True, sj
-        assert sj.get("stored") is True, sj
-        # Indexing is async-ish but should be ready quickly for small docs
-        # (if it flakes, we still catch it as a pipeline bottleneck).
-        assert sj.get("indexed") is True, sj
+        # status (poll for indexed when upload returned 202 - async ingestion)
+        for _ in range(60):
+            s = c.get(f"{GATE_BASE_URL}/v1/documents/{doc_id}/status")
+            assert s.status_code == 200, s.text
+            sj = s.json()
+            assert sj.get("ok") is True, sj
+            assert sj.get("stored") is True, sj
+            if sj.get("indexed") is True:
+                break
+            time.sleep(1)
+        else:
+            assert sj.get("indexed") is True, sj
 
         # chat
         payload = {
@@ -91,9 +96,9 @@ def test_e2e_upload_chat_status_delete():
         # With include_sources=true, gate enforces citations best-effort.
         assert "[" in (cj.get("answer") or ""), cj.get("answer")
 
-        # delete
+        # delete (200 = sync, 202 = async)
         dr = c.delete(f"{GATE_BASE_URL}/v1/documents/{doc_id}")
-        assert dr.status_code == 200, dr.text
+        assert dr.status_code in (200, 202), dr.text
         dj = dr.json()
         assert dj.get("doc_id") == doc_id, dj
 

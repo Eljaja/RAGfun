@@ -1,3 +1,11 @@
+"""
+Deep-research service: LangGraph-based iterative research with structured report.
+
+Flow: plan → scope (plan + queries) → research loop (batch Gate calls, distilled notes,
+next_queries) → early stop on min gain → write (streaming report).
+Scope/research fallback: empty queries → use question.
+Endpoint: POST /v1/deep-research/stream (SSE).
+"""
 from __future__ import annotations
 
 import asyncio
@@ -18,6 +26,9 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
 
 from agent_common import (
+    DEEP_FACT_QUERIES,
+    DEEP_HYDE,
+    DEEP_KEYWORD_QUERIES,
     SyncGateClient,
     build_context,
     context_from_hits,
@@ -78,6 +89,7 @@ class ResearchState(TypedDict):
     top_k: int
     rerank: bool
     plan_reason: str
+    history: List[Dict[str, str]] | None
 
 
 class ScopeOutput(BaseModel):
@@ -215,31 +227,35 @@ def _plan_retrieval(llm, question: str) -> dict[str, Any]:
     }
 
 
+def _infer_query_lang(query: str) -> str:
+    """Heuristic: infer language from script for HyDE generation."""
+    q = (query or "").strip()
+    if not q:
+        return "English"
+    # Cyrillic (Russian, Ukrainian, etc.)
+    if any("\u0400" <= c <= "\u04FF" for c in q):
+        return "Russian"
+    # CJK
+    if any("\u4E00" <= c <= "\u9FFF" or "\u3040" <= c <= "\u30FF" for c in q):
+        return "the same language as the query"
+    return "English"
+
+
 def _make_hyde(llm, query: str) -> str:
-    prompt = (
-        "Write a short hypothetical answer passage for retrieval. English only.\n"
-        f"Query: {query}\nReturn a 3-5 sentence passage."
-    )
+    lang = _infer_query_lang(query)
+    prompt = DEEP_HYDE.format(query=query, lang=lang)
     return _llm_text(llm, prompt)
 
 
 def _fact_queries(llm, query: str) -> list[str]:
-    prompt = (
-        "Extract fact-oriented sub-queries. Return JSON only.\n"
-        f"Query: {query}\n"
-        "Return JSON: {\"fact_queries\": [..]} with 2-3 short queries."
-    )
+    prompt = DEEP_FACT_QUERIES.format(query=query)
     data = _llm_json(llm, prompt)
     out = data.get("fact_queries") or []
     return [str(q).strip() for q in out if str(q).strip()]
 
 
 def _keyword_queries(llm, query: str) -> list[str]:
-    prompt = (
-        "Extract short keyword queries. Return JSON only.\n"
-        f"Query: {query}\n"
-        "Return JSON: {\"keywords\": [..]} with 3-6 short keyword phrases."
-    )
+    prompt = DEEP_KEYWORD_QUERIES.format(query=query)
     data = _llm_json(llm, prompt)
     out = data.get("keywords") or []
     return [str(q).strip() for q in out if str(q).strip()]
@@ -482,16 +498,19 @@ def _build_graph(
             logger.exception("scope.failed")
             plan = []
             queries = []
-        question = state.get("question") or ""
+        question = (state.get("question") or "").strip()
         if not plan:
             plan = _default_plan(question)
         if not queries:
             queries = [question] if question else []
+        queries = _dedupe_queries(queries, cap=12)
+        if not queries and question:
+            queries = [question]
         logger.info("scope.queries=%s", queries)
         logger.info("scope.done", extra={"plan_items": len(plan), "queries": len(queries)})
         return {
             "plan": plan,
-            "queries": _dedupe_queries(queries, cap=12),
+            "queries": queries,
             "notes": [],
             "sources": [],
             "context": [],
@@ -509,12 +528,14 @@ def _build_graph(
         )
         logger.info("research.start", extra={"iteration": iteration, "remaining": len(state.get("queries", []))})
         batch_size = int(_env_get("DEEP_RESEARCH_BATCH", "5"))
-        queries_list = list(state.get("queries") or [])
-        if not queries_list:
-            question = state.get("question") or ""
-            if question:
-                queries_list = [question]
-                logger.warning("research.fallback_queries=%s", queries_list)
+        question = (state.get("question") or "").strip()
+        # Explicit fallback: filter empty, fallback to question when scope/merge yields empty queries
+        queries_list = [q for q in (state.get("queries") or []) if q and str(q).strip()]
+        if not queries_list and question:
+            queries_list = [question]
+            logger.warning("research.fallback_queries from question", extra={"question": question[:80]})
+        elif not queries_list:
+            logger.error("research.no_queries_no_question")
         batch = list(queries_list[:batch_size])
         remaining = list(queries_list[batch_size:])
         logger.info("research.batch=%s", batch)
@@ -568,8 +589,10 @@ def _build_graph(
                     },
                 }
             )
+            history = state.get("history") or []
             primary = gate.chat(
                 search_query,
+                history=history,
                 retrieval_mode=mode,
                 top_k=top_k,
                 rerank=rerank,
@@ -611,6 +634,7 @@ def _build_graph(
                     )
                     r2 = gate.chat(
                         fq,
+                        history=history,
                         retrieval_mode=mode,
                         top_k=max(4, top_k // 2),
                         rerank=rerank,
@@ -632,6 +656,7 @@ def _build_graph(
                     )
                     alt = gate.chat(
                         search_query,
+                        history=history,
                         retrieval_mode="hybrid",
                         top_k=top_k,
                         rerank=rerank,
@@ -654,6 +679,7 @@ def _build_graph(
                     )
                     alt = gate.chat(
                         search_query,
+                        history=history,
                         retrieval_mode=alt_mode,
                         top_k=top_k,
                         rerank=rerank,
@@ -680,6 +706,7 @@ def _build_graph(
                         )
                         r3 = gate.chat(
                             kw,
+                            history=history,
                             retrieval_mode=mode,
                             top_k=max(4, top_k // 2),
                             rerank=rerank,
@@ -769,18 +796,28 @@ def _build_graph(
                 "sources": len(merged_sources),
             },
         )
+        notes_added = len(notes)
+        sources_added = len(new_sources)
         return {
             "iteration": iteration,
             "sources": merged_sources,
             "context": merged_context,
             "notes": state.get("notes", []) + notes,
             "queries": merged_queries,
+            "notes_added": notes_added,
+            "sources_added": sources_added,
         }
 
     def should_continue(state: dict[str, Any]) -> str:
         if int(state.get("iteration") or 0) >= int(state.get("max_iterations") or 0):
             return "write"
         if not state.get("queries"):
+            return "write"
+        min_gain = int(_env_get("DEEP_EARLY_STOP_MIN_GAIN", "2"))
+        notes_added = int(state.get("notes_added") or 0)
+        sources_added = int(state.get("sources_added") or 0)
+        if notes_added < min_gain and sources_added < min_gain and int(state.get("iteration") or 0) > 0:
+            logger.info("early_stop", extra={"notes_added": notes_added, "sources_added": sources_added})
             return "write"
         return "research"
 
@@ -834,9 +871,13 @@ def _build_graph(
             "- Call out uncertainties explicitly.\n"
             f"- Follow this template:\n{template}\n"
         )
-        result = llm.invoke(prompt)
-        report = result.content if hasattr(result, "content") else str(result)
-        report = report.strip()
+        report_parts: list[str] = []
+        for chunk in llm.stream(prompt):
+            content = chunk.content if hasattr(chunk, "content") else str(chunk)
+            if content:
+                emitter.emit({"type": "token", "content": content})
+                report_parts.append(content)
+        report = "".join(report_parts).strip()
         if source_lines:
             report += "\n\nSources:\n" + "\n".join(f"- {s}" for s in source_lines[:50])
         logger.info("write.done", extra={"report_chars": len(report)})
@@ -923,6 +964,7 @@ def _run_graph(payload: DeepResearchRequest, event_queue: queue.Queue[object]) -
         "rerank": rerank,
         "use_hyde": False,
         "plan_reason": "",
+        "history": list(payload.history) if payload.history else [],
     }
 
     logger.info("graph.build.start initial_queries=%s", initial_state.get("queries"))
@@ -946,12 +988,6 @@ def _run_graph(payload: DeepResearchRequest, event_queue: queue.Queue[object]) -
         return result
     finally:
         event_queue.put(SENTINEL)
-
-
-def _stream_text(text: str, chunk_size: int = 64) -> list[str]:
-    if not text:
-        return []
-    return [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
 
 
 app = FastAPI(title="Deep Research", version="0.1.0")
@@ -986,9 +1022,6 @@ async def deep_research_stream(payload: DeepResearchRequest) -> StreamingRespons
             return
 
         report = state.get("report") or ""
-        for chunk in _stream_text(report):
-            yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
-
         yield f"data: {json.dumps({'type': 'progress', 'stage': 'done', 'iteration': state.get('iteration', 0), 'max_iterations': state.get('max_iterations', 0), 'percent': 1.0, 'message': 'Done'})}\n\n"
 
         done_event = {

@@ -9,6 +9,7 @@ This repository implements a full-featured RAG system with:
 - **Hybrid Retrieval**: Combines BM25 (sparse) and dense vector search with Reciprocal Rank Fusion (RRF)
 - **VLM-Powered Document Processing**: Uses Vision-Language Models (Granite-Docling) for accurate document-to-text extraction
 - **Stateless Microservices**: Horizontally scalable services with clear separation of concerns
+- **Agent-Search & Deep-Research**: LLM-driven retrieval (plan, HyDE, fact queries, retry) and iterative research (LangGraph)
 - **Advanced Features**: Multi-query expansion, two-pass retrieval, reranking, segment stitching, auto-tuning
 - **Full Observability**: Prometheus metrics, Grafana dashboards, structured logging
 - **Async Processing**: RabbitMQ-based ingestion pipeline with retry/DLQ
@@ -50,6 +51,10 @@ The default `docker-compose.yml` includes the Infinity embeddings service (BAAI/
 3. **Start all services:**
    ```bash
    docker compose up -d --build
+   ```
+   With agent-search and deep-research (profile `agent-search`):
+   ```bash
+   docker compose --profile agent-search up -d --build
    ```
 
 4. **Wait for services to be ready** (typically 2-3 minutes):
@@ -94,10 +99,12 @@ curl -X POST http://localhost:8090/v1/chat \
 The system consists of **8 microservices** organized into application, ML, and infrastructure layers:
 
 #### Application Services
-- **rag-gate** (`:8090`) - FastAPI gateway; orchestrates uploads, chat, and streaming responses
-- **retrieval** (`:8080`) - Hybrid search engine (BM25 + vectors); stateless and horizontally scalable
+- **rag-gate** (`:8090`, rugfunsota: `:8092`) - FastAPI gateway; orchestrates uploads, chat, and streaming responses
+- **retrieval** (`:8080`, rugfunsota: `:8085`) - Hybrid search engine (BM25 + vectors); stateless and horizontally scalable
 - **document-storage** (`:8081`) - Stores document bytes (S3-compatible) and metadata (Postgres)
 - **doc-processor** (`:8082`) - Async worker for document extraction, chunking, and indexing
+- **agent-search** (`:8093`, profile `agent-search`) - LLM-driven search: plan, HyDE, fact queries, retry
+- **deep-research** (`:8094`, profile `agent-search`) - Iterative research (LangGraph)
 - **ui** (`:3300`) - Nginx-served SPA with SSE streaming support
 
 #### ML/Embedding Services
@@ -141,6 +148,26 @@ The system consists of **8 microservices** organized into application, ML, and i
 - **Streaming Chat**: Server-Sent Events (SSE) for real-time responses
 - **Auto-Tuning**: Optional LLM-based parameter optimization via router
 - **Full Observability**: Prometheus metrics, Grafana dashboards, structured logs
+
+### Agent & Deep Research
+
+Two agent services run on top of Gate (profile `agent-search`):
+
+| Service | Port | Description |
+|---------|------|-------------|
+| **agent-search** | 8093 | LLM-driven search: plan (mode/top_k/rerank/HyDE) → Gate.chat → quality check → fact queries on poor quality → answer → assess → retry if incomplete |
+| **deep-research** | 8094 | Iterative research: LangGraph (plan → scope → research loop → write), structured report with streaming |
+
+**agent-search flow:** plan → HyDE (optional) → Gate.chat → quality check → fact_queries (when poor quality or `AGENT_ALWAYS_FACT_QUERIES=true`) → answer → assess → retry if incomplete.
+
+**deep-research flow:** scope (plan + queries) → research loop (batch Gate calls, distilled notes, next_queries) → early stop on min gain → write (streaming report).
+
+**Features:**
+- Scope fallback: empty queries → use question
+- Citation [1], [2] in answer, sources with `ref`
+- Non-streaming `POST /v1/agent` (JSON)
+- Max LLM calls (`AGENT_MAX_LLM_CALLS=12`), request timeout (`AGENT_REQUEST_TIMEOUT_S=120`)
+- Parallel gate calls, history in prompts, Prometheus metrics, Grafana dashboards
 
 ## Current Direction
 
@@ -200,9 +227,8 @@ python -m app.main
 
 ### Testing
 
-**BRIGHT benchmark** — см. [docs/BRIGHT_VALIDATION.md](docs/BRIGHT_VALIDATION.md):
+**BRIGHT benchmark:**
 ```bash
-# Внешний скрипт run_bright_validation.sh
 /home/ubuntu/run_bright_validation.sh --stack rugfunsota --domain biology --limit 50
 ```
 
@@ -304,6 +330,55 @@ Content-Type: application/json
 }
 ```
 
+### Agent-Search (port 8093)
+
+**Streaming (SSE):**
+```bash
+curl -X POST http://localhost:8093/v1/agent/stream \
+  -H "Content-Type: application/json" \
+  -d '{"query": "What is RAG?", "include_sources": true, "filters": {"project_id": "agent_test"}}'
+```
+
+**Non-streaming (JSON):**
+```bash
+curl -X POST http://localhost:8093/v1/agent \
+  -H "Content-Type: application/json" \
+  -d '{"query": "What is FastAPI?", "include_sources": true, "filters": {"project_id": "tech_docs"}}'
+# Response: {"answer": "...", "sources": [...], "context": [...], "mode": "hybrid", "partial": false, "degraded": []}
+```
+
+### Deep-Research (port 8094)
+
+**Streaming (SSE):**
+```bash
+curl -X POST http://localhost:8094/v1/deep-research/stream \
+  -H "Content-Type: application/json" \
+  -d '{"query": "What is RAG?", "filters": {"project_id": "agent_test"}, "max_iterations": 2}'
+```
+
+### Verifying Agent Services
+
+```bash
+# 1. Start services (if not already running)
+docker compose --profile agent-search up -d
+
+# 2. Full verification: retrieval, gate, agent-search, deep-research
+python scripts/verify_agent_queries.py
+
+# 3. Smoke test (retrieval)
+python scripts/smoke_test.py
+
+# 4. Pipeline e2e (upload → chat → delete)
+docker build -t rugfunsota-pipeline-tests -f pipeline-tests/Dockerfile pipeline-tests/
+docker run --rm --network rugfunsota_rag-network \
+  -e GATE_BASE_URL=http://rag-gate:8090 \
+  -e RETRIEVAL_BASE_URL=http://retrieval:8080 \
+  -e STORAGE_BASE_URL=http://document-storage:8081 \
+  rugfunsota-pipeline-tests:latest
+```
+
+**Note:** Prometheus and Grafana must be in the same compose project as agent-search (rugfunsota) for metrics scrape to work.
+
 ## Configuration
 
 ### Environment Variables
@@ -333,6 +408,18 @@ ENABLE_TWO_PASS=false
 ENABLE_SEGMENT_STITCHING=true
 ENABLE_ROUTER=false
 
+# Agent-Search (port 8093)
+AGENT_MAX_LLM_CALLS=12
+AGENT_REQUEST_TIMEOUT_S=120
+AGENT_QUALITY_MIN_HITS=3
+AGENT_QUALITY_MIN_SCORE=0.15
+AGENT_ALWAYS_FACT_QUERIES=false
+
+# Deep-Research (port 8094)
+DEEP_MAX_ITERATIONS=6
+DEEP_EARLY_STOP_MIN_GAIN=2
+DEEP_RESEARCH_BATCH=5
+
 # Worker Configuration
 WORKER_CONCURRENCY=1
 DOCLING_TIMEOUT=300
@@ -355,10 +442,8 @@ Services that scale horizontally:
 
 ## Documentation
 
-- **[RUN_RUGFUNSOTA.md](./RUN_RUGFUNSOTA.md)** — Запуск rugfunsota (SOTA-стек)
-- **[docs/RAG_DIFF_OUR_VS_OLD.md](./docs/RAG_DIFF_OUR_VS_OLD.md)** — Отличия SOTA от baseline
-- **[docs/BRIGHT_VALIDATION.md](./docs/BRIGHT_VALIDATION.md)** — Валидация на BRIGHT
-- **[docs/INGESTION_FLOW.md](./docs/INGESTION_FLOW.md)** — Полный пайплайн индексации
+- **[RUN_RUGFUNSOTA.md](./RUN_RUGFUNSOTA.md)** — Rugfunsota stack setup
+- **[docs/ENDPOINTS_EXAMPLES.md](./docs/ENDPOINTS_EXAMPLES.md)** — API examples
 - **[docs/gate/GATE_API.md](./docs/gate/GATE_API.md)** — API Gate
 
 ## Technology Stack
@@ -399,7 +484,7 @@ Services that scale horizontally:
 2. Check timeout settings: `DOCLING_TIMEOUT`
 3. Monitor vLLM service health: `curl http://localhost:8123/health`
 
-Для rugfunsota см. [RUN_RUGFUNSOTA.md](./RUN_RUGFUNSOTA.md).
+For rugfunsota see [RUN_RUGFUNSOTA.md](./RUN_RUGFUNSOTA.md).
 
 ## Status
 
