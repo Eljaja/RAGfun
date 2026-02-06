@@ -91,18 +91,37 @@ class GateFilters(BaseModel):
 
 
 class AgentRequest(BaseModel):
-    query: str
-    history: list[dict[str, str]] = Field(default_factory=list)
-    filters: GateFilters | None = None
-    include_sources: bool = True
-    use_web_search: bool | None = None
-    web_search_num: int | None = None
-    web_search_timeout_s: float | None = None
-    max_llm_calls: int | None = None
-    max_fact_queries: int | None = None
+    """Request body for agent search (plan → Gate → quality check → fact queries → answer)."""
+
+    query: str = Field(..., description="User question")
+    history: list[dict[str, str]] = Field(default_factory=list, description="Conversation history (role, content)")
+    filters: GateFilters | None = Field(None, description="Gate filters")
+    include_sources: bool = Field(True, description="Include sources in response")
+    use_web_search: bool | None = Field(None, description="Enable web search (override env)")
+    web_search_num: int | None = Field(None, description="Max web search results")
+    web_search_timeout_s: float | None = Field(None, description="Web search timeout")
+    max_llm_calls: int | None = Field(None, description="Max LLM calls per request")
+    max_fact_queries: int | None = Field(None, description="Max fact queries per request")
+    use_hyde: bool | None = Field(None, description="Enable HyDE (override env)")
+    use_fact_queries: bool | None = Field(None, description="Enable fact queries (override env)")
+    use_retry: bool | None = Field(None, description="Enable retry on incomplete (override env)")
+    mode: str | None = Field(None, description="Preset: minimal | conservative | aggressive")
 
 
-app = FastAPI(title="Agent Search", version="0.1.0")
+AGENT_MODE_PRESETS = {
+    "minimal": {"use_hyde": False, "use_fact_queries": False, "use_retry": False, "max_llm_calls": 4, "max_fact_queries": 0},
+    "conservative": {"use_hyde": False, "use_fact_queries": False, "use_retry": False, "max_llm_calls": 6, "max_fact_queries": 0},
+    "aggressive": {"use_hyde": True, "use_fact_queries": True, "use_retry": True, "max_llm_calls": 16, "max_fact_queries": 4},
+}
+
+
+app = FastAPI(
+    title="Agent Search",
+    version="0.1.0",
+    description="LLM-driven retrieval: plan → Gate.chat → quality check → fact queries → answer. Supports web search, feature flags, and mode presets.",
+    openapi_url="/v1/openapi.json",
+    docs_url="/v1/docs",
+)
 
 
 def _env_get(key: str, default: str) -> str:
@@ -354,13 +373,22 @@ def _with_trace_id(event: dict[str, Any], trace_id: str) -> dict[str, Any]:
 
 
 async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncIterator[dict[str, Any]]:
+    # Apply mode preset (conservative/aggressive/minimal) — explicit payload fields override
+    preset = AGENT_MODE_PRESETS.get((payload.mode or "").lower()) if payload.mode else {}
+    max_llm_calls = payload.max_llm_calls if payload.max_llm_calls is not None else preset.get("max_llm_calls")
+    max_llm_calls = max_llm_calls if max_llm_calls is not None else int(_env_get("AGENT_MAX_LLM_CALLS", "12"))
+    use_hyde_payload = payload.use_hyde if payload.use_hyde is not None else preset.get("use_hyde")
+    use_fact_queries_payload = payload.use_fact_queries if payload.use_fact_queries is not None else preset.get("use_fact_queries")
+    use_retry_payload = payload.use_retry if payload.use_retry is not None else preset.get("use_retry")
+    max_fact_queries = payload.max_fact_queries if payload.max_fact_queries is not None else preset.get("max_fact_queries")
+    max_fact_queries = max_fact_queries if max_fact_queries is not None else int(_env_get("AGENT_MAX_FACT_QUERIES", "2"))
+
     gate_url = _env_get("AGENT_GATE_URL", _env_get("GATE_URL", "http://rag-gate:8090"))
     llm_base = _env_get("AGENT_LLM_BASE_URL", _env_get("GATE_LLM_BASE_URL", "http://localhost:8000/v1"))
     llm_model = _env_get("AGENT_LLM_MODEL", _env_get("GATE_LLM_MODEL", "gpt-4o-mini"))
     llm_key = os.environ.get("AGENT_LLM_API_KEY") or os.environ.get("GATE_LLM_API_KEY")
     llm_timeout = float(_env_get("AGENT_LLM_TIMEOUT_S", "60"))
     gate_timeout = float(_env_get("AGENT_GATE_TIMEOUT_S", "60"))
-    max_llm_calls = payload.max_llm_calls if payload.max_llm_calls is not None else int(_env_get("AGENT_MAX_LLM_CALLS", "12"))
     llm_calls = [0]
 
     def _can_llm() -> bool:
@@ -382,7 +410,15 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
     mode = str(plan.get("retrieval_mode") or "hybrid")
     top_k = int(plan.get("top_k") or 8)
     rerank = bool(plan.get("rerank") if plan.get("rerank") is not None else True)
-    use_hyde = bool(plan.get("use_hyde") or False)
+    use_hyde_plan = bool(plan.get("use_hyde") or False)
+    if use_hyde_payload is not None:
+        use_hyde = use_hyde_payload
+    elif _env_get("AGENT_USE_HYDE", "").lower() in ("1", "true", "yes"):
+        use_hyde = True
+    elif _env_get("AGENT_USE_HYDE", "").lower() in ("0", "false", "no"):
+        use_hyde = False
+    else:
+        use_hyde = use_hyde_plan
     use_web_search = bool(plan.get("use_web_search") or False)
     reason = str(plan.get("reason") or "no_reason")
 
@@ -441,22 +477,25 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
     min_hits = int(_env_get("AGENT_QUALITY_MIN_HITS", "3"))
     min_score = float(_env_get("AGENT_QUALITY_MIN_SCORE", "0.15"))
     always_fact = _env_get("AGENT_ALWAYS_FACT_QUERIES", "false").lower() in ("1", "true", "yes")
+    use_fact_env = _env_get("AGENT_USE_FACT_QUERIES", "true").lower() not in ("0", "false", "no")
+    if use_fact_queries_payload is False:
+        run_fact = False
+    elif use_fact_queries_payload is True:
+        run_fact = use_fact_env and _can_llm() and not web_enabled
+    else:
+        run_fact = use_fact_env and (quality_is_poor(primary, min_hits=min_hits, min_score=min_score) or always_fact) and _can_llm() and not web_enabled
     responses = [primary]
     hits = list(primary.get("hits") or [])
     context_chunks = list(primary.get("context") or [])
     degraded = set(primary.get("degraded") or [])
     partial = bool(primary.get("partial"))
-
-    # Skip fact_queries when web search is enabled — web will supplement; avoids extra LLM/gate calls (rate limits)
-    run_fact = (quality_is_poor(primary, min_hits=min_hits, min_score=min_score) or always_fact) and _can_llm() and not web_enabled
     if run_fact:
         AGENT_LLM_CALLS.labels(stage="fact_split").inc()
         msg = "Search looks weak. Splitting into fact queries." if quality_is_poor(primary, min_hits=min_hits, min_score=min_score) else "Multi-query fusion: adding fact queries."
         yield {"type": "trace", "kind": "thought", "label": "Quality", "content": msg}
         yield {"type": "trace", "kind": "tool", "name": "llm.fact_split", "payload": {"model": llm_model, "query": payload.query}}
         fact_qs = await _fact_queries(client, llm_base, llm_model, llm_key, payload.query, timeout_s=llm_timeout, history=hist)
-        max_fact = payload.max_fact_queries if payload.max_fact_queries is not None else int(_env_get("AGENT_MAX_FACT_QUERIES", "2"))
-        fact_qs = fact_qs[:max_fact] if fact_qs else []
+        fact_qs = fact_qs[:max_fact_queries] if fact_qs else []
         if fact_qs:
             for fq in fact_qs:
                 yield {"type": "trace", "kind": "action", "content": f"Fact query: {fq}"}
@@ -564,7 +603,8 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
     else:
         assessment = {"incomplete": False, "missing_terms": [], "reason": "max_llm_calls"}
 
-    if assessment.get("incomplete") and _can_llm():
+    use_retry = use_retry_payload if use_retry_payload is not None else _env_get("AGENT_USE_RETRY", "true").lower() in ("1", "true", "yes")
+    if assessment.get("incomplete") and _can_llm() and use_retry:
         AGENT_RETRY.inc()
         yield {
             "type": "trace",
@@ -627,8 +667,7 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
             AGENT_LLM_CALLS.labels(stage="fact_split_retry").inc()
             yield {"type": "trace", "kind": "tool", "name": "llm.fact_split", "payload": {"model": llm_model, "query": payload.query}}
             fact_qs = await _fact_queries(client, llm_base, llm_model, llm_key, payload.query, timeout_s=llm_timeout, history=hist)
-            max_fact = payload.max_fact_queries if payload.max_fact_queries is not None else int(_env_get("AGENT_MAX_FACT_QUERIES", "2"))
-            fact_qs = fact_qs[:max_fact] if fact_qs else []
+            fact_qs = fact_qs[:max_fact_queries] if fact_qs else []
         if fact_qs:
             for fq in fact_qs:
                 yield {"type": "trace", "kind": "action", "content": f"Fact query: {fq}"}
@@ -703,15 +742,15 @@ async def readyz():
     return {"ready": True}
 
 
-@app.get("/v1/metrics")
+@app.get("/v1/metrics", tags=["metrics"])
 async def metrics():
-    """Prometheus metrics."""
+    """Prometheus metrics (requests, latency, LLM/gate calls)."""
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
-@app.post("/v1/agent")
+@app.post("/v1/agent", tags=["agent"])
 async def agent_non_streaming(payload: AgentRequest):
-    """Non-streaming: collect events and return full response as JSON."""
+    """Non-streaming: collect events and return full response as JSON. Use mode=minimal|conservative|aggressive for presets."""
     t0 = time.perf_counter()
     trace_id = uuid.uuid4().hex
     timeout_s = float(_env_get("AGENT_REQUEST_TIMEOUT_S", "120"))
@@ -764,7 +803,7 @@ async def agent_non_streaming(payload: AgentRequest):
     }
 
 
-@app.post("/v1/agent/stream")
+@app.post("/v1/agent/stream", tags=["agent"])
 async def agent_stream(request: Request, payload: AgentRequest):
     t0 = time.perf_counter()
     trace_id = uuid.uuid4().hex

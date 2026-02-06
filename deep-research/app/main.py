@@ -17,8 +17,8 @@ import logging
 from typing import Any, Dict, List, TypedDict, AsyncIterator
 
 import httpx
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from langchain.chat_models import init_chat_model
@@ -37,7 +37,18 @@ from agent_common import (
     sources_from_context,
 )
 from agent_common.web_search import web_search_sync
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 
+DEEP_REQUESTS = Counter("deep_research_requests_total", "Deep research stream requests")
+DEEP_ITERATIONS = Counter("deep_research_iterations_total", "Research loop iterations")
+DEEP_GATE_CALLS = Counter("deep_research_gate_calls_total", "Gate chat calls")
+DEEP_LLM_CALLS = Counter("deep_research_llm_calls_total", "LLM calls", ["stage"])
+DEEP_NODE_DURATION = Histogram(
+    "deep_research_node_duration_seconds",
+    "Node execution duration",
+    ["node"],
+    buckets=(0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0),
+)
 
 _LOG_LEVEL = os.environ.get("DEEP_LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=_LOG_LEVEL)
@@ -64,17 +75,19 @@ class GateFilters(BaseModel):
 
 
 class DeepResearchRequest(BaseModel):
-    query: str
-    history: list[dict[str, str]] = Field(default_factory=list)
-    filters: GateFilters | None = None
-    include_sources: bool = True
-    max_iterations: int = 2
-    retrieval_mode: str | None = None
-    top_k: int | None = None
-    rerank: bool | None = None
-    use_web_search: bool | None = None
-    web_search_num: int | None = None
-    web_search_timeout_s: float | None = None
+    """Request body for deep research (plan → scope → research loop → write report)."""
+
+    query: str = Field(..., description="Research question")
+    history: list[dict[str, str]] = Field(default_factory=list, description="Conversation history")
+    filters: GateFilters | None = Field(None, description="Gate filters")
+    include_sources: bool = Field(True, description="Include sources in response")
+    max_iterations: int = Field(2, description="Max research loop iterations")
+    retrieval_mode: str | None = Field(None, description="Gate retrieval mode")
+    top_k: int | None = Field(None, description="Top-k per query")
+    rerank: bool | None = Field(None, description="Enable reranking")
+    use_web_search: bool | None = Field(None, description="Enable web search")
+    web_search_num: int | None = Field(None, description="Max web search results")
+    web_search_timeout_s: float | None = Field(None, description="Web search timeout")
 
 
 class ResearchState(TypedDict):
@@ -420,9 +433,11 @@ def _build_graph(
         )
 
     def plan_node(state: dict[str, Any]) -> dict[str, Any]:
+        t0 = time.perf_counter()
         max_iters = int(state.get("max_iterations") or 0)
         emit_progress("plan", 0, max_iters, "Plan: choosing retrieval settings")
         logger.info("plan.start")
+        DEEP_LLM_CALLS.labels(stage="plan").inc()
         defaults = {
             "retrieval_mode": state.get("retrieval_mode") or "hybrid",
             "top_k": int(state.get("top_k") or 8),
@@ -458,6 +473,7 @@ def _build_graph(
             }
         )
         logger.info("plan.done", extra={"mode": mode, "top_k": top_k, "rerank": rerank, "hyde": use_hyde})
+        DEEP_NODE_DURATION.labels(node="plan").observe(time.perf_counter() - t0)
 
         return {
             "retrieval_mode": mode,
@@ -514,6 +530,7 @@ def _build_graph(
             queries = [question]
         logger.info("scope.queries=%s", queries)
         logger.info("scope.done", extra={"plan_items": len(plan), "queries": len(queries)})
+        DEEP_NODE_DURATION.labels(node="scope").observe(time.perf_counter() - t0)
         return {
             "plan": plan,
             "queries": queries,
@@ -528,8 +545,10 @@ def _build_graph(
         }
 
     def research_node(state: dict[str, Any]) -> dict[str, Any]:
+        t0 = time.perf_counter()
         iteration = int(state.get("iteration") or 0) + 1
         max_iters = int(state.get("max_iterations") or 0)
+        DEEP_ITERATIONS.inc()
         emit_progress(
             "research",
             iteration,
@@ -599,6 +618,7 @@ def _build_graph(
         for q in batch:
             search_query = q
             if use_hyde:
+                DEEP_LLM_CALLS.labels(stage="research_hyde").inc()
                 emitter.emit(
                     {
                         "type": "trace",
@@ -624,6 +644,7 @@ def _build_graph(
                 }
             )
             history = state.get("history") or []
+            DEEP_GATE_CALLS.inc()
             primary = gate.chat(
                 search_query,
                 history=history,
@@ -666,6 +687,7 @@ def _build_graph(
                             "payload": {"query": fq, "retrieval_mode": mode, "top_k": max(4, top_k // 2), "rerank": rerank},
                         }
                     )
+                    DEEP_GATE_CALLS.inc()
                     r2 = gate.chat(
                         fq,
                         history=history,
@@ -711,6 +733,7 @@ def _build_graph(
                             "payload": {"query": search_query, "retrieval_mode": alt_mode, "top_k": top_k, "rerank": rerank},
                         }
                     )
+                    DEEP_GATE_CALLS.inc()
                     alt = gate.chat(
                         search_query,
                         history=history,
@@ -738,6 +761,7 @@ def _build_graph(
                                 "payload": {"query": kw, "retrieval_mode": mode, "top_k": max(4, top_k // 2), "rerank": rerank},
                             }
                         )
+                        DEEP_GATE_CALLS.inc()
                         r3 = gate.chat(
                             kw,
                             history=history,
@@ -847,6 +871,7 @@ def _build_graph(
                 "sources": len(merged_sources),
             },
         )
+        DEEP_NODE_DURATION.labels(node="research").observe(time.perf_counter() - t0)
         notes_added = len(notes)
         sources_added = len(new_sources)
         return {
@@ -873,10 +898,12 @@ def _build_graph(
         return "research"
 
     def write_node(state: dict[str, Any]) -> dict[str, Any]:
+        t0 = time.perf_counter()
         iteration = int(state.get("iteration") or 0)
         max_iters = int(state.get("max_iterations") or 0)
         emit_progress("write", iteration, max_iters, "Write: drafting report")
         logger.info("write.start", extra={"notes": len(state.get("notes", [])), "sources": len(state.get("sources", []))})
+        DEEP_LLM_CALLS.labels(stage="write").inc()
         emitter.emit(
             {
                 "type": "trace",
@@ -932,6 +959,7 @@ def _build_graph(
         if source_lines:
             report += "\n\nSources:\n" + "\n".join(f"- {s}" for s in source_lines[:50])
         logger.info("write.done", extra={"report_chars": len(report)})
+        DEEP_NODE_DURATION.labels(node="write").observe(time.perf_counter() - t0)
         return {"report": report}
 
     graph = StateGraph(dict)
@@ -1053,16 +1081,30 @@ def _run_graph(payload: DeepResearchRequest, event_queue: queue.Queue[object]) -
         event_queue.put(SENTINEL)
 
 
-app = FastAPI(title="Deep Research", version="0.1.0")
+app = FastAPI(
+    title="Deep Research",
+    version="0.1.0",
+    description="LangGraph-based iterative research: plan → scope → research loop (Gate calls, distilled notes) → write report. Supports cancellation on client disconnect.",
+    openapi_url="/v1/openapi.json",
+    docs_url="/v1/docs",
+)
 
 
-@app.get("/v1/readyz")
+@app.get("/v1/readyz", tags=["health"])
 async def readyz() -> dict[str, bool]:
+    """Health check."""
     return {"ready": True}
 
 
-@app.post("/v1/deep-research/stream")
-async def deep_research_stream(payload: DeepResearchRequest) -> StreamingResponse:
+@app.get("/v1/metrics", tags=["metrics"])
+async def metrics():
+    """Prometheus metrics (iterations, gate calls, LLM calls, node duration)."""
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.post("/v1/deep-research/stream", tags=["deep-research"])
+async def deep_research_stream(request: Request, payload: DeepResearchRequest) -> StreamingResponse:
+    """SSE stream: plan → scope → research loop → write. Cancels on client disconnect."""
     if not (payload.query or "").strip():
         raise HTTPException(status_code=400, detail="query is required")
     async def event_stream() -> AsyncIterator[str]:
@@ -1071,7 +1113,18 @@ async def deep_research_stream(payload: DeepResearchRequest) -> StreamingRespons
         task = asyncio.create_task(asyncio.to_thread(_run_graph, payload, event_queue))
 
         while True:
-            event = await asyncio.to_thread(event_queue.get)
+            try:
+                event = await asyncio.to_thread(event_queue.get, True, 1.0)
+            except queue.Empty:
+                if await request.is_disconnected():
+                    logger.info("stream.client_disconnected")
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    return
+                continue
             if event is SENTINEL:
                 break
             yield f"data: {json.dumps(event)}\n\n"

@@ -488,6 +488,9 @@ services:
       - WEB_SEARCH_NUM=${WEB_SEARCH_NUM:-5}
       - WEB_SEARCH_TIMEOUT_S=${WEB_SEARCH_TIMEOUT_S:-15}
       - AGENT_ALWAYS_WEB_SEARCH=${AGENT_ALWAYS_WEB_SEARCH:-false}
+      - AGENT_USE_HYDE=${AGENT_USE_HYDE:-}
+      - AGENT_USE_FACT_QUERIES=${AGENT_USE_FACT_QUERIES:-true}
+      - AGENT_USE_RETRY=${AGENT_USE_RETRY:-true}
     depends_on:
       rag-gate:
         condition: service_started

@@ -158,7 +158,7 @@ Two LLM-driven services extend RAG with intelligent query planning and iterative
 | **agent-search** | 8093 | Plan → Gate.chat → quality check → fact queries → answer (with optional web search) |
 | **deep-research** | 8094 | LangGraph: plan → scope → research loop → streaming report (with optional web search) |
 
-**Features:** Web search (Serper/Tavily), citation [1][2], per-request limits (`max_llm_calls`, `max_fact_queries`), Prometheus metrics.
+**Features:** Web search (Serper/Tavily), citation [1][2], per-request limits (`max_llm_calls`, `max_fact_queries`), feature flags (`use_hyde`, `use_fact_queries`, `use_retry`), Prometheus metrics.
 
 See **[docs/AGENT_SEARCH_AND_DEEP_RESEARCH.md](./docs/AGENT_SEARCH_AND_DEEP_RESEARCH.md)** for API reference, parameters, and configuration.
 

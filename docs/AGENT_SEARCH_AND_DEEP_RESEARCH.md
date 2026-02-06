@@ -58,14 +58,26 @@ curl -X POST http://localhost:8093/v1/agent \
 | `web_search_timeout_s` | float | Web search timeout (default: 15)                                           |
 | `max_llm_calls`      | int    | Max LLM calls per request (rate limit protection)                          |
 | `max_fact_queries`   | int    | Max fact queries when quality is poor                                      |
+| `use_hyde`           | bool   | `false` = never, `true` = force, `null` = use env + plan                    |
+| `use_fact_queries`   | bool   | `false` = never, `true` = force, `null` = use env + quality check           |
+| `use_retry`         | bool   | `false` = never retry, `true` = allow, `null` = use env                     |
+| `mode`              | string | Preset: `minimal` \| `conservative` \| `aggressive` — overrides use_hyde, use_fact_queries, use_retry, max_llm_calls, max_fact_queries |
+
+### OpenAPI / Swagger
+
+- **agent-search**: http://localhost:8093/v1/docs (Swagger UI), http://localhost:8093/v1/openapi.json
+- **deep-research**: http://localhost:8094/v1/docs (Swagger UI), http://localhost:8094/v1/openapi.json
 
 ### Configuration (env)
 
 - `AGENT_MAX_LLM_CALLS` — Max LLM calls (default: 12)
 - `AGENT_MAX_FACT_QUERIES` — Max fact queries (default: 2)
-- `AGENT_ALWAYS_FACT_QUERIES` — Always run fact queries (default: false)
+- `AGENT_ALWAYS_FACT_QUERIES` — Always run fact queries when `use_fact_queries` is null (default: false)
 - `AGENT_ALWAYS_WEB_SEARCH` — Force web search for every request (default: false)
 - `AGENT_REQUEST_TIMEOUT_S` — Request timeout (default: 120)
+- `AGENT_USE_HYDE` — Force HyDE when set to true; disable when false; else use plan
+- `AGENT_USE_FACT_QUERIES` — Master switch for fact queries (default: true)
+- `AGENT_USE_RETRY` — Allow retry on incomplete answer (default: true)
 
 ---
 
