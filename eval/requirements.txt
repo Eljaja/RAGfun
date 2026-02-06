@@ -1,7 +1,0 @@
-# Dependencies for run_rag_baseline.py (eval only).
-# Install: pip install -r eval/requirements.txt
-httpx>=0.27.0
-tqdm>=4.66.0
-
-# Optional: for prepare_beir_data.py (BEIR benchmark download).
-# pip install beir
