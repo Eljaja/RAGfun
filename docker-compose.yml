@@ -266,7 +266,7 @@ services:
     networks:
       - rag-network
       # Опционально: использовать уже поднятые infinity-embed/rerank из другого стека (rag_fun)
-      - rag_fun_rag-network
+      # - rag_fun_rag-network
 
   # Document Storage Service (S3 = уже поднятый presign-rustfs-1 в сети presign_rustfs-net)
   document-storage:
@@ -410,8 +410,8 @@ services:
       - GATE_SERVICE_NAME=rag-gate
       - GATE_ENVIRONMENT=dev
       - GATE_LOG_LEVEL=INFO
-      # Use docker network service name for retrieval (no public port required)
-      - GATE_RETRIEVAL_URL=http://retrieval:8080
+      # Use docker network service name for retrieval. Override in .env if rugfunsota retrieval hangs (both stacks): GATE_RETRIEVAL_URL=http://host.docker.internal:8080
+      - GATE_RETRIEVAL_URL=${GATE_RETRIEVAL_URL:-http://retrieval:8080}
       - GATE_RETRIEVAL_TIMEOUT_S=60
       - GATE_RETRIEVAL_MODE=hybrid
       # Default top_k for chat requests (ru_eval overrides per-request, but keeping this aligned helps).
@@ -463,12 +463,15 @@ services:
     networks:
       - rag-network
 
-  # Agentic search service (agent_cli as a microservice)
+  # Agentic search service (agent_cli as a microservice). Optional: dir removed in cleanup-sota-repo.
   agent-search:
+    profiles:
+      - agent-search
     build:
-      context: ./agent-search
+      context: .
+      dockerfile: agent-search/Dockerfile
     ports:
-      - "8091:8091"
+      - "${RUGFUNSOTA_AGENT_PORT:-8093}:8091"
     environment:
       - AGENT_GATE_URL=http://rag-gate:8090
       - AGENT_GATE_TIMEOUT_S=60
@@ -489,9 +492,10 @@ services:
     profiles:
       - deep-research
     build:
-      context: ./deep-research
+      context: .
+      dockerfile: deep-research/Dockerfile
     ports:
-      - "8092:8092"
+      - "${RUGFUNSOTA_DEEP_PORT:-8094}:8092"
     environment:
       - DEEP_LLM_PROVIDER=${GATE_LLM_PROVIDER:-mock}
       - DEEP_LLM_BASE_URL=${GATE_LLM_BASE_URL:-https://inference.asicloud.cudos.org/v1}
