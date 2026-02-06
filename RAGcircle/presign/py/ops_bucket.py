@@ -2,8 +2,8 @@ from typing import Any
 
 from botocore.exceptions import ClientError
 
-from .exceptions import BucketAlreadyExistsError, BucketNotFoundError, S3OperationError, safe_s3_call
-from .models import (
+from exceptions import BucketAlreadyExistsError, BucketNotFoundError, S3OperationError, safe_s3_call
+from models import (
     BucketInfo,
     CollectionCreateResponse,
     CollectionDeleteResponse,

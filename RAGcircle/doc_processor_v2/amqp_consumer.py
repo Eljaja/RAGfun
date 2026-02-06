@@ -7,7 +7,7 @@ import aio_pika
 
 from config import AppConfig
 from errors import NonRetryableError
-from events import extract_s3_event_info
+from s3_events import extract_s3_event_info
 from pipeline import PipelineDeps, handle_s3_event
 
 
@@ -73,6 +73,8 @@ async def publish_to_dlq(
     reason: str,
     retry_count: int,
 ) -> None:
+    #print("GOES HERE")
+    #print(reason)
     hdrs = dict(message.headers or {})
     hdrs["dlq_reason"] = reason
     hdrs["x-retry-count"] = retry_count
@@ -104,13 +106,17 @@ async def handle_incoming_message(
     - We only ACK after either (a) successful processing, or (b) successful publish to retry/DLQ.
     - If publish fails, we do NOT ACK; the message will be redelivered.
     """
+
+    #print("INCOMING")
     retry_count = retry_count_from_headers(message.headers, retry_queue=cfg.amqp_retry_queue)
 
     # Parse JSON payload (DLQ immediately if invalid)
     try:
         decoded = message.body.decode("utf-8")
         event = json.loads(decoded)
+        # print(event)
     except Exception as e:
+        raise e
         await publish_to_dlq(
             message=message,
             dlq_exchange=dlq_exchange,
@@ -122,6 +128,7 @@ async def handle_incoming_message(
         return
 
     if not isinstance(event, dict):
+       
         await publish_to_dlq(
             message=message,
             dlq_exchange=dlq_exchange,
@@ -136,14 +143,18 @@ async def handle_incoming_message(
     try:
         info = extract_s3_event_info(event)
     except NonRetryableError as e:
-        await publish_to_dlq(
-            message=message,
-            dlq_exchange=dlq_exchange,
-            routing_key=cfg.amqp_dlq_routing_key,
-            reason=f"non_retryable:{e}",
-            retry_count=retry_count,
-        )
+        #raise e
+        print(e)
         await message.ack()
+        return
+        # await publish_to_dlq(
+        #     message=message,
+        #     dlq_exchange=dlq_exchange,
+        #     routing_key=cfg.amqp_dlq_routing_key,
+        #     reason=f"non_retryable:{e}",
+        #     retry_count=retry_count,
+        # )
+        # await message.ack()
         return
 
     # Main pipeline
@@ -162,7 +173,9 @@ async def handle_incoming_message(
         await message.ack()
         return
     except Exception as e:
+        print(e)
         # Retryable failure
+        raise e
         if retry_count >= cfg.amqp_max_retries:
             await publish_to_dlq(
                 message=message,
@@ -227,8 +240,10 @@ async def consume_rabbitmq(*, s3_client, deps: PipelineDeps, cfg: AppConfig) -> 
                         cfg=cfg,
                     )
         except asyncio.CancelledError:
+            print("ARE WE REAL")
             break
-        except Exception:
+        except Exception as e:
             # basic reconnect loop; caller can add backoff/logging
+            #raise e
             await asyncio.sleep(3)
 

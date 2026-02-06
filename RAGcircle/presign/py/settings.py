@@ -4,6 +4,8 @@ import os
 
 
 
+
+
 class Constants(BaseSettings):
     model_config = SettingsConfigDict(
         # Load from environment-specific file
@@ -22,8 +24,12 @@ class Settings(BaseSettings):
         env_file=f"../.env.{os.getenv('ENV', 'local')}",
         env_file_encoding="utf-8",
         case_sensitive=False,
-        extra="ignore"
+        extra="ignore",
     )
+
+    # Auth check 
+    auth_server: str
+    admin_secret_token: str
 
     aws_region: str = "us-east-1"
     aws_access_key_id: str = "rustfs"
@@ -33,4 +39,10 @@ class Settings(BaseSettings):
     # TODO: based on the .env for RUSTFS get the queue arn instead of passing 
     # the actual values
     queue_arn: str = "arn:rustfs:sqs:us-east-1:primary:mqtt"
-    
+    bucket_name: str = "ragfun"
+
+    database_url: str = "postgresql://user:pass@localhost:5438/db"
+    max_projects_per_user: int = 5
+
+def load_settings() -> Settings:
+    return Settings()

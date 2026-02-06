@@ -6,13 +6,13 @@ services:
     ports:
       - "8902:7997"
     environment:
-      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1}
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ["${GPU_ID:-0}"]
+              device_ids: ["${GPU_ID:-1}"]
               capabilities: [gpu]
     volumes:
       - infinity-cache:/app/.cache
@@ -29,7 +29,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ["0"]  # different GPU or same if fits
+              device_ids: ["1"]  # different GPU or same if fits
               capabilities: [gpu]
     volumes:
       - infinity-cache:/app/.cache

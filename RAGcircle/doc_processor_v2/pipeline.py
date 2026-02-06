@@ -7,7 +7,7 @@ from urllib.parse import unquote
 from chunker import chunk_text_chars
 from embed_caller import Embedder
 from errors import NonRetryableError
-from events import S3EventInfo, is_supported_file, is_object_created, is_object_removed
+from s3_events import S3EventInfo, is_supported_file, is_object_created, is_object_removed
 from ingestion import ingest_chunks
 from models import ChunkMeta, Locator
 from processing import Settings, file_to_texts, VLMClient
@@ -64,6 +64,8 @@ class PipelineDeps:
     embedder: Embedder
     qdrant: QdrantStore
     opensearch: BM25Store
+    qdrant_collection: str
+    opensearch_index: str
     embed_batch_size: int = 32
 
 
@@ -82,9 +84,13 @@ async def download_from_s3(*, bucket: str, key: str, s3_client) -> tuple[bytes, 
 
 
 async def handle_object_created(*, info: S3EventInfo, s3_client, deps: PipelineDeps) -> None:
-    if not is_supported_file(info.key):
-        return
+    
+    # print(info)
+    # if not is_supported_file(info.key):
+    #     return
 
+    print("HELLO")
+    print(info)
     # Download + extract
     file_bytes, content_type, filename = await download_from_s3(bucket=info.bucket, key=info.key, s3_client=s3_client)
     texts = await file_to_texts(
@@ -100,7 +106,7 @@ async def handle_object_created(*, info: S3EventInfo, s3_client, deps: PipelineD
         raise RuntimeError("extracted_no_text")
 
     # Chunk + ingest
-    doc_id = generate_doc_id(info.bucket, info.key)
+    project_id, doc_id = filename.split("_")
     source = f"s3://{info.bucket}/{unquote(info.key or '')}"
     chunks = create_chunks_from_texts(
         doc_id=doc_id,
@@ -110,13 +116,22 @@ async def handle_object_created(*, info: S3EventInfo, s3_client, deps: PipelineD
         uri=source,
     )
 
+    print("THIS IS IMPORTANT")
+
+
+
+    #print("COLLECTIONS CREATED")
+
     result = await ingest_chunks(
         chunks=chunks,
         embedder=deps.embedder,
         qdrant=deps.qdrant,
         opensearch=deps.opensearch,
+        qdrant_collection=project_id,
+        opensearch_index=project_id,
         embed_batch_size=deps.embed_batch_size,
     )
+    print("WELL")
     if not result.ok:
         # Make it retryable so we either succeed or end up in DLQ after max retries.
         raise RuntimeError(f"ingestion_failed:{result.error}")
@@ -130,10 +145,10 @@ async def handle_object_removed(*, info: S3EventInfo, deps: PipelineDeps) -> Non
     # same object might later arrive with a decoded key. To make deletes robust,
     # we attempt both possibilities when they differ.
     doc_ids: list[str] = []
-    doc_ids.append(generate_doc_id(info.bucket, info.key))
-    decoded_key = unquote(info.key or "")
-    if decoded_key != info.key:
-        doc_ids.append(generate_doc_id(info.bucket, decoded_key))
+    doc_ids.append(info.key)
+    #decoded_key = unquote(info.key or "")
+    #if decoded_key != info.key:
+    #    doc_ids.append(generate_doc_id(info.bucket, decoded_key))
 
     # De-dupe while preserving order
     seen: set[str] = set()
@@ -141,10 +156,12 @@ async def handle_object_removed(*, info: S3EventInfo, deps: PipelineDeps) -> Non
 
     async def _delete_one(doc_id: str) -> None:
         tasks = []
+
+        project_id, document_id = doc_id.split("_")
         if deps.qdrant is not None:
-            tasks.append(deps.qdrant.delete_by_doc_id(doc_id))
+            tasks.append(deps.qdrant.delete_by_doc_id(document_id, project_id))
         if deps.opensearch is not None:
-            tasks.append(deps.opensearch.delete_by_doc_id(doc_id))
+            tasks.append(deps.opensearch.delete_by_doc_id(document_id, project_id))
         if not tasks:
             return
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -157,12 +174,18 @@ async def handle_object_removed(*, info: S3EventInfo, deps: PipelineDeps) -> Non
 
 
 async def handle_s3_event(*, info: S3EventInfo, s3_client, deps: PipelineDeps) -> None:
+    print(info)
     if is_object_created(info.event_name):
-        await handle_object_created(info=info, s3_client=s3_client, deps=deps)
-        return
+        if info.key and not "_temp" in info.key:
+            await handle_object_created(info=info, s3_client=s3_client, deps=deps)
+        # return
     if is_object_removed(info.event_name):
-        await handle_object_removed(info=info, deps=deps)
-        return
+        # print(info)
+        if not "_temp" in info.key:
+            await handle_object_removed(info=info, deps=deps)
+        # else:
+        #     print("TEMP FOUND")
+        #pass
     # Unknown events: ignore (non-error)
     return
 

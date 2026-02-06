@@ -33,6 +33,7 @@ async def ingest_to_qdrant(
     chunks: list[ChunkMeta],
     embedder: Embedder,
     store: QdrantStore,
+    collection: str,
     *,
     batch_size: int = 32,
 ) -> tuple[bool, int, int, str | None]:
@@ -46,7 +47,7 @@ async def ingest_to_qdrant(
     try:
         # Check which chunks already exist with same content
         chunk_ids = [c.chunk_id for c in chunks]
-        existing_raw = await store.get_existing_chunks(chunk_ids)
+        existing_raw = await store.get_existing_chunks(chunk_ids, collection)
         
         existing_by_id = {
             cid: ExistingChunk(
@@ -72,16 +73,18 @@ async def ingest_to_qdrant(
             all_vectors.extend(vectors)
 
         # Upsert to Qdrant
-        await store.upsert(need_embed, all_vectors)
+        await store.upsert(need_embed, all_vectors, collection)
         return True, len(need_embed), skipped, None
 
     except Exception as e:
+        raise
         return False, 0, 0, str(e)
 
 
 async def ingest_to_opensearch(
     chunks: list[ChunkMeta],
     store: BM25Store,
+    index: str,
 ) -> tuple[bool, str | None]:
     """
     Upsert chunks to OpenSearch for BM25 search.
@@ -91,7 +94,7 @@ async def ingest_to_opensearch(
         return True, None
 
     try:
-        await store.upsert(chunks)
+        await store.upsert(chunks, index)
         return True, None
 
     except Exception as e:
@@ -103,6 +106,8 @@ async def ingest_chunks(
     embedder: Embedder,
     qdrant: QdrantStore,
     opensearch: BM25Store,
+    qdrant_collection: str,
+    opensearch_index: str,
     *,
     embed_batch_size: int = 32,
 ) -> IngestionResult:
@@ -114,8 +119,8 @@ async def ingest_chunks(
         return IngestionResult(ok=True, chunks_count=0)
 
     # Run both in parallel
-    qdrant_task = ingest_to_qdrant(chunks, embedder, qdrant, batch_size=embed_batch_size)
-    opensearch_task = ingest_to_opensearch(chunks, opensearch)
+    qdrant_task = ingest_to_qdrant(chunks, embedder, qdrant, qdrant_collection, batch_size=embed_batch_size)
+    opensearch_task = ingest_to_opensearch(chunks, opensearch, opensearch_index)
 
     (qdrant_ok, embedded, skipped, qdrant_err), (os_ok, os_err) = await asyncio.gather(
         qdrant_task, opensearch_task

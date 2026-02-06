@@ -275,12 +275,11 @@ async def main():
     context = "ahaha"
     answer = "this is ridiculous"
 
-    #{"complete": true/false, "missing": "what's missing or null", "requery": "better search query or null"}
+    # {"complete": true/false, "missing": "what's missing or null", "requery": "better search query or null"}
 
     from pydantic import BaseModel, Field
 
     from typing import Optional
-
 
     class ReflectionResult(BaseModel):
         """
@@ -308,27 +307,25 @@ async def main():
         complete: bool
         missing_context: str | None
         requery: str | None
-        
 
     payload = {
-                "model": "minimax/minimax-m2.1",
-                "messages": [
-                    {"role": "system", "content": """Evaluate if the answer fully addresses the question based on the context."""},
-                    {"role": "user", "content": f"Question: {query}\n\nContext:\n{context}\n\nAnswer: {answer}"},
-                ],
-                "response_format": {
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": "reflection-result",
-                            "schema": ReflectionResult.model_json_schema()
-                        },
+        "model": "minimax/minimax-m2.1",
+        "messages": [
+            {"role": "system", "content": """Evaluate if the answer fully addresses the question based on the context."""},
+            {"role": "user", "content": f"Question: {query}\n\nContext:\n{context}\n\nAnswer: {answer}"},
+        ],
+        "response_format": {
+            "type": "json_schema",
+                    "json_schema": {
+                        "name": "reflection-result",
+                        "schema": ReflectionResult.model_json_schema()
                     },
-            }
+        },
+    }
     print(payload)
 
     resp = await one_pass_agent(payload=payload)
     print(resp)
-
 
     # em = Embedder("http://localhost:8902",
     #               model="sentence-transformers/e5-base-v2")

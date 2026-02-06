@@ -17,8 +17,9 @@ SUPPORTED_EXTENSIONS = {
 
 
 def is_supported_file(filename: str) -> bool:
-    name = (filename or "").lower()
-    return any(name.endswith(ext) for ext in SUPPORTED_EXTENSIONS)
+    #name = (filename or "").lower()
+    #return any(name.endswith(ext) for ext in SUPPORTED_EXTENSIONS)
+    return True
 
 
 def decode_s3_key(key: str) -> str:
@@ -44,6 +45,7 @@ def extract_s3_event_info(event: dict) -> S3EventInfo:
 
     Raises NonRetryableError for payloads that don't match expected shapes.
     """
+    # print(event)
     try:
         # RustFS/AWS-style: Records[0]
         records = event.get("Records", [])
@@ -71,10 +73,9 @@ def extract_s3_event_info(event: dict) -> S3EventInfo:
         key_path = event.get("Key")
         if key_path and "/" in key_path:
             bucket, key = key_path.split("/", 1)
-            if bucket and key:
-                return S3EventInfo(bucket=bucket, key=key, event_name=str(event_name))
+            #if bucket and key:
+            return S3EventInfo(bucket=bucket, key=key, event_name=str(event_name))
 
-        raise NonRetryableError("could_not_extract_bucket_or_key")
     except NonRetryableError:
         raise
     except Exception as e:
@@ -82,6 +83,12 @@ def extract_s3_event_info(event: dict) -> S3EventInfo:
 
 
 def is_object_created(event_name: str) -> bool:
+    # if "ObjectCreated" in event_name:
+    #     if "CompleteMultipartUpload" in event_name:
+    #         print("CompleteMultipartUpload")
+    #         return False
+    #     return True
+
     return "ObjectCreated" in (event_name or "")
 
 

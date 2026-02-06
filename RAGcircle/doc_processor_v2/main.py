@@ -28,8 +28,8 @@ from processing import Settings, VLMClient
 from store import BM25Store, QdrantStore
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+# @asynccontextmanager
+async def lifespan(app: FastAPI = None):
     cfg = AppConfig.from_env()
 
     vlm = VLMClient(
@@ -49,11 +49,11 @@ async def lifespan(app: FastAPI):
 
     embedder = Embedder(base_url=cfg.embedder_url, model=cfg.embedder_model)
 
-    qdrant = QdrantStore(url=cfg.qdrant_url, collection=cfg.qdrant_collection, dimension=cfg.embedder_dim)
-    await qdrant.ensure_collection()
+    qdrant = QdrantStore(url=cfg.qdrant_url, dimension=cfg.embedder_dim)
+    await qdrant.ensure_collection(cfg.qdrant_collection)
 
-    opensearch = BM25Store(url=cfg.opensearch_url, index=cfg.opensearch_index)
-    await opensearch.ensure_index()
+    opensearch = BM25Store(url=cfg.opensearch_url)
+    await opensearch.ensure_index(cfg.opensearch_index)
 
     deps = PipelineDeps(
         vlm=vlm,
@@ -61,6 +61,8 @@ async def lifespan(app: FastAPI):
         embedder=embedder,
         qdrant=qdrant,
         opensearch=opensearch,
+        qdrant_collection=cfg.qdrant_collection,
+        opensearch_index=cfg.opensearch_index,
         embed_batch_size=cfg.embed_batch_size,
     )
 
@@ -73,17 +75,18 @@ async def lifespan(app: FastAPI):
         region_name=cfg.s3_region,
     ) as s3_client:
         consumer_task = asyncio.create_task(consume_rabbitmq(s3_client=s3_client, deps=deps, cfg=cfg))
-        try:
-            yield
-        finally:
-            consumer_task.cancel()
-            try:
-                await consumer_task
-            except asyncio.CancelledError:
-                pass
-            await embedder.close()
-            await qdrant.close()
-            await opensearch.close()
+        await consumer_task
+        # try:
+        #     yield
+        # finally:
+        #     consumer_task.cancel()
+        #     #try:
+        #     #    await consumer_task
+        #     #except asyncio.CancelledError:
+        #     await consumer_task    
+        #     await embedder.close()
+        #     await qdrant.close()
+        #     await opensearch.close()
 
 
 app = FastAPI(
@@ -105,6 +108,11 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "doc-processor-v2"}
+
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(lifespan())
 
 
 # Run with:

@@ -50,5 +50,19 @@ services:
       # RUSTFS_NOTIFY_MQTT_QUEUE_DIR: "/tmp/rustfs-mqtt-queue"
       # RUSTFS_NOTIFY_MQTT_QUEUE_LIMIT: "100000"
 
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pass
+      POSTGRES_DB: db
+    ports:
+      - "127.0.0.1:5438:5432"  # host:container
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
+
 networks:
   rustfs-net:

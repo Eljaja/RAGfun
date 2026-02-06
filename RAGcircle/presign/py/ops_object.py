@@ -1,7 +1,7 @@
 from typing import Any
 
-from .exceptions import safe_s3_call
-from .models import (
+from exceptions import safe_s3_call
+from models import (
     ObjectDeleteRequest,
     ObjectDeleteResponse,
     ObjectInfo,

@@ -2,7 +2,7 @@
 from pydantic import BaseModel, Field, field_validator
 import re
 
-from .settings import Constants
+from settings import Constants
 
 
 constants = Constants()

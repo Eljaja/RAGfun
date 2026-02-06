@@ -268,4 +268,5 @@ async def file_to_texts(
         settings = Settings()
     
     document = document_from_bytes(raw, content_type, filename, vlm, settings)
+    # print(type(document))
     return await document.to_text()
