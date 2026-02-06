@@ -1,8 +1,8 @@
-# Gate API (локально)
+# Gate API
 
-Базовый URL по умолчанию: `http://localhost:8090`
+Default base URL: `http://localhost:8090`
 
-Во всех примерах ниже можно использовать переменную:
+Use a variable in examples:
 
 ```bash
 export GATE_URL="http://localhost:8090"
@@ -13,18 +13,18 @@ export GATE_URL="http://localhost:8090"
 ### `GET /v1/healthz`
 Liveness check.
 
-**Ответ 200**
+**Response 200**
 
 ```json
 {"ok": true}
 ```
 
 ### `GET /v1/readyz`
-Readiness check. Проверяет, что `gate` успешно загрузил конфиг и что доступен `retrieval` (через `retrieval.readyz()`).
+Readiness check. Verifies gate loaded config and retrieval is available.
 
-- При проблемах возвращает **503**.
+- Returns **503** on failure.
 
-**Ответ 200/503**
+**Response 200/503**
 
 ```json
 {
@@ -34,7 +34,7 @@ Readiness check. Проверяет, что `gate` успешно загрузи
 ```
 
 ### `GET /v1/version`
-Возвращает имя сервиса и “безопасное” резюме конфига (секреты не включаются).
+Returns service name and safe config summary (no secrets).
 
 ### `GET /v1/metrics`
 Prometheus metrics (content-type: `text/plain; version=0.0.4`).
@@ -42,151 +42,125 @@ Prometheus metrics (content-type: `text/plain; version=0.0.4`).
 ## Chat
 
 ### `POST /v1/chat`
-Нестримащий чат. Делает retrieval → собирает контекст → вызывает LLM → возвращает ответ + (опционально) источники и debug-пэйлоад retrieval.
+Non-streaming chat. Retrieval → build context → call LLM → return answer + (optional) sources and retrieval debug payload.
 
 **JSON body (`ChatRequest`)**
 
-- **query**: `string` — пользовательский запрос
-- **history**: `[{role, content}]` — история диалога (опционально)
-- **retrieval_mode**: `"bm25" | "vector" | "hybrid"` (опционально; иначе берётся дефолт из конфига)
-- **top_k**: `int` (опционально)
-- **rerank**: `bool` (опционально)
-- **filters**: объект фильтров (опционально)
+- **query**: `string` — user query
+- **history**: `[{role, content}]` — chat history (optional)
+- **retrieval_mode**: `"bm25" | "vector" | "hybrid"` (optional; else config default)
+- **top_k**: `int` (optional)
+- **rerank**: `bool` (optional)
+- **filters**: filter object (optional)
   - **source**: `string|null`
   - **tags**: `string[]|null`
   - **lang**: `string|null`
   - **doc_ids**: `string[]|null`
   - **tenant_id**: `string|null`
   - **project_id**: `string|null`
-  - **project_ids**: `string[]|null` (несколько “коллекций”)
-- **acl**: `string[]` (опционально)
-- **include_sources**: `bool` (по умолчанию `true`)
+  - **project_ids**: `string[]|null` (multiple collections)
+- **acl**: `string[]` (optional)
+- **include_sources**: `bool` (default `true`)
 
-**Пример**
+**Example**
 
 ```bash
 curl -sS "$GATE_URL/v1/chat" \
   -H 'Content-Type: application/json' \
   -d '{
-    "query": "Что такое gate в этом проекте?",
+    "query": "What is the gate in this project?",
     "top_k": 8,
     "include_sources": true
   }' | jq .
 ```
 
-**Ответ 200 (`ChatResponse`)**
+**Response 200 (`ChatResponse`)**
 
 - **ok**: `bool`
 - **answer**: `string`
 - **used_mode**: `string`
 - **degraded**: `string[]`
 - **partial**: `bool`
-- **context**: массив чанков контекста (с `chunk_id/doc_id/text/score` и `source`, если `include_sources=true`)
-- **sources**: массив источников (если `include_sources=true`)
-- **retrieval**: сырой debug-пэйлоад retrieval (для UI/трассировки)
+- **context**: context chunks (with `chunk_id/doc_id/text/score` and `source` if `include_sources=true`)
+- **sources**: sources array (if `include_sources=true`)
+- **retrieval**: raw retrieval debug payload (for UI/tracing)
 
-**Ошибки (типовые)**
+**Errors**
 
-- **503**/`config_error`: gate не смог загрузить конфиг
-- `retrieval_timeout` / `retrieval_error:*`: проблемы при вызове retrieval
+- **503**/`config_error`: gate failed to load config
+- `retrieval_timeout` / `retrieval_error:*`: retrieval issues
 
 ### `POST /v1/chat/stream`
-Streaming чат через SSE (`text/event-stream`).
+Streaming chat via SSE (`text/event-stream`).
 
-Сервер отправляет события вида:
+Server sends events:
 
-- `{"type":"retrieval", ...}` — один раз после retrieval (включает `context` и `retrieval`)
-- `{"type":"token","content":"..."}` — много раз, токены ответа
-- `{"type":"done","answer":"...","sources":[...],...}` — финал
-- `{"type":"error","error":"..."}` — ошибка
+- `{"type":"retrieval", ...}` — once after retrieval (includes `context` and `retrieval`)
+- `{"type":"token","content":"..."}` — multiple times, answer tokens
+- `{"type":"done","answer":"...","sources":[...],...}` — final
+- `{"type":"error","error":"..."}` — error
 
-**Пример**
+**Example**
 
 ```bash
 curl -N -sS "$GATE_URL/v1/chat/stream" \
   -H 'Content-Type: application/json' \
   -d '{
-    "query": "Сделай краткое резюме архитектуры проекта.",
+    "query": "Summarize the project architecture.",
     "include_sources": true
   }'
 ```
 
 ## Documents
 
-> Важно: `gate` работает с документами через `document-storage`, если он настроен. Если `storage_url` не задан — многие document-эндпоинты вернут `storage_unavailable`.
+> Note: Gate works with documents via `document-storage` when configured. If `storage_url` is not set, many document endpoints return `storage_unavailable`.
 
-> Важно про `doc_id`: в URL он должен быть **url-encoded** (например `#`, пробелы и т.п.).
+> Note on `doc_id`: in URLs it must be **url-encoded** (e.g. `#`, spaces).
 
 ### `POST /v1/documents/upload`
 Multipart upload.
 
 **Form fields**
 
-- **file** (обязательно): файл
-- **doc_id** (обязательно): строка
-- **title**: строка
-- **uri**: строка
-- **source**: строка
-- **lang**: строка
-- **tags**: строка, comma-separated (например `tag1,tag2`)
-- **acl**: строка, comma-separated
-- **tenant_id**: строка
-- **project_id**: строка (используется как “collection”)
-- **refresh**: bool (по умолчанию `false`)
+- **file** (required): file
+- **doc_id** (required): string
+- **title**: string
+- **uri**: string
+- **source**: string
+- **lang**: string
+- **tags**: comma-separated string (e.g. `tag1,tag2`)
+- **acl**: comma-separated string
+- **tenant_id**: string
+- **project_id**: string (used as collection)
+- **refresh**: bool (default `false`)
 
-**Поведение ответа**
+**Response behavior**
 
-- Если настроены `document-storage` + RabbitMQ publisher — загрузка **ставится в очередь**, ответ **202** (`accepted=true`) и `task_id`.
-- Иначе используется legacy path: gate читает файл, пытается UTF-8 decode (HTML → text через `html_to_text`), и индексирует напрямую через retrieval — ответ **200**.
+- If `document-storage` + RabbitMQ publisher are configured — upload is **queued**, response **202** (`accepted=true`) and `task_id`.
+- Otherwise legacy path: gate reads file, UTF-8 decode (HTML → text via `html_to_text`), indexes directly via retrieval — response **200**.
 
 ### `GET /v1/documents`
-Список документов из `document-storage` + batch-проверка `indexed` через `retrieval.index_exists` (если retrieval доступен).
+List documents from `document-storage` + batch `indexed` check via `retrieval.index_exists` (if retrieval available).
 
-Query params:
-
-- `source`, `tags` (comma-separated), `lang`
-- `collections` (comma-separated project_ids)
-- `limit` (default 100), `offset` (default 0)
+Query params: `source`, `tags` (comma-separated), `lang`, `collections` (comma-separated project_ids), `limit` (default 100), `offset` (default 0).
 
 ### `GET /v1/documents/{doc_id}/status`
-Возвращает:
-
-- `stored`: есть ли метаданные в `document-storage`
-- `indexed`: проиндексирован ли документ в retrieval (через `index_exists`)
-- `metadata`: метаданные из storage (если есть)
-- `ingestion`: `metadata.extra.ingestion` (если есть)
+Returns: `stored`, `indexed`, `metadata`, `ingestion`.
 
 ### `GET /v1/documents/stats`
-Серверная агрегация статистики по документам (чтобы UI не загружал всё целиком).
-
-Полезно для проверки ingestion состояний: `queued/processing/retrying/failed/completed/unknown`.
+Server-side document statistics aggregation.
 
 ### `GET /v1/collections`
-Список “коллекций” (distinct `project_id`) из `document-storage`.
-
-Query params:
-
-- `tenant_id` (опционально)
-- `limit` (default 1000)
+List collections (distinct `project_id`) from `document-storage`.
 
 ### `DELETE /v1/documents/{doc_id}`
-Удаление документа:
-
-- Если настроены `document-storage` + RabbitMQ publisher: **enqueue delete**, ответ **202**.
-- Иначе best-effort: удалить из storage (если настроен) и удалить из retrieval (обязательно).
-  - Если одна из сторон упала — ответ будет `partial=true` и `degraded=[...]` (HTTP 207 не выставляется явно как статус, но внутри метрики используется).
+Delete document. With document-storage + RabbitMQ: enqueue delete, **202**. Otherwise best-effort delete from storage and retrieval.
 
 ### `DELETE /v1/documents?confirm=true`
-Удаляет **все документы** (safety: нужен `confirm=true`).
+Delete **all documents** (requires `confirm=true`).
 
-Query params:
+## Notes
 
-- `confirm=true` (обязательно)
-- `batch_size` (<=1000), `concurrency` (<=50), `max_batches`
-
-## Примечания / частые проблемы
-
-- **`doc_id` с `#`/пробелами**: в URL используйте urlencode.
-- **`/v1/documents` и `.../status` требуют storage**: иначе `storage_unavailable` либо поля `stored=false`.
-- **upload может вернуть 202**: это нормально при включённой асинхронной ingestion-пайплайне.
-
+- **`doc_id` with `#`/spaces**: use urlencode in URLs.
+- **`/v1/documents` and `.../status` require storage**: else `storage_unavailable` or `stored=false`.
+- **Upload may return 202**: normal when async ingestion pipeline is enabled.

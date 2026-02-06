@@ -36,6 +36,7 @@ from agent_common import (
     quality_is_poor,
     sources_from_context,
 )
+from agent_common.web_search import web_search_sync
 
 
 _LOG_LEVEL = os.environ.get("DEEP_LOG_LEVEL", "INFO").upper()
@@ -71,6 +72,9 @@ class DeepResearchRequest(BaseModel):
     retrieval_mode: str | None = None
     top_k: int | None = None
     rerank: bool | None = None
+    use_web_search: bool | None = None
+    web_search_num: int | None = None
+    web_search_timeout_s: float | None = None
 
 
 class ResearchState(TypedDict):
@@ -461,6 +465,7 @@ def _build_graph(
             "rerank": rerank,
             "use_hyde": use_hyde,
             "plan_reason": reason,
+            "question": state.get("question") or "",  # preserve for downstream
         }
 
     def scope_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -499,6 +504,7 @@ def _build_graph(
             plan = []
             queries = []
         question = (state.get("question") or "").strip()
+        logger.info("scope.state_question=%s", question[:80] if question else "(empty)")
         if not plan:
             plan = _default_plan(question)
         if not queries:
@@ -515,6 +521,10 @@ def _build_graph(
             "sources": [],
             "context": [],
             "iteration": 0,
+            "question": (question or state.get("question") or "").strip(),  # preserve for research (prefer local)
+            "web_search_num": state.get("web_search_num"),
+            "web_search_timeout_s": state.get("web_search_timeout_s"),
+            "use_web_search": state.get("use_web_search"),
         }
 
     def research_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -526,9 +536,9 @@ def _build_graph(
             max_iters,
             f"Research iteration {iteration}/{max_iters}",
         )
-        logger.info("research.start", extra={"iteration": iteration, "remaining": len(state.get("queries", []))})
+        logger.info("research.start", extra={"iteration": iteration, "remaining": len(state.get("queries", [])), "question": (state.get("question") or "")[:50]})
         batch_size = int(_env_get("DEEP_RESEARCH_BATCH", "5"))
-        question = (state.get("question") or "").strip()
+        question = (state.get("question") or state.get("initial_question") or "").strip()
         # Explicit fallback: filter empty, fallback to question when scope/merge yields empty queries
         queries_list = [q for q in (state.get("queries") or []) if q and str(q).strip()]
         if not queries_list and question:
@@ -539,6 +549,10 @@ def _build_graph(
         batch = list(queries_list[:batch_size])
         remaining = list(queries_list[batch_size:])
         logger.info("research.batch=%s", batch)
+        new_context: list[dict[str, Any]] = []
+        new_sources: list[dict[str, Any]] = []
+        gathered_docs: list[dict[str, Any]] = []
+
         if not batch:
             emitter.emit(
                 {
@@ -548,10 +562,30 @@ def _build_graph(
                     "content": "No queries to run in this iteration.",
                 }
             )
-
-        new_context: list[dict[str, Any]] = []
-        new_sources: list[dict[str, Any]] = []
-        gathered_docs: list[dict[str, Any]] = []
+            # Fallback: when no queries but web search enabled, run web search with question
+            web_provider = _env_get("WEB_SEARCH_PROVIDER", "").lower().strip()
+            web_key = os.environ.get("WEB_SEARCH_API_KEY") or os.environ.get("SERPER_API_KEY") or os.environ.get("TAVILY_API_KEY")
+            _req_web = state.get("use_web_search")
+            _web_enabled = _req_web is not False and (_req_web is True or _env_get("DEEP_USE_WEB_SEARCH", "false").lower() in ("1", "true", "yes"))
+            if question and web_provider in ("serper", "tavily") and (web_key or "").strip() and _web_enabled:
+                web_num = int(state.get("web_search_num") or _env_get("WEB_SEARCH_NUM", "5"))
+                web_timeout = float(state.get("web_search_timeout_s") or _env_get("WEB_SEARCH_TIMEOUT_S", "15"))
+                emitter.emit({"type": "trace", "kind": "tool", "name": "web.search", "payload": {"query": question, "provider": web_provider, "num": web_num}})
+                web_hits = web_search_sync(question, provider=web_provider, api_key=web_key, num=web_num, timeout_s=web_timeout)
+                if web_hits:
+                    max_docs_val = int(_env_get("DEEP_RESEARCH_MAX_DOCS", "8"))
+                    max_chars_val = int(_env_get("DEEP_RESEARCH_MAX_CHARS", "4000"))
+                    for i, h in enumerate(web_hits[:max_docs_val]):
+                        src = h.get("source") or {}
+                        gathered_docs.append({
+                            "query": question,
+                            "doc_id": h.get("doc_id", ""),
+                            "title": src.get("title", ""),
+                            "uri": src.get("uri", ""),
+                            "content": (h.get("text") or "")[:max_chars_val],
+                        })
+                        new_sources.append({"ref": i + 1, "doc_id": h.get("doc_id", ""), "title": src.get("title", ""), "uri": src.get("uri", ""), "locator": None})
+                    emitter.emit({"type": "trace", "kind": "action", "content": f"Web search: {len(web_hits)} results (no gate queries)"})
 
         max_docs = int(_env_get("DEEP_RESEARCH_MAX_DOCS", "8"))
         max_chars = int(_env_get("DEEP_RESEARCH_MAX_CHARS", "4000"))
@@ -716,6 +750,23 @@ def _build_graph(
                         responses.append(r3)
                     hits = merge_hits(responses, cap=max(12, top_k))
                     context_chunks = context_from_hits(hits, context_chunks)
+
+            web_provider = _env_get("WEB_SEARCH_PROVIDER", "").lower().strip()
+            web_key = os.environ.get("WEB_SEARCH_API_KEY") or os.environ.get("SERPER_API_KEY") or os.environ.get("TAVILY_API_KEY")
+            _req_web = state.get("use_web_search")
+            _web_enabled = _req_web is not False and (_req_web is True or _env_get("DEEP_USE_WEB_SEARCH", "false").lower() in ("1", "true", "yes"))
+            if web_provider in ("serper", "tavily") and (web_key or "").strip() and _web_enabled:
+                web_query = (state.get("question") or q or "").strip()
+                web_num = int(state.get("web_search_num") or _env_get("WEB_SEARCH_NUM", "5"))
+                web_timeout = float(state.get("web_search_timeout_s") or _env_get("WEB_SEARCH_TIMEOUT_S", "15"))
+                if web_query:
+                    emitter.emit({"type": "trace", "kind": "tool", "name": "web.search", "payload": {"query": web_query, "provider": web_provider, "num": web_num}})
+                web_hits = web_search_sync(web_query, provider=web_provider, api_key=web_key, num=web_num, timeout_s=web_timeout)
+                if web_hits:
+                    responses.append({"hits": web_hits})
+                    hits = merge_hits(responses, cap=max(16, top_k + len(web_hits)))
+                    context_chunks = context_from_hits(hits, context_chunks)
+                    emitter.emit({"type": "trace", "kind": "action", "content": f"Web search: {len(web_hits)} results merged"})
 
             if not context_chunks:
                 context_chunks = context_from_hits(hits, context_chunks)
@@ -947,8 +998,17 @@ def _run_graph(payload: DeepResearchRequest, event_queue: queue.Queue[object]) -
         "yes",
     }
 
+    web_num = payload.web_search_num if payload.web_search_num is not None else int(_env_get("WEB_SEARCH_NUM", "5"))
+    web_timeout = payload.web_search_timeout_s if payload.web_search_timeout_s is not None else float(_env_get("WEB_SEARCH_TIMEOUT_S", "15"))
+    use_web_search = (
+        payload.use_web_search
+        if payload.use_web_search is not None
+        else _env_get("DEEP_USE_WEB_SEARCH", "false").lower() in {"1", "true", "yes"}
+    )
+
     initial_state: dict[str, Any] = {
         "question": payload.query,
+        "initial_question": payload.query,  # never overwritten, fallback when question is lost
         "plan": [],
         "queries": [payload.query],
         "notes": [],
@@ -963,6 +1023,9 @@ def _run_graph(payload: DeepResearchRequest, event_queue: queue.Queue[object]) -
         "top_k": top_k,
         "rerank": rerank,
         "use_hyde": False,
+        "web_search_num": web_num,
+        "web_search_timeout_s": web_timeout,
+        "use_web_search": use_web_search,
         "plan_reason": "",
         "history": list(payload.history) if payload.history else [],
     }

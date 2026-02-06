@@ -14,7 +14,8 @@ PLAN_USER = (
     "{history}"
     "Decide per-request retrieval knobs.\n"
     "JSON fields: retrieval_mode (bm25|vector|hybrid), top_k (1..40), "
-    "rerank (true/false), use_hyde (true/false), reason.\n"
+    "rerank (true/false), use_hyde (true/false), use_web_search (true/false), reason.\n"
+    "Set use_web_search=true for: current events, news, facts outside documents, recent data.\n"
     "Query: {query}"
 )
 

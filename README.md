@@ -151,23 +151,16 @@ The system consists of **8 microservices** organized into application, ML, and i
 
 ### Agent & Deep Research
 
-Two agent services run on top of Gate (profile `agent-search`):
+Two LLM-driven services extend RAG with intelligent query planning and iterative research (profile `agent-search`):
 
 | Service | Port | Description |
 |---------|------|-------------|
-| **agent-search** | 8093 | LLM-driven search: plan (mode/top_k/rerank/HyDE) → Gate.chat → quality check → fact queries on poor quality → answer → assess → retry if incomplete |
-| **deep-research** | 8094 | Iterative research: LangGraph (plan → scope → research loop → write), structured report with streaming |
+| **agent-search** | 8093 | Plan → Gate.chat → quality check → fact queries → answer (with optional web search) |
+| **deep-research** | 8094 | LangGraph: plan → scope → research loop → streaming report (with optional web search) |
 
-**agent-search flow:** plan → HyDE (optional) → Gate.chat → quality check → fact_queries (when poor quality or `AGENT_ALWAYS_FACT_QUERIES=true`) → answer → assess → retry if incomplete.
+**Features:** Web search (Serper/Tavily), citation [1][2], per-request limits (`max_llm_calls`, `max_fact_queries`), Prometheus metrics.
 
-**deep-research flow:** scope (plan + queries) → research loop (batch Gate calls, distilled notes, next_queries) → early stop on min gain → write (streaming report).
-
-**Features:**
-- Scope fallback: empty queries → use question
-- Citation [1], [2] in answer, sources with `ref`
-- Non-streaming `POST /v1/agent` (JSON)
-- Max LLM calls (`AGENT_MAX_LLM_CALLS=12`), request timeout (`AGENT_REQUEST_TIMEOUT_S=120`)
-- Parallel gate calls, history in prompts, Prometheus metrics, Grafana dashboards
+See **[docs/AGENT_SEARCH_AND_DEEP_RESEARCH.md](./docs/AGENT_SEARCH_AND_DEEP_RESEARCH.md)** for API reference, parameters, and configuration.
 
 ## Current Direction
 
@@ -330,31 +323,9 @@ Content-Type: application/json
 }
 ```
 
-### Agent-Search (port 8093)
+### Agent-Search & Deep-Research
 
-**Streaming (SSE):**
-```bash
-curl -X POST http://localhost:8093/v1/agent/stream \
-  -H "Content-Type: application/json" \
-  -d '{"query": "What is RAG?", "include_sources": true, "filters": {"project_id": "agent_test"}}'
-```
-
-**Non-streaming (JSON):**
-```bash
-curl -X POST http://localhost:8093/v1/agent \
-  -H "Content-Type: application/json" \
-  -d '{"query": "What is FastAPI?", "include_sources": true, "filters": {"project_id": "tech_docs"}}'
-# Response: {"answer": "...", "sources": [...], "context": [...], "mode": "hybrid", "partial": false, "degraded": []}
-```
-
-### Deep-Research (port 8094)
-
-**Streaming (SSE):**
-```bash
-curl -X POST http://localhost:8094/v1/deep-research/stream \
-  -H "Content-Type: application/json" \
-  -d '{"query": "What is RAG?", "filters": {"project_id": "agent_test"}, "max_iterations": 2}'
-```
+See **[docs/AGENT_SEARCH_AND_DEEP_RESEARCH.md](./docs/AGENT_SEARCH_AND_DEEP_RESEARCH.md)** for full API reference, request parameters, and configuration.
 
 ### Verifying Agent Services
 
@@ -443,8 +414,9 @@ Services that scale horizontally:
 ## Documentation
 
 - **[RUN_RUGFUNSOTA.md](./RUN_RUGFUNSOTA.md)** — Rugfunsota stack setup
-- **[docs/ENDPOINTS_EXAMPLES.md](./docs/ENDPOINTS_EXAMPLES.md)** — API examples
-- **[docs/gate/GATE_API.md](./docs/gate/GATE_API.md)** — API Gate
+- **[docs/AGENT_SEARCH_AND_DEEP_RESEARCH.md](./docs/AGENT_SEARCH_AND_DEEP_RESEARCH.md)** — Agent-search and deep-research API
+- **[docs/ENDPOINTS_EXAMPLES.md](./docs/ENDPOINTS_EXAMPLES.md)** — Retrieval API examples
+- **[docs/gate/GATE_API.md](./docs/gate/GATE_API.md)** — Gate API
 
 ## Technology Stack
 

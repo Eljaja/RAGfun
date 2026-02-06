@@ -475,10 +475,19 @@ services:
     environment:
       - AGENT_GATE_URL=http://rag-gate:8090
       - AGENT_GATE_TIMEOUT_S=60
+      - AGENT_MAX_LLM_CALLS=${AGENT_MAX_LLM_CALLS:-12}
+      - AGENT_MAX_FACT_QUERIES=${AGENT_MAX_FACT_QUERIES:-2}
       - AGENT_LLM_BASE_URL=${GATE_LLM_BASE_URL:-https://inference.asicloud.cudos.org/v1}
       - AGENT_LLM_MODEL=${GATE_LLM_MODEL:-openai/gpt-oss-120bt}
       - AGENT_LLM_API_KEY=${GATE_LLM_API_KEY:-}
       - AGENT_LLM_TIMEOUT_S=60
+      - WEB_SEARCH_PROVIDER=${WEB_SEARCH_PROVIDER:-}
+      - WEB_SEARCH_API_KEY=${WEB_SEARCH_API_KEY:-}
+      - SERPER_API_KEY=${SERPER_API_KEY:-}
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
+      - WEB_SEARCH_NUM=${WEB_SEARCH_NUM:-5}
+      - WEB_SEARCH_TIMEOUT_S=${WEB_SEARCH_TIMEOUT_S:-15}
+      - AGENT_ALWAYS_WEB_SEARCH=${AGENT_ALWAYS_WEB_SEARCH:-false}
     depends_on:
       rag-gate:
         condition: service_started
@@ -508,6 +517,13 @@ services:
       - DEEP_RETRIEVAL_MODE=hybrid
       - DEEP_TOP_K=8
       - DEEP_RERANK=true
+      - DEEP_USE_WEB_SEARCH=${DEEP_USE_WEB_SEARCH:-false}
+      - WEB_SEARCH_PROVIDER=${WEB_SEARCH_PROVIDER:-}
+      - WEB_SEARCH_API_KEY=${WEB_SEARCH_API_KEY:-}
+      - SERPER_API_KEY=${SERPER_API_KEY:-}
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
+      - WEB_SEARCH_NUM=${WEB_SEARCH_NUM:-5}
+      - WEB_SEARCH_TIMEOUT_S=${WEB_SEARCH_TIMEOUT_S:-15}
     depends_on:
       rag-gate:
         condition: service_started

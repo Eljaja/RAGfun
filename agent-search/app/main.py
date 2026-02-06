@@ -38,6 +38,7 @@ from agent_common import (
     quality_is_poor,
     sources_from_context,
 )
+from agent_common.web_search import web_search_async
 
 # Prometheus metrics
 AGENT_REQS = Counter("agent_requests_total", "Agent requests", ["endpoint", "status"])
@@ -94,6 +95,11 @@ class AgentRequest(BaseModel):
     history: list[dict[str, str]] = Field(default_factory=list)
     filters: GateFilters | None = None
     include_sources: bool = True
+    use_web_search: bool | None = None
+    web_search_num: int | None = None
+    web_search_timeout_s: float | None = None
+    max_llm_calls: int | None = None
+    max_fact_queries: int | None = None
 
 
 app = FastAPI(title="Agent Search", version="0.1.0")
@@ -180,7 +186,7 @@ async def _plan_retrieval(
     try:
         return json.loads(raw)
     except Exception:
-        return {"retrieval_mode": "hybrid", "top_k": 8, "rerank": True, "use_hyde": False, "reason": "fallback"}
+        return {"retrieval_mode": "hybrid", "top_k": 8, "rerank": True, "use_hyde": False, "use_web_search": False, "reason": "fallback"}
 
 
 async def _make_hyde(
@@ -354,7 +360,7 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
     llm_key = os.environ.get("AGENT_LLM_API_KEY") or os.environ.get("GATE_LLM_API_KEY")
     llm_timeout = float(_env_get("AGENT_LLM_TIMEOUT_S", "60"))
     gate_timeout = float(_env_get("AGENT_GATE_TIMEOUT_S", "60"))
-    max_llm_calls = int(_env_get("AGENT_MAX_LLM_CALLS", "12"))
+    max_llm_calls = payload.max_llm_calls if payload.max_llm_calls is not None else int(_env_get("AGENT_MAX_LLM_CALLS", "12"))
     llm_calls = [0]
 
     def _can_llm() -> bool:
@@ -371,19 +377,31 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
         AGENT_LLM_CALLS.labels(stage="plan").inc()
         plan = await _plan_retrieval(client, llm_base, llm_model, llm_key, payload.query, timeout_s=llm_timeout, history=hist)
     else:
-        plan = {"retrieval_mode": "hybrid", "top_k": 8, "rerank": True, "use_hyde": False, "reason": "max_llm_calls"}
+        plan = {"retrieval_mode": "hybrid", "top_k": 8, "rerank": True, "use_hyde": False, "use_web_search": False, "reason": "max_llm_calls"}
 
     mode = str(plan.get("retrieval_mode") or "hybrid")
     top_k = int(plan.get("top_k") or 8)
     rerank = bool(plan.get("rerank") if plan.get("rerank") is not None else True)
     use_hyde = bool(plan.get("use_hyde") or False)
+    use_web_search = bool(plan.get("use_web_search") or False)
     reason = str(plan.get("reason") or "no_reason")
+
+    web_provider = _env_get("WEB_SEARCH_PROVIDER", "").lower().strip()
+    web_key = os.environ.get("WEB_SEARCH_API_KEY") or os.environ.get("SERPER_API_KEY") or os.environ.get("TAVILY_API_KEY")
+    # Per-request override: False = never, True = force, None = use plan + env
+    if payload.use_web_search is False:
+        web_enabled = False
+    elif payload.use_web_search is True:
+        web_enabled = web_provider in ("serper", "tavily") and (web_key or "").strip()
+    else:
+        always_web = _env_get("AGENT_ALWAYS_WEB_SEARCH", "false").lower() in ("1", "true", "yes")
+        web_enabled = (use_web_search or always_web) and web_provider in ("serper", "tavily") and (web_key or "").strip()
 
     yield {
         "type": "trace",
         "kind": "thought",
         "label": "Plan",
-        "content": f"mode={mode}, top_k={top_k}, rerank={rerank}, hyde={use_hyde}. Reason: {reason}",
+        "content": f"mode={mode}, top_k={top_k}, rerank={rerank}, hyde={use_hyde}, web={use_web_search}. Reason: {reason}",
     }
 
     if _can_llm():
@@ -429,13 +447,16 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
     degraded = set(primary.get("degraded") or [])
     partial = bool(primary.get("partial"))
 
-    run_fact = (quality_is_poor(primary, min_hits=min_hits, min_score=min_score) or always_fact) and _can_llm()
+    # Skip fact_queries when web search is enabled — web will supplement; avoids extra LLM/gate calls (rate limits)
+    run_fact = (quality_is_poor(primary, min_hits=min_hits, min_score=min_score) or always_fact) and _can_llm() and not web_enabled
     if run_fact:
         AGENT_LLM_CALLS.labels(stage="fact_split").inc()
         msg = "Search looks weak. Splitting into fact queries." if quality_is_poor(primary, min_hits=min_hits, min_score=min_score) else "Multi-query fusion: adding fact queries."
         yield {"type": "trace", "kind": "thought", "label": "Quality", "content": msg}
         yield {"type": "trace", "kind": "tool", "name": "llm.fact_split", "payload": {"model": llm_model, "query": payload.query}}
         fact_qs = await _fact_queries(client, llm_base, llm_model, llm_key, payload.query, timeout_s=llm_timeout, history=hist)
+        max_fact = payload.max_fact_queries if payload.max_fact_queries is not None else int(_env_get("AGENT_MAX_FACT_QUERIES", "2"))
+        fact_qs = fact_qs[:max_fact] if fact_qs else []
         if fact_qs:
             for fq in fact_qs:
                 yield {"type": "trace", "kind": "action", "content": f"Fact query: {fq}"}
@@ -463,6 +484,23 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
             context_chunks = context_from_hits(hits, context_chunks)
         else:
             yield {"type": "trace", "kind": "thought", "label": "Quality", "content": "No useful fact queries found."}
+
+    if web_enabled:
+        web_num = payload.web_search_num if payload.web_search_num is not None else int(_env_get("WEB_SEARCH_NUM", "5"))
+        web_timeout = payload.web_search_timeout_s if payload.web_search_timeout_s is not None else float(_env_get("WEB_SEARCH_TIMEOUT_S", "15"))
+        yield {"type": "trace", "kind": "tool", "name": "web.search", "payload": {"query": payload.query, "provider": web_provider, "num": web_num}}
+        web_hits = await web_search_async(
+            payload.query,
+            provider=web_provider,
+            api_key=web_key,
+            num=web_num,
+            timeout_s=web_timeout,
+        )
+        if web_hits:
+            responses.append({"hits": web_hits})
+            hits = merge_hits(responses, cap=max(16, top_k + len(web_hits)))
+            context_chunks = context_from_hits(hits, context_chunks)
+            yield {"type": "trace", "kind": "action", "content": f"Web search: {len(web_hits)} results merged"}
 
     if not context_chunks:
         context_chunks = context_from_hits(hits, context_chunks)
@@ -589,6 +627,8 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
             AGENT_LLM_CALLS.labels(stage="fact_split_retry").inc()
             yield {"type": "trace", "kind": "tool", "name": "llm.fact_split", "payload": {"model": llm_model, "query": payload.query}}
             fact_qs = await _fact_queries(client, llm_base, llm_model, llm_key, payload.query, timeout_s=llm_timeout, history=hist)
+            max_fact = payload.max_fact_queries if payload.max_fact_queries is not None else int(_env_get("AGENT_MAX_FACT_QUERIES", "2"))
+            fact_qs = fact_qs[:max_fact] if fact_qs else []
         if fact_qs:
             for fq in fact_qs:
                 yield {"type": "trace", "kind": "action", "content": f"Fact query: {fq}"}
