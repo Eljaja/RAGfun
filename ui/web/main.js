@@ -120,6 +120,68 @@ async function callAgentStream(query, onToken, onComplete, onError, onRetrieval,
   }
 }
 
+async function callDeepResearchStream(query, onToken, onComplete, onError, onRetrieval, onTrace, onProgress) {
+  const filters = buildChatFilters();
+  const r = await fetch("/deep-api/v1/deep-research/stream", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      query,
+      include_sources: true,
+      filters,
+    }),
+  });
+
+  if (!r.ok) {
+    const data = await r.json().catch(() => ({}));
+    const msg = (data && (data.detail || data.error)) || `HTTP ${r.status}`;
+    onError(new Error(msg));
+    return;
+  }
+
+  const reader = r.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        const dataStr = line.slice(6).trim();
+        if (!dataStr) continue;
+        try {
+          const data = JSON.parse(dataStr);
+          if (data.type === "token" && data.content) {
+            onToken(data.content);
+          } else if (data.type === "retrieval") {
+            if (typeof onRetrieval === "function") onRetrieval(data);
+          } else if (data.type === "trace") {
+            if (typeof onTrace === "function") onTrace(data);
+          } else if (data.type === "progress") {
+            if (typeof onProgress === "function") onProgress(data);
+          } else if (data.type === "done") {
+            onComplete(data);
+          } else if (data.type === "error") {
+            onError(new Error(data.error));
+            return;
+          }
+        } catch (e) {
+          console.error("Failed to parse SSE data:", e, dataStr);
+        }
+      }
+    }
+  } catch (e) {
+    onError(e);
+  }
+}
+
 async function uploadDoc({ file, doc_id, title, uri, source, lang, tags, project_id }) {
   const fd = new FormData();
   fd.append("file", file);
@@ -270,6 +332,33 @@ function setUploadBusy(busy, text) {
     statusEl.textContent = "";
     statusEl.className = "status";
   }
+}
+
+let deepProgressTimer = null;
+function setDeepProgress(percent, label) {
+  const wrap = document.getElementById("deep_progress");
+  const bar = document.getElementById("deep_progress_bar");
+  const labelEl = document.getElementById("deep_progress_label");
+  if (!wrap || !bar || !labelEl) return;
+  if (percent === null || percent === undefined) {
+    wrap.style.display = "none";
+    bar.style.width = "0%";
+    labelEl.textContent = "";
+    return;
+  }
+  if (deepProgressTimer) {
+    clearTimeout(deepProgressTimer);
+    deepProgressTimer = null;
+  }
+  const pct = Math.max(0, Math.min(1, percent));
+  wrap.style.display = "flex";
+  bar.style.width = `${Math.round(pct * 100)}%`;
+  labelEl.textContent = label || `${Math.round(pct * 100)}%`;
+}
+
+function finishDeepProgress(label) {
+  setDeepProgress(1, label || "Done");
+  deepProgressTimer = setTimeout(() => setDeepProgress(null), 1400);
 }
 
 function fmtSources(sources) {
@@ -939,7 +1028,9 @@ async function askStream() {
   addMessage({ role: "user", text: q });
   const assistant = addMessage({ role: "assistant", text: "" });
   const agentToggle = document.getElementById("agent_research");
+  const deepToggle = document.getElementById("deep_research");
   const agentMode = !!(agentToggle && agentToggle.checked);
+  const deepMode = !!(deepToggle && deepToggle.checked);
   let latestContext = null;
 
   // Clear composer early (chat-like)
@@ -949,10 +1040,65 @@ async function askStream() {
   }
 
   setBusy(true, "Sending...");
+  if (deepMode) {
+    setDeepProgress(0.05, "Starting");
+  } else {
+    setDeepProgress(null);
+  }
   let answerText = "";
 
   try {
-    if (agentMode) {
+    if (deepMode) {
+      await callDeepResearchStream(
+        q,
+        token => {
+          answerText += token;
+          if (assistant && assistant.bubbleText) {
+            assistant.bubbleText.innerHTML = formatMessageText(answerText);
+            scrollMessagesToBottom();
+          }
+        },
+        data => {
+          if (data && data.answer) answerText = data.answer;
+          if (assistant && assistant.bubbleText) assistant.bubbleText.innerHTML = formatMessageText(answerText);
+          if (assistant && assistant.wrapper && data) {
+            setAssistantExtras(assistant.wrapper, { sources: data.sources, context: data.context || latestContext });
+          }
+          const flags = [];
+          if (data && data.partial) flags.push("partial");
+          if (data && data.degraded && data.degraded.length) flags.push(`degraded=${data.degraded.join(",")}`);
+          setBusy(false, flags.length ? flags.join(" | ") : "OK");
+          if (assistant && assistant.wrapper && assistant.wrapper._agentTrace) {
+            stopTraceSpinner(assistant.wrapper._agentTrace);
+          }
+          finishDeepProgress("Done");
+        },
+        error => {
+          if (assistant && assistant.bubbleText) assistant.bubbleText.innerHTML = escapeHtml(`Error: ${error.message}`).replace(/\n/g, '<br>');
+          setBusy(false, "Error");
+          setDeepProgress(null);
+        },
+        data => {
+          if (!assistant || !assistant.wrapper) return;
+          if (data && data.context) {
+            latestContext = data.context;
+            setAssistantExtras(assistant.wrapper, { sources: null, context: latestContext });
+          }
+        },
+        data => {
+          if (!assistant || !assistant.wrapper) return;
+          const traceState = ensureAgentTrace(assistant.wrapper, "Deep research");
+          addTraceItem(traceState, data);
+        },
+        data => {
+          if (!data) return;
+          const pct = typeof data.percent === "number" ? data.percent : null;
+          const label = data.message || null;
+          if (pct !== null) setDeepProgress(pct, label);
+        }
+      );
+    } else if (agentMode) {
+      setDeepProgress(null);
       await callAgentStream(
         q,
         token => {
@@ -994,6 +1140,7 @@ async function askStream() {
         }
       );
     } else {
+      setDeepProgress(null);
       await callChatStream(
         q,
         token => {
@@ -1036,11 +1183,23 @@ async function askStream() {
   } catch (e) {
     if (assistant && assistant.bubbleText) assistant.bubbleText.innerHTML = escapeHtml(`Error: ${e.message}`).replace(/\n/g, '<br>');
     setBusy(false, "Error");
+    setDeepProgress(null);
   }
 }
 
 const askBtn = document.getElementById("ask_stream");
 if (askBtn) askBtn.addEventListener("click", askStream);
+
+const agentToggle = document.getElementById("agent_research");
+const deepToggle = document.getElementById("deep_research");
+if (agentToggle && deepToggle) {
+  agentToggle.addEventListener("change", () => {
+    if (agentToggle.checked) deepToggle.checked = false;
+  });
+  deepToggle.addEventListener("change", () => {
+    if (deepToggle.checked) agentToggle.checked = false;
+  });
+}
 
 // Composer keybinds:
 // - Enter: send
