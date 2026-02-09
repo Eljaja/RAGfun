@@ -149,39 +149,6 @@ Layer 2: Dead letter queue (DLQ) for failed deletes
 Layer 3: S3 lifecycle rule (auto-delete _temp/* after 24h)
 Layer 4: Background cleanup worker
 """
-# async def upload_with_content_addressing(s3, db, bucket, doc_id, request_stream, ...):
-#     temp_key = f"_temp/{uuid.uuid4().hex}"
-    
-#     # Upload to temp
-#     size, sha256 = await upload_via_multipart(s3, bucket, temp_key, ...)
-#     storage_id = sha256
-    
-#     # Check if content already exists
-#     try:
-#         await s3.head_object(Bucket=bucket, Key=storage_id)
-#         exists = True
-#     except s3.exceptions.ClientError:
-#         exists = False
-    
-#     if exists:
-#         # Content already stored - just delete temp, skip copy
-#         await s3.delete_object(Bucket=bucket, Key=temp_key)
-#     else:
-#         # New content - move from temp to final
-#         await s3.copy_object(
-#             Bucket=bucket,
-#             CopySource=f"{bucket}/{temp_key}",
-#             Key=storage_id,
-#         )
-#         await s3.delete_object(Bucket=bucket, Key=temp_key)
-    
-#     # Record new doc referencing this content
-#     await db.create_document(doc_id=doc_id, storage_id=storage_id, ...)
-    
-#     return UploadResult(ok=True, storage_id=storage_id, duplicate=exists)
-
-
-
 
 
 class UploadMeta(BaseModel):
@@ -223,19 +190,13 @@ def sha256_hex_to_uuid_v8(sha256_hex: str) -> uuid.UUID:
 
 async def upload_with_content_addressing(
     s3,
-    # db,
     bucket: str,
-    # doc_id: str,
     request_stream,
     content_type: str,
     max_bytes: int,
-    # meta: UploadMeta,
     storage_prefix: str, 
-    # doc_id: str, # well I think I will change those args later when I define schemas for them
-    # project_id: str,
 ) -> UploadResult:
     temp_key = f"_temp_{uuid.uuid4().hex}"
-    
     size, sha256 = await upload_via_multipart(
         s3=s3,
         bucket=bucket,

@@ -1,4 +1,9 @@
 from __future__ import annotations
+import uvicorn
+import uuid
+from storage import UploadMeta, upload_with_content_addressing, detect_content_type
+from collectors import QdrantStore, BM25Store
+from collectors import BM25Store, QdrantStore, create_bm25_store, create_qdrant_store
 
 import logging
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -6,31 +11,8 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from aiobotocore.session import get_session
 from fastapi import APIRouter, Depends, FastAPI, Request
 
-from ops_bucket import create_collection, delete_collection, list_collections
-from models import (
-    CollectionCreateResponse,
-    CollectionDeleteResponse,
-    CollectionListResponse,
-    ObjectDeleteRequest,
-    ObjectDeleteResponse,
-    ObjectListRequest,
-    ObjectListResponse,
-    PresignDownloadRequest,
-    PresignDownloadResponse,
-    PresignPostResponse,
-    PresignPutResponse,
-    PresignUploadRequest,
-)
-from ops_object import (
-    delete_object,
-    generate_presigned_download_url,
-    generate_presigned_post,
-    generate_presigned_put_url,
-    list_objects,
-)
 from settings import Settings
 from exceptions import register_exception_handlers
-
 
 
 from fastapi import UploadFile, File, Form, HTTPException
@@ -40,6 +22,9 @@ from pydantic import BaseModel
 from database_ops import create_db, ProjectDB, DocumentDB
 from auth import UserCreds, authenticated
 from projects import authorize_project
+
+
+from ops_bucket import create_collection
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +47,7 @@ class ProjectUpdate(BaseModel):
 # Dependencies
 # ----------------------------
 
+
 def get_s3(request: Request):
     """Fetch the S3 client from app state"""
     s3 = getattr(request.app.state, "s3", None)
@@ -78,21 +64,22 @@ def get_settings(request: Request) -> Settings:
 def get_project_db(request: Request) -> ProjectDB:
     return request.app.state.project_db
 
+
 def get_document_db(request: Request) -> DocumentDB:
     return request.app.state.document_db
 
 
+def get_qdrant(request: Request):
+    return request.app.state.qdrant
 
- 
+def get_opensearch(request: Request):
+    return request.app.state.opensearch
 
 
 # ----------------------------
 # Lifespan
 # ----------------------------
 
-from collectors import QdrantStore, BM25Store
-qdrant = QdrantStore("http://localhost:8903", 768)
-opensearch = BM25Store("http://localhost:8905")
 
 
 @asynccontextmanager
@@ -100,17 +87,6 @@ async def lifecycle(app: FastAPI):
     """Initialize and cleanup S3 client"""
     settings = Settings()
     session = get_session()
-
-    # if state.settings.redis_url:
-    # try:
-    #     state.redis = Redis.from_url(state.settings.redis_url, decode_responses=True)
-    #     state.project_store = ProjectStore(
-    #         redis=state.redis,
-    #         max_projects_per_user=state.settings.max_projects_per_user
-    #     )
-    #     logger.info("redis_initialized", extra={"extra": {"url": state.settings.redis_url}})
-    # except Exception as e:
-    #     logger.error("redis_init_failed", extra={"extra": {"error": str(e)}})
 
     async with AsyncExitStack() as stack:
         s3 = await stack.enter_async_context(
@@ -122,15 +98,24 @@ async def lifecycle(app: FastAPI):
                 region_name=settings.aws_region,
             )
         )
+        # create bucket in case it does not exist
+        await create_collection(s3, settings.bucket_name, settings.aws_region, settings.queue_arn,)
+
         project_db, document_db = await stack.enter_async_context(
             create_db(
                 settings.database_url,
                 max_projects_per_user=settings.max_projects_per_user,
             )
         )
+
+        qdrant: QdrantStore = await stack.enter_async_context(create_qdrant_store(settings.qdrant_url))
+        opensearch: BM25Store = await stack.enter_async_context(create_bm25_store(settings.opensearch_url))
+
         app.state.s3 = s3
         app.state.project_db = project_db
         app.state.document_db = document_db
+        app.state.qdrant = qdrant
+        app.state.opensearch = opensearch
         app.state.settings = settings
         yield
 
@@ -143,7 +128,6 @@ public_router = APIRouter(prefix="/public", tags=["public"])
 protected_router = APIRouter(prefix="/api", tags=["protected"])
 
 
-
 # ----------------------------
 # Public Endpoints (no auth)
 # ----------------------------
@@ -152,7 +136,6 @@ protected_router = APIRouter(prefix="/api", tags=["protected"])
 async def health_check():
     """Health check endpoint"""
     return {"status": "ok"}
-
 
 
 # ----------------------------
@@ -164,6 +147,8 @@ async def create_project(
     payload: ProjectCreate,
     user: UserCreds = Depends(authenticated),
     project_db: ProjectDB = Depends(get_project_db),
+    qdrant: QdrantStore = Depends(get_qdrant),
+    opensearch: BM25Store = Depends(get_opensearch)
 ):
     """Create a new project (enforces max limit per user)."""
     project = await project_db.create(
@@ -171,7 +156,6 @@ async def create_project(
         name=payload.name,
         description=payload.description,
     )
-
 
     await qdrant.ensure_collection(project.project_id, dimension=768)
     await opensearch.ensure_index(project.project_id)
@@ -199,32 +183,15 @@ async def get_project(
     return {"ok": True, "project": project.to_dict()}
 
 
-@protected_router.patch("/v1/projects/{project_id}")
-async def update_project(
-    project_id: str,
-    payload: ProjectUpdate,
-    user: UserCreds = Depends(authenticated),
-    project_db: ProjectDB = Depends(get_project_db),
-):
-    """Update project metadata."""
-    # Verify ownership first
-    await authorize_project(user, project_id, project_db)
-
-    project = await project_db.update(
-        project_id=project_id,
-        name=payload.name,
-        description=payload.description,
-    )
-    return {"ok": True, "project": project.to_dict() if project else None}
-
-
 @protected_router.delete("/v1/projects/{project_id}")
 async def delete_project(
     project_id: str,
     user: UserCreds = Depends(authenticated),
     project_db: ProjectDB = Depends(get_project_db),
     document_db: DocumentDB = Depends(get_document_db),
-    s3 = Depends(get_s3)
+    s3=Depends(get_s3),
+    qdrant: QdrantStore = Depends(get_qdrant),
+    opensearch: BM25Store = Depends(get_opensearch)
 ):
     """
     Delete a project (soft delete).
@@ -237,7 +204,7 @@ async def delete_project(
     await opensearch.delete_index(project_id)
 
     documents = await document_db.list_by_project(project_id)
-    for doc in documents: 
+    for doc in documents:
         await s3.delete_object(Bucket="ragfun", Key=project_id + "_" + doc.get("doc_id"))
 
     # Delete all documents for this project first
@@ -246,150 +213,7 @@ async def delete_project(
     # Soft-delete the project
     deleted = await project_db.delete(project_id, user.user_id)
 
-
     return {"ok": deleted, "project_id": project_id}
-
-
-
-# ----------------------------
-# Protected Endpoints (require auth)
-# ----------------------------
-
-
-# TOTHINK: might have more than one bucket creation op
-# OR: well bucket can have subfolders
-@protected_router.post("/collections/{bucket_name}", response_model=CollectionCreateResponse)
-async def api_create_collection(
-    bucket_name: str,
-    s3=Depends(get_s3),
-    settings: Settings = Depends(get_settings),
-) -> CollectionCreateResponse:
-    """Create a new S3 bucket/collection with event notifications"""
-    return await create_collection(s3, bucket_name=bucket_name, settings=settings)
-
-
-@protected_router.delete("/collections/{bucket_name}", response_model=CollectionDeleteResponse)
-async def api_delete_collection(
-    bucket_name: str,
-    s3=Depends(get_s3),
-) -> CollectionDeleteResponse:
-    """Delete a bucket/collection and all objects within it (destructive operation)"""
-    return await delete_collection(s3, bucket_name=bucket_name)
-
-
-@protected_router.get("/collections", response_model=CollectionListResponse)
-async def api_list_collections(
-    s3=Depends(get_s3),
-) -> CollectionListResponse:
-    """List all buckets/collections"""
-    return await list_collections(s3)
-
-
-@protected_router.post("/objects/presign/upload", response_model=PresignPostResponse)
-async def api_presign_upload(
-    request: PresignUploadRequest,
-    s3=Depends(get_s3),
-) -> PresignPostResponse:
-    """
-    Generate presigned POST for object upload (recommended).
-    Supports file size limits and content-type validation.
-    """
-    return await generate_presigned_post(s3, request)
-
-
-@protected_router.post("/objects/presign/put", response_model=PresignPutResponse, tags=["legacy"])
-async def api_presign_put(
-    request: PresignUploadRequest,
-    s3=Depends(get_s3),
-) -> PresignPutResponse:
-    """Generate presigned PUT URL for object upload (legacy - prefer /upload)"""
-    return await generate_presigned_put_url(s3, request)
-
-
-@protected_router.post("/objects/presign/download", response_model=PresignDownloadResponse)
-async def api_presign_download(
-    request: PresignDownloadRequest,
-    s3=Depends(get_s3),
-) -> PresignDownloadResponse:
-    """Generate presigned GET URL for object download"""
-    return await generate_presigned_download_url(s3, request)
-
-
-@protected_router.post("/objects/delete", response_model=ObjectDeleteResponse)
-async def api_delete_object(
-    request: ObjectDeleteRequest,
-    s3=Depends(get_s3),
-) -> ObjectDeleteResponse:
-    """Delete an object from S3"""
-    return await delete_object(s3, request)
-
-
-@protected_router.post("/objects/list", response_model=ObjectListResponse)
-async def api_list_objects(
-    request: ObjectListRequest,
-    s3=Depends(get_s3),
-) -> ObjectListResponse:
-    """List objects in a bucket with optional prefix filter"""
-    return await list_objects(s3, request)
-
-
-
-from storage import UploadMeta, upload_with_content_addressing, detect_content_type
-import uuid
-
-
-
-# what could be improved 
-# user permissions/max_file_size
-# 
-@protected_router.post("/v1/file/upload")
-async def upload(
-    file: UploadFile = File(...),
-    project_id: str = Form(...),
-    title: str = Form(...),
-    description: str | None = Form(None),
-
-    user: UserCreds = Depends(authenticated),
-    s3_client = Depends(get_s3),
-    project_db: ProjectDB = Depends(get_project_db),
-    document_db: DocumentDB = Depends(get_document_db),
-    settings: Settings = Depends(get_settings),
-):
-    # Verify user owns the project
-    await authorize_project(user, project_id, project_db)
-
-    content_type = await detect_content_type(file)
-    meta = UploadMeta(title=title, description=description)
-    # doc_id = uuid.uuid4().hex
-    
-    async def file_stream():
-        while chunk := await file.read(64 * 1024):
-            yield chunk
-
-    # Use project_id as storage prefix for S3 organization
-    storage_prefix = f"{project_id}_"
-    
-    upload_result = await upload_with_content_addressing(
-        s3=s3_client,
-        bucket=settings.bucket_name,
-        request_stream=file_stream(),
-        content_type=content_type,
-        max_bytes=1 * 1024 * 1024,
-        storage_prefix=storage_prefix,
-        #doc_id=doc_id,
-        #project_id=project_id,
-    )
-    # print(upload_result)
-
-    await document_db.persist_document(upload_result.storage_id, project_id, upload_result, meta)
-    
-    return {
-        "doc_id": upload_result.storage_id,
-        "project_id": project_id,
-        # "storage_id": ,
-        "size": upload_result.size,
-        "duplicate": upload_result.duplicate,
-    }
 
 
 @protected_router.get("/v1/projects/{project_id}/documents")
@@ -407,14 +231,67 @@ async def list_project_documents(
     return {"ok": True, "documents": documents}
 
 
+# ----------------------------
+# Protected Endpoints (require auth)
+# ----------------------------
+
+
+# what could be improved
+# user permissions/max_file_size
+#
+@protected_router.post("/v1/documents/upload")
+async def upload(
+    file: UploadFile = File(...),
+    project_id: str = Form(...),
+    title: str = Form(...),
+    description: str | None = Form(None),
+
+    user: UserCreds = Depends(authenticated),
+    s3_client=Depends(get_s3),
+    project_db: ProjectDB = Depends(get_project_db),
+    document_db: DocumentDB = Depends(get_document_db),
+    settings: Settings = Depends(get_settings),
+):
+    # Verify user owns the project
+    await authorize_project(user, project_id, project_db)
+
+    content_type = await detect_content_type(file)
+    meta = UploadMeta(title=title, description=description)
+
+    async def file_stream():
+        while chunk := await file.read(64 * 1024):
+            yield chunk
+
+    # Use project_id as storage prefix for S3 organization
+    storage_prefix = f"{project_id}_"
+
+    upload_result = await upload_with_content_addressing(
+        s3=s3_client,
+        bucket=settings.bucket_name,
+        request_stream=file_stream(),
+        content_type=content_type,
+        max_bytes=1 * 1024 * 1024,
+        storage_prefix=storage_prefix,
+    )
+
+    await document_db.persist_document(upload_result.storage_id, project_id, upload_result, meta)
+
+    return {
+        "doc_id": upload_result.storage_id,
+        "project_id": project_id,
+        "size": upload_result.size,
+        "duplicate": upload_result.duplicate,
+    }
+
+
 @protected_router.delete("/v1/documents/{doc_id}")
 async def delete_document(
     doc_id: str,
     user: UserCreds = Depends(authenticated),
     project_db: ProjectDB = Depends(get_project_db),
     document_db: DocumentDB = Depends(get_document_db),
-    s3 = Depends(get_s3),
-    settings = Depends(get_settings)
+    s3=Depends(get_s3),
+    settings=Depends(get_settings)
 ):
     """Delete a document (with ownership check via project)."""
     # Get document to find its project
@@ -427,19 +304,19 @@ async def delete_document(
 
     deleted = await document_db.delete(doc_id)
 
-    await s3.delete_object(Bucket= settings.bucket_name, Key=doc['project_id'] + "_" + doc_id)
+    await s3.delete_object(Bucket=settings.bucket_name, Key=doc['project_id'] + "_" + doc_id)
     return {"ok": deleted, "doc_id": doc_id}
 
 
 # preinit bucket if possible + plus pass as a setting
 # user passes project id and we actually add normal project_id functionality with dbs
 # we can do auth from now on
-# add proper crud for ops 
-# if we remove a file we also have to remove it from db 
+# add proper crud for ops
+# if we remove a file we also have to remove it from db
 # also think about connecting the tables in the db (cascade delete and stuff)
 
-# TODOs I want 
-# maybe move to sql finally to avoid string slop 
+# TODOs I want
+# maybe move to sql finally to avoid string slop
 
 # ----------------------------
 # App Initialization
@@ -450,7 +327,5 @@ register_exception_handlers(app)
 app.include_router(public_router)
 app.include_router(protected_router)
 
-
-import uvicorn
 
 uvicorn.run(app=app, port=8912, host="localhost")

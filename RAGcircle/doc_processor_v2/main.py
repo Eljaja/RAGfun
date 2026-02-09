@@ -89,32 +89,10 @@ async def lifespan(app: FastAPI = None):
         #     await opensearch.close()
 
 
-app = FastAPI(
-    lifespan=lifespan,
-    title="Document Processor v2",
-    description="Async document processing service - consumes S3 events from RabbitMQ",
-)
-
-
-@app.get("/")
-async def root():
-    return {
-        "service": "doc-processor-v2",
-        "status": "running",
-        "description": "Async document processing from RabbitMQ events",
-    }
-
-
-@app.get("/health")
-async def health():
-    return {"status": "ok", "service": "doc-processor-v2"}
 
 
 if __name__ == "__main__":
     import asyncio
     asyncio.run(lifespan())
 
-
-# Run with:
-# uvicorn main:app --host 0.0.0.0 --port 9998
 

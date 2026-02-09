@@ -4,6 +4,27 @@ import re
 from dataclasses import dataclass
 
 
+
+#  encoding = "cl100k_base"
+#     enc = tiktoken.get_encoding(encoding)
+#     chunk_size = 512
+#     chunker = semchunk.chunkerify(lambda t: len(enc.encode(t)), chunk_size)
+
+#     # print(pdf_data)
+#     chunks = chunker(pdf_data.decode('utf-8'))
+
+#     processed_chunks = []
+#     for i, chunk in enumerate(chunks):
+#         print("****")
+#         print(chunk)
+#         print("****")
+#         ch = Chunk(text=chunk, source_id="1234", chunk_index=i)
+#         processed_chunks.append(ch)
+#         vectors = await em.embed(texts=[chunk])
+#         await store.upsert([ch], vectors)
+#     #print(chunks)
+
+
 def chunk_text_chars(text: str, *, chunk_size: int, overlap: int) -> list[str]:
     """
     Chunk text by character budget, but try hard to preserve Markdown structure,

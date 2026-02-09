@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
+import json 
 
 import asyncpg
 from fastapi import HTTPException
@@ -217,6 +218,18 @@ class DocumentDB:
                     extra = EXCLUDED.extra
             """, doc_id, project_id, upload.storage_id, meta.title, meta.description,
                 upload.size, upload.sha256, upload.duplicate, str(meta.extra))
+
+
+
+    # async def update_extra(self, doc_id: str, extra: dict) -> bool:
+    #     """Replace the entire extra field with a new dict."""
+    #     async with self.pool.acquire() as conn:
+    #         result = await conn.execute("""
+    #             UPDATE documents 
+    #             SET extra = $2 
+    #             WHERE doc_id = $1
+    #         """, doc_id, json.dumps(extra))
+    #         return result == "UPDATE 1"
 
     async def get(self, doc_id: str) -> Optional[dict]:
         """Get a document by ID. Returns None if not found."""

@@ -116,11 +116,6 @@ async def handle_object_created(*, info: S3EventInfo, s3_client, deps: PipelineD
         uri=source,
     )
 
-    print("THIS IS IMPORTANT")
-
-
-
-    #print("COLLECTIONS CREATED")
 
     result = await ingest_chunks(
         chunks=chunks,
@@ -131,7 +126,7 @@ async def handle_object_created(*, info: S3EventInfo, s3_client, deps: PipelineD
         opensearch_index=project_id,
         embed_batch_size=deps.embed_batch_size,
     )
-    print("WELL")
+
     if not result.ok:
         # Make it retryable so we either succeed or end up in DLQ after max retries.
         raise RuntimeError(f"ingestion_failed:{result.error}")

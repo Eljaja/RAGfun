@@ -45,29 +45,26 @@ async def bucket_exists(s3_cli, bucket_name: str) -> bool:
 async def create_collection(
     s3_cli,
     bucket_name: str,
-    settings,
+    aws_region,
+    queue_arn,
 ) -> CollectionCreateResponse:
     """
     Create bucket with event notifications.
     Raises BucketAlreadyExistsError if bucket exists.
     """
     if await bucket_exists(s3_cli, bucket_name):
-        raise BucketAlreadyExistsError(bucket_name)
+        return False
 
-    await create_bucket(s3_cli, bucket_name=bucket_name, region=settings.aws_region)
+    await create_bucket(s3_cli, bucket_name=bucket_name, region=aws_region)
     await subscribe_bucket_to_events(
         s3_cli,
         bucket_name=bucket_name,
-        queue_arn=settings.queue_arn,
+        queue_arn=queue_arn,
         events=["s3:ObjectCreated:*", "s3:ObjectRemoved:*"],
         config_id="rabbit-notification",
     )
 
-    return CollectionCreateResponse(
-        bucket=bucket_name,
-        created=True,
-        notifications_set=True,
-    )
+    return True
 
 
 async def create_bucket(s3_cli, bucket_name: str, region: str = "us-east-1") -> None:
@@ -110,78 +107,4 @@ async def subscribe_bucket_to_events(
     )
 
 
-async def delete_collection(
-    s3_cli,
-    bucket_name: str
-) -> CollectionDeleteResponse:
-    """
-    Delete all objects in a bucket and then delete the bucket itself.
-    This is a destructive operation that cannot be undone.
-    """
-    if not await bucket_exists(s3_cli, bucket_name):
-        raise BucketNotFoundError(bucket_name)
 
-    # List and delete all objects in the bucket
-    objects_deleted = 0
-    continuation_token = None
-
-    while True:
-        # List objects
-        list_params: dict[str, Any] = {"Bucket": bucket_name, "MaxKeys": 1000}
-        if continuation_token:
-            list_params["ContinuationToken"] = continuation_token
-
-        response = await safe_s3_call(
-            "list_objects_v2",
-            s3_cli.list_objects_v2(**list_params)
-        )
-
-        # Delete objects if any
-        contents = response.get("Contents", [])
-        if contents:
-            objects_to_delete = [{"Key": obj["Key"]} for obj in contents]
-            await safe_s3_call(
-                "delete_objects",
-                s3_cli.delete_objects(
-                    Bucket=bucket_name,
-                    Delete={"Objects": objects_to_delete}
-                )
-            )
-            objects_deleted += len(objects_to_delete)
-
-        # Check if there are more objects
-        if not response.get("IsTruncated", False):
-            break
-        continuation_token = response.get("NextContinuationToken")
-
-    # Delete the bucket
-    await safe_s3_call(
-        "delete_bucket",
-        s3_cli.delete_bucket(Bucket=bucket_name)
-    )
-
-    return CollectionDeleteResponse(
-        bucket=bucket_name,
-        deleted=True,
-        objects_deleted=objects_deleted,
-    )
-
-
-async def list_collections(s3_cli) -> CollectionListResponse:
-    """List all buckets/collections"""
-    response = await safe_s3_call(
-        "list_buckets",
-        s3_cli.list_buckets()
-    )
-
-    buckets = []
-    for bucket in response.get("Buckets", []):
-        buckets.append(BucketInfo(
-            name=bucket["Name"],
-            creation_date=bucket["CreationDate"].isoformat(),
-        ))
-
-    return CollectionListResponse(
-        buckets=buckets,
-        count=len(buckets),
-    )

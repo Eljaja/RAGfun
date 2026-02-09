@@ -249,24 +249,24 @@ async def file_to_texts(
 ) -> list[str]:
     """
     Convert file bytes to a list of text segments (pages/sections).
-    
+
     This is the main entry point for document processing.
     Routes to the appropriate converter based on content type/filename,
     then extracts text.
-    
+
     Args:
         raw: File content as bytes
         content_type: MIME type (e.g., "application/pdf")
         filename: Original filename (used for format detection)
         vlm: VLM client for image-based extraction
         settings: Processing settings (uses defaults if None)
-    
+
     Returns:
         List of text strings (one per page for PDFs, single item for others)
     """
     if settings is None:
         settings = Settings()
-    
+
     document = document_from_bytes(raw, content_type, filename, vlm, settings)
     # print(type(document))
     return await document.to_text()
