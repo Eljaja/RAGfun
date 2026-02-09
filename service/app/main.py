@@ -385,6 +385,9 @@ async def search(payload: SearchRequest):
         redact_uri_mode=state.settings.redact_uri_mode,
         enable_page_deduplication=state.settings.enable_page_deduplication,
         enable_parent_page_retrieval=state.settings.enable_parent_page_retrieval,
+        adaptive_k_enabled=state.settings.adaptive_k_enabled,
+        adaptive_k_min=state.settings.adaptive_k_min,
+        adaptive_k_max=state.settings.adaptive_k_max,
     )
     REQS.labels(endpoint="/v1/search", status="200").inc()
     return r

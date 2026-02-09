@@ -72,6 +72,11 @@ class Settings(BaseSettings):
     enable_page_deduplication: bool = False  # Deduplicate chunks by (doc_id, page)
     enable_parent_page_retrieval: bool = False  # Return full pages instead of chunks
 
+    # Adaptive-k: cut at steepest score drop instead of fixed top_k.
+    adaptive_k_enabled: bool = False
+    adaptive_k_min: int = 3
+    adaptive_k_max: int = 24
+
     # Embedding enrichment (opt-in):
     # prepend lightweight contextual headers (title/uri/page/lang/source) to the text BEFORE embedding,
     # while keeping stored chunk text unchanged.

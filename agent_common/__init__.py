@@ -2,6 +2,7 @@
 
 from agent_common.prompts import (
     ANSWER_SYSTEM,
+    ANSWER_SYSTEM_WITH_TOOLS,
     ANSWER_USER,
     DEEP_FACT_QUERIES,
     DEEP_HYDE,
@@ -24,9 +25,11 @@ from agent_common.retrieval import (
 )
 from agent_common.gate_client import AsyncGateClient, SyncGateClient
 from agent_common.events import EventType
+from agent_common.tools import run_calculator, run_execute_code
 
 __all__ = [
     "ANSWER_SYSTEM",
+    "ANSWER_SYSTEM_WITH_TOOLS",
     "ANSWER_USER",
     "DEEP_FACT_QUERIES",
     "DEEP_HYDE",
@@ -47,4 +50,6 @@ __all__ = [
     "AsyncGateClient",
     "SyncGateClient",
     "EventType",
+    "run_calculator",
+    "run_execute_code",
 ]

@@ -221,6 +221,9 @@ async def search(
     redact_uri_mode: str,
     enable_page_deduplication: bool = False,
     enable_parent_page_retrieval: bool = False,
+    adaptive_k_enabled: bool = False,
+    adaptive_k_min: int = 3,
+    adaptive_k_max: int = 24,
 ) -> SearchResponse:
     top_k = req.top_k or top_k_default
     max_per_doc = req.max_chunks_per_doc or max_chunks_per_doc
@@ -490,7 +493,19 @@ async def search(
         out = _group_by_doc(out, max_per_doc)
 
     # Final truncate (after rerank and grouping/dedup improvements).
-    if len(out) > top_k:
+    use_adaptive = req.use_adaptive_k if req.use_adaptive_k is not None else adaptive_k_enabled
+    if use_adaptive and len(out) > 1:
+        # Adaptive-k: cut at steepest score drop. k = argmax(s_i - s_{i+1}) + 1
+        scores = [h.score for h in out]
+        gaps = [scores[i] - scores[i + 1] for i in range(len(scores) - 1)]
+        if gaps:
+            best_i = max(range(len(gaps)), key=lambda i: gaps[i])
+            effective_k = best_i + 1
+            effective_k = max(adaptive_k_min, min(adaptive_k_max, effective_k))
+            if len(out) > effective_k:
+                out = out[:effective_k]
+            logger.debug("rag_adaptive_k", extra={"computed_k": best_i + 1, "effective_k": effective_k})
+    elif len(out) > top_k:
         out = out[:top_k]
 
     with tracer.start_as_current_span("assemble_response"):

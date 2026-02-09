@@ -128,6 +128,9 @@ class SearchRequest(BaseModel):
 
     rerank: bool | None = None  # override config
 
+    # Adaptive-k: cut at steepest score drop. None = use service config.
+    use_adaptive_k: bool | None = None
+
 
 class SourceObj(BaseModel):
     doc_id: str

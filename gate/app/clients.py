@@ -23,6 +23,7 @@ class RetrievalClient:
         top_k: int,
         rerank: bool | None = None,
         max_chunks_per_doc: int | None = None,
+        use_adaptive_k: bool | None = None,
         filters: dict[str, Any] | None,
         acl: list[str],
         include_sources: bool,
@@ -34,6 +35,7 @@ class RetrievalClient:
             # Let gate override service-level rerank behavior (critical for multi-query/anchor passes).
             "rerank": rerank,
             "max_chunks_per_doc": max_chunks_per_doc,
+            "use_adaptive_k": use_adaptive_k,
             "include_sources": include_sources,
             "sources_level": "basic",
             "filters": filters,

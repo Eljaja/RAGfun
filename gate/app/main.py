@@ -411,6 +411,7 @@ async def _apply_bm25_anchor_pass(
             mode="bm25",
             top_k=anchor_top_k,
             rerank=False,
+            use_adaptive_k=False,
             filters=filters,
             acl=payload.acl,
             include_sources=payload.include_sources,
@@ -676,6 +677,7 @@ async def chat(payload: ChatRequest):
     two_pass_enabled = bool(state.settings.two_pass_enabled)
     bm25_anchor_enabled = bool(state.settings.bm25_anchor_enabled)
     segment_stitching_enabled = bool(state.settings.segment_stitching_enabled)
+    use_adaptive_k = payload.use_adaptive_k if payload.use_adaptive_k is not None else bool(state.settings.adaptive_k_enabled)
 
     filters = payload.filters.model_dump(exclude_none=True) if payload.filters else None
 
@@ -694,6 +696,7 @@ async def chat(payload: ChatRequest):
                     top_k=raw_top_k,
                     # IMPORTANT: keep rerank behavior for q0 (restores quality vs massive refusals).
                     rerank=rerank,
+                    use_adaptive_k=False,
                     filters=filters,
                     acl=payload.acl,
                     include_sources=payload.include_sources,
@@ -725,6 +728,7 @@ async def chat(payload: ChatRequest):
                         top_k=raw_top_k,
                         # Only q0 is reranked; expansions are for recall.
                         rerank=False if q != payload.query else rerank,
+                        use_adaptive_k=False,
                         filters=filters,
                         acl=payload.acl,
                         include_sources=payload.include_sources,
@@ -777,6 +781,7 @@ async def chat(payload: ChatRequest):
                     mode=mode,
                     top_k=top_k,
                     rerank=rerank,
+                    use_adaptive_k=use_adaptive_k,
                     filters=filters,
                     acl=payload.acl,
                     include_sources=payload.include_sources,
@@ -822,6 +827,7 @@ async def chat(payload: ChatRequest):
                     mode="bm25",
                     top_k=20,
                     rerank=False,
+                    use_adaptive_k=False,
                     filters={**(filters or {}), "doc_ids": doc_ids},
                     acl=payload.acl,
                     include_sources=False,
@@ -889,6 +895,7 @@ async def chat(payload: ChatRequest):
                                     mode="bm25",
                                     top_k=20,
                                     rerank=False,
+                                    use_adaptive_k=False,
                                     filters={**(filters or {}), "doc_ids": [did]},
                                     acl=payload.acl,
                                     include_sources=False,
@@ -1733,6 +1740,7 @@ async def chat_stream(payload: ChatRequest):
     rerank = payload.rerank
     bm25_anchor_enabled = bool(state.settings.bm25_anchor_enabled)
     segment_stitching_enabled = bool(state.settings.segment_stitching_enabled)
+    use_adaptive_k = payload.use_adaptive_k if payload.use_adaptive_k is not None else bool(state.settings.adaptive_k_enabled)
 
     filters = payload.filters.model_dump(exclude_none=True) if payload.filters else None
 
@@ -1746,6 +1754,7 @@ async def chat_stream(payload: ChatRequest):
                         mode=mode,
                         top_k=top_k,
                         rerank=rerank,
+                        use_adaptive_k=use_adaptive_k,
                         filters=filters,
                         acl=payload.acl,
                         include_sources=payload.include_sources,

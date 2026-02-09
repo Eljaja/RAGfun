@@ -13,9 +13,9 @@ PLAN_SYSTEM = (
 PLAN_USER = (
     "{history}"
     "Decide per-request retrieval knobs.\n"
-    "JSON fields: retrieval_mode (bm25|vector|hybrid), top_k (1..40), "
-    "rerank (true/false), use_hyde (true/false), use_web_search (true/false), reason.\n"
-    "Set use_web_search=true for: current events, news, facts outside documents, recent data.\n"
+    "JSON fields: retrieval_mode (bm25|vector|hybrid), top_k (5..24), "
+    "rerank (true/false), use_hyde (true/false), reason.\n"
+    "top_k guidelines: 5-8 for simple factoid/definition; 10-14 for comparison/multi-entity; 16-24 for list/summary/multi-hop.\n"
     "Query: {query}"
 )
 
@@ -62,6 +62,12 @@ ANSWER_SYSTEM = (
     "You answer using the provided context only. "
     "When you use information from a context block, cite it with [N] where N is the block number (e.g. [1], [2]). "
     "If the context is insufficient, say what is missing. Reply in {lang}."
+)
+ANSWER_SYSTEM_WITH_TOOLS = (
+    "You answer using the provided context. "
+    "ALWAYS use the calculator tool for any numeric computation (arithmetic, sqrt, log, etc). "
+    "Use execute_code for code that must run (e.g. list comprehensions, data transforms). "
+    "Cite context with [N] when you use it. Reply in {lang}."
 )
 ANSWER_USER = (
     "{history}Question:\n{query}\n\nContext:\n{context}\n\n"

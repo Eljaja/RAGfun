@@ -22,12 +22,15 @@ from pydantic import BaseModel, Field
 
 from agent_common import (
     ANSWER_SYSTEM,
+    ANSWER_SYSTEM_WITH_TOOLS,
     ANSWER_USER,
     AsyncGateClient,
     FACT_QUERIES_SYSTEM,
     FACT_QUERIES_USER,
     HYDE_SYSTEM,
     HYDE_USER,
+    run_calculator,
+    run_execute_code,
     KEYWORD_QUERIES_SYSTEM,
     KEYWORD_QUERIES_USER,
     PLAN_SYSTEM,
@@ -38,8 +41,6 @@ from agent_common import (
     quality_is_poor,
     sources_from_context,
 )
-from agent_common.web_search import web_search_async
-
 # Prometheus metrics
 AGENT_REQS = Counter("agent_requests_total", "Agent requests", ["endpoint", "status"])
 AGENT_LAT = Histogram(
@@ -97,14 +98,15 @@ class AgentRequest(BaseModel):
     history: list[dict[str, str]] = Field(default_factory=list, description="Conversation history (role, content)")
     filters: GateFilters | None = Field(None, description="Gate filters")
     include_sources: bool = Field(True, description="Include sources in response")
-    use_web_search: bool | None = Field(None, description="Enable web search (override env)")
-    web_search_num: int | None = Field(None, description="Max web search results")
-    web_search_timeout_s: float | None = Field(None, description="Web search timeout")
+    top_k: int | None = Field(None, description="Override retrieval top_k (5..24), else use plan")
+    use_adaptive_k: bool | None = Field(None, description="Cut at steepest score drop (adaptive-k)")
     max_llm_calls: int | None = Field(None, description="Max LLM calls per request")
     max_fact_queries: int | None = Field(None, description="Max fact queries per request")
     use_hyde: bool | None = Field(None, description="Enable HyDE (override env)")
+    hyde_num: int | None = Field(None, description="Number of HyDE variants to merge (1=single, 3=multi)")
     use_fact_queries: bool | None = Field(None, description="Enable fact queries (override env)")
     use_retry: bool | None = Field(None, description="Enable retry on incomplete (override env)")
+    use_tools: bool | None = Field(None, description="Enable calculator & code execution tools")
     mode: str | None = Field(None, description="Preset: minimal | conservative | aggressive")
 
 
@@ -149,6 +151,63 @@ async def _llm_chat(
     resp.raise_for_status()
     data = resp.json()
     return str(data["choices"][0]["message"]["content"])
+
+
+async def _llm_chat_with_tools(
+    client: httpx.AsyncClient,
+    base_url: str,
+    model: str,
+    api_key: str | None,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    temperature: float = 0.2,
+    timeout_s: float = 60.0,
+    max_tool_rounds: int = 5,
+) -> str:
+    """Call LLM with tools; execute tool calls and loop until final answer."""
+    url = base_url.rstrip("/") + "/chat/completions"
+    msgs = list(messages)
+    for _ in range(max_tool_rounds):
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": msgs,
+            "temperature": temperature,
+            "tools": tools,
+            "tool_choice": "auto",
+        }
+        resp = await client.post(url, json=payload, headers=_llm_headers(api_key), timeout=timeout_s)
+        resp.raise_for_status()
+        data = resp.json()
+        choice = (data.get("choices") or [{}])[0]
+        msg = choice.get("message") or {}
+        content = msg.get("content")
+        tool_calls = msg.get("tool_calls")
+        msgs.append({"role": "assistant", "content": content or "", "tool_calls": tool_calls or []})
+        if not tool_calls:
+            return (content or "").strip()
+        for tc in tool_calls:
+            fid = tc.get("id", "")
+            fn = (tc.get("function") or {})
+            name = fn.get("name", "")
+            args_str = fn.get("arguments", "{}")
+            try:
+                args = json.loads(args_str)
+            except json.JSONDecodeError:
+                args = {}
+            if name == "calculator":
+                out = run_calculator(args.get("expression", ""))
+                result = str(out.get("result")) if out.get("ok") else f"Error: {out.get('error', 'unknown')}"
+            elif name == "execute_code":
+                out = run_execute_code(args.get("code", ""))
+                result = out.get("stdout", "") or (f"stderr: {out.get('stderr', '')}" if not out.get("ok") else "ok")
+            else:
+                result = "Unknown tool"
+            msgs.append({
+                "role": "tool",
+                "tool_call_id": fid,
+                "content": result,
+            })
+    return ""
 
 
 async def _llm_chat_stream(
@@ -205,7 +264,36 @@ async def _plan_retrieval(
     try:
         return json.loads(raw)
     except Exception:
-        return {"retrieval_mode": "hybrid", "top_k": 8, "rerank": True, "use_hyde": False, "use_web_search": False, "reason": "fallback"}
+        return {"retrieval_mode": "hybrid", "top_k": 10, "rerank": True, "use_hyde": False, "reason": "fallback"}
+
+
+# Tool definitions for OpenAI-compatible API
+AGENT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "calculator",
+            "description": "Evaluate a math expression. Supports +, -, *, /, **, sqrt, log, sin, cos, pi, e.",
+            "parameters": {
+                "type": "object",
+                "properties": {"expression": {"type": "string", "description": "Math expression, e.g. 2+2*3 or sqrt(16)"}},
+                "required": ["expression"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "execute_code",
+            "description": "Run Python code in sandbox. No imports, no file I/O. Use for list comprehensions, data transforms.",
+            "parameters": {
+                "type": "object",
+                "properties": {"code": {"type": "string", "description": "Python code to run, e.g. print(sum(range(10)))"}},
+                "required": ["code"],
+            },
+        },
+    },
+]
 
 
 async def _make_hyde(
@@ -216,6 +304,7 @@ async def _make_hyde(
     query: str,
     timeout_s: float,
     lang_hint: str = "English",
+    temperature: float = 0.2,
 ) -> str:
     system = {"role": "system", "content": HYDE_SYSTEM.format(lang=lang_hint)}
     user = {"role": "user", "content": HYDE_USER.format(query=query, lang=lang_hint)}
@@ -225,7 +314,7 @@ async def _make_hyde(
         llm_model,
         llm_key,
         [system, user],
-        temperature=0.2,
+        temperature=temperature,
         timeout_s=timeout_s,
     )
 
@@ -380,6 +469,7 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
     use_hyde_payload = payload.use_hyde if payload.use_hyde is not None else preset.get("use_hyde")
     use_fact_queries_payload = payload.use_fact_queries if payload.use_fact_queries is not None else preset.get("use_fact_queries")
     use_retry_payload = payload.use_retry if payload.use_retry is not None else preset.get("use_retry")
+    use_tools = payload.use_tools if payload.use_tools is not None else _env_get("AGENT_USE_TOOLS", "false").lower() in ("1", "true", "yes")
     max_fact_queries = payload.max_fact_queries if payload.max_fact_queries is not None else preset.get("max_fact_queries")
     max_fact_queries = max_fact_queries if max_fact_queries is not None else int(_env_get("AGENT_MAX_FACT_QUERIES", "2"))
 
@@ -405,11 +495,15 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
         AGENT_LLM_CALLS.labels(stage="plan").inc()
         plan = await _plan_retrieval(client, llm_base, llm_model, llm_key, payload.query, timeout_s=llm_timeout, history=hist)
     else:
-        plan = {"retrieval_mode": "hybrid", "top_k": 8, "rerank": True, "use_hyde": False, "use_web_search": False, "reason": "max_llm_calls"}
+        plan = {"retrieval_mode": "hybrid", "top_k": 10, "rerank": True, "use_hyde": False, "reason": "max_llm_calls"}
 
     mode = str(plan.get("retrieval_mode") or "hybrid")
-    top_k = int(plan.get("top_k") or 8)
+    top_k_raw = int(payload.top_k) if payload.top_k is not None else int(plan.get("top_k") or 10)
+    top_k_min = int(_env_get("AGENT_TOP_K_MIN", "5"))
+    top_k_max = int(_env_get("AGENT_TOP_K_MAX", "24"))
+    top_k = max(top_k_min, min(top_k_max, top_k_raw))
     rerank = bool(plan.get("rerank") if plan.get("rerank") is not None else True)
+    use_adaptive_k = payload.use_adaptive_k
     use_hyde_plan = bool(plan.get("use_hyde") or False)
     if use_hyde_payload is not None:
         use_hyde = use_hyde_payload
@@ -419,25 +513,13 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
         use_hyde = False
     else:
         use_hyde = use_hyde_plan
-    use_web_search = bool(plan.get("use_web_search") or False)
     reason = str(plan.get("reason") or "no_reason")
-
-    web_provider = _env_get("WEB_SEARCH_PROVIDER", "").lower().strip()
-    web_key = os.environ.get("WEB_SEARCH_API_KEY") or os.environ.get("SERPER_API_KEY") or os.environ.get("TAVILY_API_KEY")
-    # Per-request override: False = never, True = force, None = use plan + env
-    if payload.use_web_search is False:
-        web_enabled = False
-    elif payload.use_web_search is True:
-        web_enabled = web_provider in ("serper", "tavily") and (web_key or "").strip()
-    else:
-        always_web = _env_get("AGENT_ALWAYS_WEB_SEARCH", "false").lower() in ("1", "true", "yes")
-        web_enabled = (use_web_search or always_web) and web_provider in ("serper", "tavily") and (web_key or "").strip()
 
     yield {
         "type": "trace",
         "kind": "thought",
         "label": "Plan",
-        "content": f"mode={mode}, top_k={top_k}, rerank={rerank}, hyde={use_hyde}, web={use_web_search}. Reason: {reason}",
+        "content": f"mode={mode}, top_k={top_k}, rerank={rerank}, hyde={use_hyde}. Reason: {reason}",
     }
 
     if _can_llm():
@@ -448,31 +530,76 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
     else:
         answer_lang = "English"
 
-    search_query = payload.query
-    if use_hyde and _can_llm():
-        AGENT_LLM_CALLS.labels(stage="hyde").inc()
-        yield {"type": "trace", "kind": "thought", "label": "HyDE", "content": f"Generating hypothetical passage in {answer_lang}."}
-        yield {"type": "trace", "kind": "tool", "name": "llm.hyde", "payload": {"model": llm_model, "query": payload.query, "lang": answer_lang}}
-        hyde = await _make_hyde(client, llm_base, llm_model, llm_key, payload.query, timeout_s=llm_timeout, lang_hint=answer_lang)
-        search_query = hyde.strip() or payload.query
+    hyde_num = payload.hyde_num if payload.hyde_num is not None else int(_env_get("AGENT_HYDE_NUM", "1"))
+    hyde_num = max(1, min(7, hyde_num))
 
-    yield {
-        "type": "trace",
-        "kind": "tool",
-        "name": "gate.chat",
-        "payload": {"query": search_query, "retrieval_mode": mode, "top_k": top_k, "rerank": rerank},
-    }
-    AGENT_GATE_CALLS.inc()
-    primary = await gate.chat(
-        client,
-        search_query,
-        history=[m for m in payload.history] if payload.history else None,
-        retrieval_mode=mode,
-        top_k=top_k,
-        rerank=rerank,
-        filters=filters,
-        include_sources=payload.include_sources,
-    )
+    if use_hyde and _can_llm():
+        if hyde_num > 1:
+            yield {"type": "trace", "kind": "thought", "label": "HyDE", "content": f"Generating {hyde_num} hypothetical passages in {answer_lang}."}
+            temps = [0.2 + 0.15 * i for i in range(hyde_num)][:hyde_num]
+            hyde_tasks = [
+                _make_hyde(client, llm_base, llm_model, llm_key, payload.query, timeout_s=llm_timeout, lang_hint=answer_lang, temperature=t)
+                for t in temps
+            ]
+            for _ in hyde_tasks:
+                AGENT_LLM_CALLS.labels(stage="hyde").inc()
+            hyde_passages = await asyncio.gather(*hyde_tasks)
+            search_queries = [h.strip() or payload.query for h in hyde_passages if h.strip()]
+            if not search_queries:
+                search_queries = [payload.query]
+            yield {"type": "trace", "kind": "tool", "name": "llm.hyde", "payload": {"model": llm_model, "query": payload.query, "lang": answer_lang, "num": len(search_queries)}}
+            gate_tasks = [
+                gate.chat(client, q, history=[m for m in payload.history] if payload.history else None, retrieval_mode=mode, top_k=top_k, rerank=rerank, use_adaptive_k=use_adaptive_k, filters=filters, include_sources=payload.include_sources)
+                for q in search_queries
+            ]
+            hyde_responses = await asyncio.gather(*gate_tasks)
+            AGENT_GATE_CALLS.inc(len(hyde_responses))
+            merged_hits = merge_hits(hyde_responses, cap=max(12, top_k))
+            all_ctx = []
+            for r in hyde_responses:
+                all_ctx.extend(r.get("context") or [])
+            primary = {
+                "hits": merged_hits,
+                "context": context_from_hits(merged_hits, all_ctx),
+                "partial": any(r.get("partial") for r in hyde_responses),
+                "degraded": [],
+                "sources": hyde_responses[0].get("sources") or [] if hyde_responses else [],
+            }
+            for r in hyde_responses:
+                primary["degraded"].extend(r.get("degraded") or [])
+        else:
+            yield {"type": "trace", "kind": "thought", "label": "HyDE", "content": f"Generating hypothetical passage in {answer_lang}."}
+            yield {"type": "trace", "kind": "tool", "name": "llm.hyde", "payload": {"model": llm_model, "query": payload.query, "lang": answer_lang}}
+            hyde = await _make_hyde(client, llm_base, llm_model, llm_key, payload.query, timeout_s=llm_timeout, lang_hint=answer_lang)
+            search_query = hyde.strip() or payload.query
+            yield {"type": "trace", "kind": "tool", "name": "gate.chat", "payload": {"query": search_query, "retrieval_mode": mode, "top_k": top_k, "rerank": rerank}}
+            AGENT_GATE_CALLS.inc()
+            primary = await gate.chat(
+                client,
+                search_query,
+                history=[m for m in payload.history] if payload.history else None,
+                retrieval_mode=mode,
+                top_k=top_k,
+                rerank=rerank,
+                use_adaptive_k=use_adaptive_k,
+                filters=filters,
+                include_sources=payload.include_sources,
+            )
+    else:
+        search_query = payload.query
+        yield {"type": "trace", "kind": "tool", "name": "gate.chat", "payload": {"query": search_query, "retrieval_mode": mode, "top_k": top_k, "rerank": rerank}}
+        AGENT_GATE_CALLS.inc()
+        primary = await gate.chat(
+            client,
+            search_query,
+            history=[m for m in payload.history] if payload.history else None,
+            retrieval_mode=mode,
+            top_k=top_k,
+            rerank=rerank,
+            use_adaptive_k=use_adaptive_k,
+            filters=filters,
+            include_sources=payload.include_sources,
+        )
 
     min_hits = int(_env_get("AGENT_QUALITY_MIN_HITS", "3"))
     min_score = float(_env_get("AGENT_QUALITY_MIN_SCORE", "0.15"))
@@ -481,9 +608,9 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
     if use_fact_queries_payload is False:
         run_fact = False
     elif use_fact_queries_payload is True:
-        run_fact = use_fact_env and _can_llm() and not web_enabled
+        run_fact = use_fact_env and _can_llm()
     else:
-        run_fact = use_fact_env and (quality_is_poor(primary, min_hits=min_hits, min_score=min_score) or always_fact) and _can_llm() and not web_enabled
+        run_fact = use_fact_env and (quality_is_poor(primary, min_hits=min_hits, min_score=min_score) or always_fact) and _can_llm()
     responses = [primary]
     hits = list(primary.get("hits") or [])
     context_chunks = list(primary.get("context") or [])
@@ -508,6 +635,7 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
                     retrieval_mode=mode,
                     top_k=max(4, top_k // 2),
                     rerank=rerank,
+                    use_adaptive_k=use_adaptive_k,
                     filters=filters,
                     include_sources=payload.include_sources,
                 )
@@ -523,23 +651,6 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
             context_chunks = context_from_hits(hits, context_chunks)
         else:
             yield {"type": "trace", "kind": "thought", "label": "Quality", "content": "No useful fact queries found."}
-
-    if web_enabled:
-        web_num = payload.web_search_num if payload.web_search_num is not None else int(_env_get("WEB_SEARCH_NUM", "5"))
-        web_timeout = payload.web_search_timeout_s if payload.web_search_timeout_s is not None else float(_env_get("WEB_SEARCH_TIMEOUT_S", "15"))
-        yield {"type": "trace", "kind": "tool", "name": "web.search", "payload": {"query": payload.query, "provider": web_provider, "num": web_num}}
-        web_hits = await web_search_async(
-            payload.query,
-            provider=web_provider,
-            api_key=web_key,
-            num=web_num,
-            timeout_s=web_timeout,
-        )
-        if web_hits:
-            responses.append({"hits": web_hits})
-            hits = merge_hits(responses, cap=max(16, top_k + len(web_hits)))
-            context_chunks = context_from_hits(hits, context_chunks)
-            yield {"type": "trace", "kind": "action", "content": f"Web search: {len(web_hits)} results merged"}
 
     if not context_chunks:
         context_chunks = context_from_hits(hits, context_chunks)
@@ -563,29 +674,47 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
     if not context_text and context_chunks:
         context_text = build_context(context_chunks, limit=8, max_chars=4000)
     if not context_text:
-        yield {"type": "error", "error": "no_context"}
-        return
+        if use_tools:
+            context_text = "[No relevant documents. Use calculator for math, execute_code for code.]"
+        else:
+            yield {"type": "error", "error": "no_context"}
+            return
 
     hist_ctx = _history_summary(hist) if hist else ""
-    system = {"role": "system", "content": ANSWER_SYSTEM.format(lang=answer_lang)}
+    system_content = ANSWER_SYSTEM_WITH_TOOLS.format(lang=answer_lang) if use_tools else ANSWER_SYSTEM.format(lang=answer_lang)
+    system = {"role": "system", "content": system_content}
     user = {"role": "user", "content": ANSWER_USER.format(history=hist_ctx, query=payload.query, context=context_text)}
 
     AGENT_LLM_CALLS.labels(stage="answer").inc()
-    yield {"type": "trace", "kind": "tool", "name": "llm.answer", "payload": {"model": llm_model, "stream": True}}
-    answer_parts: list[str] = []
-    async for chunk in _llm_chat_stream(
-        client,
-        llm_base,
-        llm_model,
-        llm_key,
-        [system, user],
-        temperature=0.2,
-        timeout_s=llm_timeout,
-    ):
-        answer_parts.append(chunk)
-        yield {"type": "token", "content": chunk}
-
-    full_answer = "".join(answer_parts)
+    if use_tools:
+        yield {"type": "trace", "kind": "tool", "name": "llm.answer", "payload": {"model": llm_model, "stream": False, "tools": True}}
+        full_answer = await _llm_chat_with_tools(
+            client,
+            llm_base,
+            llm_model,
+            llm_key,
+            [system, user],
+            AGENT_TOOLS,
+            temperature=0.2,
+            timeout_s=llm_timeout,
+        )
+        for ch in full_answer:
+            yield {"type": "token", "content": ch}
+    else:
+        yield {"type": "trace", "kind": "tool", "name": "llm.answer", "payload": {"model": llm_model, "stream": True}}
+        answer_parts: list[str] = []
+        async for chunk in _llm_chat_stream(
+            client,
+            llm_base,
+            llm_model,
+            llm_key,
+            [system, user],
+            temperature=0.2,
+            timeout_s=llm_timeout,
+        ):
+            answer_parts.append(chunk)
+            yield {"type": "token", "content": chunk}
+        full_answer = "".join(answer_parts)
     sources = sources_from_context(context_chunks) if context_chunks else (primary.get("sources") or [])
 
     if _can_llm():
@@ -650,7 +779,7 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
         for q in queries:
             yield {"type": "trace", "kind": "tool", "name": "gate.chat", "payload": {"query": q, "retrieval_mode": retry_mode, "top_k": retry_top_k, "rerank": retry_rerank}}
         retry_tasks = [
-            gate.chat(client, q, history=hist, retrieval_mode=retry_mode, top_k=retry_top_k, rerank=retry_rerank, filters=filters, include_sources=payload.include_sources)
+            gate.chat(client, q, history=hist, retrieval_mode=retry_mode, top_k=retry_top_k, rerank=retry_rerank, use_adaptive_k=use_adaptive_k, filters=filters, include_sources=payload.include_sources)
             for q in queries
         ]
         retry_responses = await asyncio.gather(*retry_tasks)
@@ -673,7 +802,7 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
                 yield {"type": "trace", "kind": "action", "content": f"Fact query: {fq}"}
                 yield {"type": "trace", "kind": "tool", "name": "gate.chat", "payload": {"query": fq, "retrieval_mode": retry_mode, "top_k": max(4, retry_top_k // 2), "rerank": retry_rerank}}
             fact_retry_tasks = [
-                gate.chat(client, fq, history=hist, retrieval_mode=retry_mode, top_k=max(4, retry_top_k // 2), rerank=retry_rerank, filters=filters, include_sources=payload.include_sources)
+                gate.chat(client, fq, history=hist, retrieval_mode=retry_mode, top_k=max(4, retry_top_k // 2), rerank=retry_rerank, use_adaptive_k=use_adaptive_k, filters=filters, include_sources=payload.include_sources)
                 for fq in fact_qs
             ]
             fact_retry_responses = await asyncio.gather(*fact_retry_tasks)
@@ -708,19 +837,33 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
 
         if retry_context_text:
             hist_ctx = _history_summary(hist) if hist else ""
-            system = {"role": "system", "content": ANSWER_SYSTEM.format(lang=answer_lang)}
+            system_content = ANSWER_SYSTEM_WITH_TOOLS.format(lang=answer_lang) if use_tools else ANSWER_SYSTEM.format(lang=answer_lang)
+            system = {"role": "system", "content": system_content}
             user = {"role": "user", "content": ANSWER_USER.format(history=hist_ctx, query=payload.query, context=retry_context_text)}
             AGENT_LLM_CALLS.labels(stage="answer_retry").inc()
-            yield {"type": "trace", "kind": "tool", "name": "llm.answer", "payload": {"model": llm_model, "stream": False}}
-            full_answer = await _llm_chat(
-                client,
-                llm_base,
-                llm_model,
-                llm_key,
-                [system, user],
-                temperature=0.2,
-                timeout_s=llm_timeout,
-            )
+            if use_tools:
+                yield {"type": "trace", "kind": "tool", "name": "llm.answer", "payload": {"model": llm_model, "stream": False, "tools": True}}
+                full_answer = await _llm_chat_with_tools(
+                    client,
+                    llm_base,
+                    llm_model,
+                    llm_key,
+                    [system, user],
+                    AGENT_TOOLS,
+                    temperature=0.2,
+                    timeout_s=llm_timeout,
+                )
+            else:
+                yield {"type": "trace", "kind": "tool", "name": "llm.answer", "payload": {"model": llm_model, "stream": False}}
+                full_answer = await _llm_chat(
+                    client,
+                    llm_base,
+                    llm_model,
+                    llm_key,
+                    [system, user],
+                    temperature=0.2,
+                    timeout_s=llm_timeout,
+                )
             sources = sources_from_context(retry_context) if retry_context else (retry_resp.get("sources") or [])
             context_chunks = retry_context
             degraded = retry_degraded
@@ -813,6 +956,7 @@ async def agent_stream(request: Request, payload: AgentRequest):
         deadline = asyncio.get_event_loop().time() + timeout_s
         stream_error: str | None = None
         try:
+            yield f"data: {json.dumps(_with_trace_id({'type': 'init', 'trace_id': trace_id}, trace_id))}\n\n"
             async with httpx.AsyncClient() as client:
                 try:
                     async for event in _run_agent(payload, client):
@@ -839,4 +983,12 @@ async def agent_stream(request: Request, payload: AgentRequest):
             AGENT_LAT.labels(endpoint="/v1/agent/stream").observe(time.perf_counter() - t0)
             AGENT_REQS.labels(endpoint="/v1/agent/stream", status="ok" if not stream_error else "error").inc()
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

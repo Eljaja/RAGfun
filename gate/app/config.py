@@ -58,6 +58,9 @@ class Settings(BaseSettings):
     bm25_anchor_top_k: int = 30
     bm25_anchor_rrf_k: int = 60
 
+    # Adaptive-k: cut at steepest score drop (optional)
+    adaptive_k_enabled: bool = False
+
     # Context packing (segment stitching)
     segment_stitching_enabled: bool = False
     segment_stitching_max_chunks: int = 4

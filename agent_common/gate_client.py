@@ -74,6 +74,7 @@ class AsyncGateClient:
         retrieval_mode: str = "hybrid",
         top_k: int = 8,
         rerank: bool = True,
+        use_adaptive_k: bool | None = None,
         filters: dict[str, Any] | None = None,
         include_sources: bool = True,
     ) -> dict[str, Any]:
@@ -87,6 +88,8 @@ class AsyncGateClient:
             "rerank": bool(rerank),
             "include_sources": bool(include_sources),
         }
+        if use_adaptive_k is not None:
+            payload["use_adaptive_k"] = use_adaptive_k
         if filters:
             payload["filters"] = filters
 
@@ -100,8 +103,20 @@ class AsyncGateClient:
             resp.raise_for_status()
             return resp.json()
 
-        data = await _call()
-        return _normalize_gate_response(data, retrieval_mode)
+        try:
+            data = await _call()
+            return _normalize_gate_response(data, retrieval_mode)
+        except Exception:
+            return {
+                "ok": False,
+                "mode": retrieval_mode,
+                "partial": True,
+                "degraded": ["gate_error"],
+                "hits": [],
+                "context": [],
+                "sources": [],
+                "retrieval": {"ok": False, "partial": True, "degraded": ["gate_error"]},
+            }
 
 
 class SyncGateClient:
@@ -126,6 +141,7 @@ class SyncGateClient:
         retrieval_mode: str = "hybrid",
         top_k: int = 8,
         rerank: bool = True,
+        use_adaptive_k: bool | None = None,
         filters: dict[str, Any] | None = None,
         include_sources: bool = True,
     ) -> dict[str, Any]:
@@ -139,6 +155,8 @@ class SyncGateClient:
             "rerank": bool(rerank),
             "include_sources": bool(include_sources),
         }
+        if use_adaptive_k is not None:
+            payload["use_adaptive_k"] = use_adaptive_k
         if filters:
             payload["filters"] = filters
 
