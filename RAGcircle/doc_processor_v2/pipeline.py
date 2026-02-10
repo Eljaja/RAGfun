@@ -101,8 +101,12 @@ async def handle_object_created(*, info: S3EventInfo, s3_client, deps: PipelineD
     # print(info)
 
     filename = info.key.split("/")[-1]
+
+    # THe actual uuid4 that represents our doc
+    document_id = await s3_client.head_object(Bucket=info.bucket, Key=info.key).get("Metadata").get("doc-id")
+    
     project_id, doc_id = filename.split("_")
-    await deps.event_db_docs.log_ingested(doc_id=doc_id, processing_time_ms=1000)
+    await deps.event_db_docs.log_ingested(doc_id=doc_id, project_id=project_id, processing_time_ms=1000)
 
 
     # Download + extract
@@ -147,7 +151,7 @@ async def handle_object_created(*, info: S3EventInfo, s3_client, deps: PipelineD
         # Make it retryable so we either succeed or end up in DLQ after max retries.
         raise RuntimeError(f"ingestion_failed:{result.error}")
     else:
-        await deps.event_db_docs.log_processed(doc_id=doc_id, processing_time_ms=1000)
+        await deps.event_db_docs.log_processed(doc_id=doc_id, project_id=project_id, processing_time_ms=1000)
 
 
 async def handle_object_removed(*, info: S3EventInfo, deps: PipelineDeps) -> None:
@@ -188,7 +192,7 @@ async def handle_object_removed(*, info: S3EventInfo, deps: PipelineDeps) -> Non
     for did in doc_ids:
         await _delete_one(did)
 
-    await deps.event_db_docs.log_deleted(doc_id=doc_id, deleted_by="USER", reason="ASK THE USER")
+    await deps.event_db_docs.log_deleted(doc_id=doc_id, project_id=project_id, deleted_by="USER", reason="ASK THE USER")
 
 
 async def handle_s3_event(*, info: S3EventInfo, s3_client, deps: PipelineDeps) -> None:
