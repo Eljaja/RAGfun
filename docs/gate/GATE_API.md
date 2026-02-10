@@ -49,7 +49,7 @@ Non-streaming chat. Retrieval → build context → call LLM → return answer +
 - **query**: `string` — user query
 - **history**: `[{role, content}]` — chat history (optional)
 - **retrieval_mode**: `"bm25" | "vector" | "hybrid"` (optional; else config default)
-- **top_k**: `int` (optional)
+- **top_k**: `int` (optional). If present (e.g. from agent plan), Gate uses it; otherwise uses `GATE_TOP_K`.
 - **rerank**: `bool` (optional)
 - **filters**: filter object (optional)
   - **source**: `string|null`

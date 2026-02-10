@@ -9,7 +9,7 @@ This repository implements a full-featured RAG system with:
 - **Hybrid Retrieval**: Combines BM25 (sparse) and dense vector search with Reciprocal Rank Fusion (RRF)
 - **VLM-Powered Document Processing**: Uses Vision-Language Models (Granite-Docling) for accurate document-to-text extraction
 - **Stateless Microservices**: Horizontally scalable services with clear separation of concerns
-- **Agent-Search & Deep-Research**: LLM-driven retrieval (plan, HyDE, fact queries, retry) and iterative research (LangGraph)
+- **Agent-Search**: LLM-driven retrieval (plan, HyDE, fact queries, retry)
 - **Advanced Features**: Multi-query expansion, two-pass retrieval, reranking, segment stitching, auto-tuning
 - **Full Observability**: Prometheus metrics, Grafana dashboards, structured logging
 - **Async Processing**: RabbitMQ-based ingestion pipeline with retry/DLQ
@@ -52,7 +52,7 @@ The default `docker-compose.yml` includes the Infinity embeddings service (BAAI/
    ```bash
    docker compose up -d --build
    ```
-   With agent-search and deep-research (profile `agent-search`):
+   With agent-search (profile `agent-search`):
    ```bash
    docker compose --profile agent-search up -d --build
    ```
@@ -104,7 +104,6 @@ The system consists of **8 microservices** organized into application, ML, and i
 - **document-storage** (`:8081`) - Stores document bytes (S3-compatible) and metadata (Postgres)
 - **doc-processor** (`:8082`) - Async worker for document extraction, chunking, and indexing
 - **agent-search** (`:8093`, profile `agent-search`) - LLM-driven search: plan, HyDE, fact queries, retry
-- **deep-research** (`:8094`, profile `agent-search`) - Iterative research (LangGraph). Async Gate client, parallel fact/alt-mode calls, cancellation on disconnect.
 - **ui** (`:3300`) - Nginx-served SPA with SSE streaming support
 
 #### ML/Embedding Services
@@ -149,18 +148,17 @@ The system consists of **8 microservices** organized into application, ML, and i
 - **Auto-Tuning**: Optional LLM-based parameter optimization via router
 - **Full Observability**: Prometheus metrics, Grafana dashboards, structured logs
 
-### Agent & Deep Research
+### Agent-Search
 
-Two LLM-driven services extend RAG with intelligent query planning and iterative research (profile `agent-search`):
+LLM-driven search (profile `agent-search`): plan → Gate.chat → quality check → fact queries → answer, with optional web search.
 
 | Service | Port | Description |
 |---------|------|-------------|
-| **agent-search** | 8093 | Plan → Gate.chat → quality check → fact queries → answer (with optional web search) |
-| **deep-research** | 8094 | LangGraph: plan → scope → research loop → streaming report. Async Gate, parallel calls, cancellation on disconnect. |
+| **agent-search** | 8093 | Plan → Gate.chat → quality check → fact queries → answer (optional web search, citation [1][2]) |
 
-**Features:** Web search (Serper/Tavily), citation [1][2], per-request limits (`max_llm_calls`, `max_fact_queries`), feature flags (`use_hyde`, `use_fact_queries`, `use_retry`), mode presets (`minimal`/`conservative`/`aggressive`), Prometheus metrics. Deep-research uses async Gate client and parallelizes fact queries and alt-mode retrieval.
+**Features:** Web search (Serper/Tavily), per-request limits (`max_llm_calls`, `max_fact_queries`), feature flags (`use_hyde`, `use_fact_queries`, `use_retry`), mode presets (`minimal`/`conservative`/`aggressive`), Prometheus metrics.
 
-See **[docs/AGENT_SEARCH_AND_DEEP_RESEARCH.md](./docs/AGENT_SEARCH_AND_DEEP_RESEARCH.md)** for API reference, parameters, and configuration.
+See **[docs/AGENT_SEARCH.md](./docs/AGENT_SEARCH.md)** for API reference and configuration.
 
 ## Current Direction
 
@@ -323,26 +321,19 @@ Content-Type: application/json
 }
 ```
 
-### Agent-Search & Deep-Research
-
-See **[docs/AGENT_SEARCH_AND_DEEP_RESEARCH.md](./docs/AGENT_SEARCH_AND_DEEP_RESEARCH.md)** for full API reference, request parameters, and configuration.
-
 ### Verifying Agent Services
 
 ```bash
 # 1. Start services (if not already running)
 docker compose --profile agent-search up -d
 
-# 2. Full verification: retrieval, gate, agent-search, deep-research
+# 2. Full verification: retrieval, gate, agent-search
 python scripts/verify_agent_queries.py
 
-# 3. Async concurrency test (parallel deep-research + agent, cancellation)
-python scripts/test_async_concurrent.py
-
-# 4. Smoke test (retrieval)
+# 3. Smoke test (retrieval)
 python scripts/smoke_test.py
 
-# 5. Pipeline e2e (upload → chat → delete)
+# 4. Pipeline e2e (upload → chat → delete)
 docker build -t rugfunsota-pipeline-tests -f pipeline-tests/Dockerfile pipeline-tests/
 docker run --rm --network rugfunsota_rag-network \
   -e GATE_BASE_URL=http://rag-gate:8090 \
@@ -389,11 +380,6 @@ AGENT_QUALITY_MIN_HITS=3
 AGENT_QUALITY_MIN_SCORE=0.15
 AGENT_ALWAYS_FACT_QUERIES=false
 
-# Deep-Research (port 8094)
-DEEP_MAX_ITERATIONS=6
-DEEP_EARLY_STOP_MIN_GAIN=2
-DEEP_RESEARCH_BATCH=5
-
 # Worker Configuration
 WORKER_CONCURRENCY=1
 DOCLING_TIMEOUT=300
@@ -417,7 +403,7 @@ Services that scale horizontally:
 ## Documentation
 
 - **[RUN_RUGFUNSOTA.md](./RUN_RUGFUNSOTA.md)** — Rugfunsota stack setup
-- **[docs/AGENT_SEARCH_AND_DEEP_RESEARCH.md](./docs/AGENT_SEARCH_AND_DEEP_RESEARCH.md)** — Agent-search and deep-research API
+- **[docs/AGENT_SEARCH.md](./docs/AGENT_SEARCH.md)** — Agent-search API
 - **[docs/ENDPOINTS_EXAMPLES.md](./docs/ENDPOINTS_EXAMPLES.md)** — Retrieval API examples
 - **[docs/gate/GATE_API.md](./docs/gate/GATE_API.md)** — Gate API
 

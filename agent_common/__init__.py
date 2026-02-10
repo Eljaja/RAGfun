@@ -1,12 +1,9 @@
-"""Shared library for agent-search and deep-research."""
+"""Shared library for agent-search."""
 
 from agent_common.prompts import (
     ANSWER_SYSTEM,
     ANSWER_SYSTEM_WITH_TOOLS,
     ANSWER_USER,
-    DEEP_FACT_QUERIES,
-    DEEP_HYDE,
-    DEEP_KEYWORD_QUERIES,
     FACT_QUERIES_SYSTEM,
     FACT_QUERIES_USER,
     HYDE_SYSTEM,
@@ -23,7 +20,7 @@ from agent_common.retrieval import (
     quality_is_poor,
     sources_from_context,
 )
-from agent_common.gate_client import AsyncGateClient, SyncGateClient
+from agent_common.gate_client import AsyncGateClient
 from agent_common.events import EventType
 from agent_common.tools import run_calculator, run_execute_code
 
@@ -31,9 +28,6 @@ __all__ = [
     "ANSWER_SYSTEM",
     "ANSWER_SYSTEM_WITH_TOOLS",
     "ANSWER_USER",
-    "DEEP_FACT_QUERIES",
-    "DEEP_HYDE",
-    "DEEP_KEYWORD_QUERIES",
     "FACT_QUERIES_SYSTEM",
     "FACT_QUERIES_USER",
     "HYDE_SYSTEM",
@@ -48,7 +42,6 @@ __all__ = [
     "context_from_hits",
     "sources_from_context",
     "AsyncGateClient",
-    "SyncGateClient",
     "EventType",
     "run_calculator",
     "run_execute_code",

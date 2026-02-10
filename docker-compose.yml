@@ -216,10 +216,11 @@ services:
       # Contextual Chunk Headers (CCH) for embeddings (opt-in; requires re-index/re-embed when enabled)
       - RAG_EMBEDDING_CONTEXTUAL_HEADERS_ENABLED=true
       - RAG_EMBEDDING_CONTEXTUAL_HEADERS_MAX_CHARS=400
-      # Chunking (mode=document): semantic (section-based) or token
-      - RAG_CHUNK_STRATEGY=semantic
-      - RAG_CHUNK_MAX_TOKENS=300
+      # Chunking (mode=document): semantic | token | semchunk
+      - RAG_CHUNK_STRATEGY=semchunk
+      - RAG_CHUNK_MAX_TOKENS=512
       - RAG_CHUNK_OVERLAP_TOKENS=50
+      - RAG_CHUNK_ENCODING=cl100k_base
       # Candidate pool (QUALITY): increase recall before fusion/rerank
       - RAG_DEFAULT_TOP_K=20
       - RAG_BM25_TOP_K=200

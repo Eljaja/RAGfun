@@ -286,6 +286,7 @@ async def index_upsert(payload: IndexUpsertRequest):
                 chunk_strategy=state.settings.chunk_strategy,
                 max_tokens=state.settings.chunk_max_tokens,
                 overlap_tokens=state.settings.chunk_overlap_tokens,
+                chunk_encoding=state.settings.chunk_encoding,
                 embedding_batch_size=state.settings.embedding_batch_size,
                 embedding_concurrency=state.settings.embedding_concurrency,
                 embedding_contextual_headers_enabled=state.settings.embedding_contextual_headers_enabled,

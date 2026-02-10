@@ -1,4 +1,4 @@
-"""Unified event format for agent-search and deep-research SSE streams."""
+"""Event format for agent-search SSE streams."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ EventType = Literal[
     "trace",      # thought, tool, action, mood
     "retrieval",  # hits, context, mode, partial, degraded
     "token",      # streaming answer chunk
-    "progress",   # stage, percent, message (deep-research)
+    "progress",   # stage, percent, message
     "done",       # answer, sources, context
     "error",      # error message
 ]
@@ -17,5 +17,5 @@ EventType = Literal[
 # Trace kinds
 TraceKind = Literal["thought", "tool", "action", "mood"]
 
-# Progress stages (deep-research)
+# Progress stages
 ProgressStage = Literal["init", "plan", "scope", "research", "write", "done", "compiled"]

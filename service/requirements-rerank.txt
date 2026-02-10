@@ -1,0 +1,2 @@
+# Only for RAG_RERANK_PROVIDER=local (in-process reranker). Adds ~10GB to image.
+sentence-transformers>=3.0.0

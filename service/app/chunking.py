@@ -11,6 +11,11 @@ try:
 except ImportError:
     tiktoken = None
 
+try:
+    import semchunk
+except ImportError:
+    semchunk = None
+
 # Default encoding used by GPT-4, GPT-3.5-turbo, and text-embedding-3-large
 _DEFAULT_ENCODING = "cl100k_base"
 
@@ -265,19 +270,56 @@ def chunk_text_semantic(
     return chunks
 
 
+def chunk_text_semchunk(
+    text: str,
+    max_tokens: int,
+    overlap_tokens: int,
+    encoding: str = "cl100k_base",
+) -> list[tuple[int, str, int]]:
+    """
+    Chunk using semchunk (semantically meaningful splits, fast). Uses tiktoken for token count.
+    overlap_tokens: absolute token overlap between chunks (>= 1); 0 = no overlap.
+    Returns list of (chunk_index, chunk_text, token_count).
+    """
+    if semchunk is None:
+        raise ValueError(
+            "semchunk is required for strategy 'semchunk'. Install with: pip install semchunk"
+        )
+    if tiktoken is None:
+        raise ValueError("tiktoken is required for strategy 'semchunk'. Install with: pip install tiktoken")
+    text = text.strip()
+    if not text:
+        return []
+    enc = tiktoken.get_encoding(encoding)
+    token_counter = lambda t: len(enc.encode(t, allowed_special="all"))
+    chunker = semchunk.chunkerify(token_counter, max_tokens, memoize=True)
+    overlap = max(0, min(overlap_tokens, max_tokens - 1)) if max_tokens > 1 else 0
+    chunks_list = chunker(text, overlap=overlap if overlap else None)
+    result: list[tuple[int, str, int]] = []
+    for idx, ctext in enumerate(chunks_list):
+        if not ctext.strip():
+            continue
+        cnt = token_count(ctext, enc)
+        result.append((idx, ctext, cnt))
+    return result
+
+
 def chunk_by_strategy(
     text: str,
     *,
     strategy: str,
     max_tokens: int,
     overlap_tokens: int,
+    encoding: str = "cl100k_base",
 ) -> list[tuple[int, str, int]]:
     """
-    Single entry point. strategy: "semantic" (section-based) or "token" (paragraph + sliding window).
+    Single entry point. strategy: "semantic" | "token" | "semchunk".
     Returns list of (chunk_index, chunk_text, token_count).
     """
     if strategy == "semantic":
         return chunk_text_semantic(text, max_tokens, overlap_tokens)
+    if strategy == "semchunk":
+        return chunk_text_semchunk(text, max_tokens, overlap_tokens, encoding=encoding)
     return chunk_text(text, max_tokens, overlap_tokens)
 
 

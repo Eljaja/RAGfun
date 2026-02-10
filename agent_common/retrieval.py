@@ -1,5 +1,5 @@
 """
-Shared retrieval helpers for agent-search and deep-research.
+Shared retrieval helpers for agent-search.
 
 - quality_is_poor: check if retrieval needs expansion (fact queries, retry)
 - merge_hits: RRF-like merge with dedupe (chunk_id or doc_id:chunk_index/hash fallback)

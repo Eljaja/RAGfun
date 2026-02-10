@@ -1,8 +1,7 @@
 """
-Shared prompt templates for agent-search and deep-research.
+Shared prompt templates for agent-search.
 
-Used by both services to ensure consistent LLM behavior for plan, HyDE, fact/keyword
-queries, and answer generation with citation.
+Used for plan, HyDE, fact/keyword queries, and answer generation with citation.
 """
 
 # Plan / retrieval strategy (agent-search plan stage)
@@ -39,22 +38,6 @@ KEYWORD_QUERIES_USER = (
     "{history}"
     'Return JSON: {{"keywords": [..]}} with 3-6 short keyword phrases. '
     "Query: {query}"
-)
-
-# Deep-research (single prompt string format)
-DEEP_HYDE = (
-    "Write a short hypothetical answer passage for retrieval. Write in {lang} only.\n"
-    "Query: {query}\nReturn a 3-5 sentence passage."
-)
-DEEP_FACT_QUERIES = (
-    "Extract fact-oriented sub-queries. Return JSON only.\n"
-    "Query: {query}\n"
-    'Return JSON: {{"fact_queries": [..]}} with 2-3 short queries.'
-)
-DEEP_KEYWORD_QUERIES = (
-    "Extract short keyword queries. Return JSON only.\n"
-    "Query: {query}\n"
-    'Return JSON: {{"keywords": [..]}} with 3-6 short keyword phrases.'
 )
 
 # Answer (citation)

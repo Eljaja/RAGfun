@@ -13,7 +13,7 @@ from app.clients.opensearch import OpenSearchClient
 from app.clients.qdrant import QdrantFacade
 from app.clients.rerank import Reranker
 from app.fusion import hybrid_fusion, rrf_fusion
-from app.metrics import CAND, DEP_DEGRADED, ERRS, LAT, RAG_PAGE_DEDUP_SAVED, RAG_PARENT_PAGES, RAG_PARTIAL, RAG_RERANK
+from app.metrics import CAND, DEP_DEGRADED, ERRS, LAT, RAG_ADAPTIVE_K_CHUNKS, RAG_PAGE_DEDUP_SAVED, RAG_PARENT_PAGES, RAG_PARTIAL, RAG_RERANK
 from app.models import SearchFilters, SearchHit, SearchRequest, SearchResponse, SourceObj
 from app.utils import redact_uri
 
@@ -504,6 +504,7 @@ async def search(
             effective_k = max(adaptive_k_min, min(adaptive_k_max, effective_k))
             if len(out) > effective_k:
                 out = out[:effective_k]
+            RAG_ADAPTIVE_K_CHUNKS.observe(effective_k)
             logger.debug("rag_adaptive_k", extra={"computed_k": best_i + 1, "effective_k": effective_k})
     elif len(out) > top_k:
         out = out[:top_k]

@@ -38,9 +38,10 @@ class Settings(BaseSettings):
     embedding_concurrency: int = 1
 
     # Chunking (mode=document only; mode=chunks uses doc-processor output)
-    chunk_strategy: str = "semantic"  # semantic|token
+    chunk_strategy: str = "semantic"  # semantic|token|semchunk
     chunk_max_tokens: int = 300
     chunk_overlap_tokens: int = 50
+    chunk_encoding: str = "cl100k_base"  # tiktoken encoding for semchunk (and token/semantic)
 
     # Search: hybrid (BM25 + dense), configurable weights. RU/EN supported via embedder + BM25 analyzer.
     default_top_k: int = 10
@@ -125,6 +126,7 @@ class Settings(BaseSettings):
                 "strategy": self.chunk_strategy,
                 "max_tokens": self.chunk_max_tokens,
                 "overlap_tokens": self.chunk_overlap_tokens,
+                "encoding": self.chunk_encoding,
             },
             "search": {
                 "default_top_k": self.default_top_k,
@@ -176,8 +178,8 @@ def load_settings() -> Settings:
         raise ValueError("RAG_CHUNK_MAX_TOKENS must be > 0")
     if s.chunk_overlap_tokens < 0 or s.chunk_overlap_tokens >= s.chunk_max_tokens:
         raise ValueError("RAG_CHUNK_OVERLAP_TOKENS must be >=0 and < CHUNK_MAX_TOKENS")
-    if s.chunk_strategy not in ("semantic", "token"):
-        raise ValueError("RAG_CHUNK_STRATEGY must be 'semantic' or 'token'")
+    if s.chunk_strategy not in ("semantic", "token", "semchunk"):
+        raise ValueError("RAG_CHUNK_STRATEGY must be 'semantic', 'token' or 'semchunk'")
     if s.retrieval_candidates < 1:
         raise ValueError("RAG_RETRIEVAL_CANDIDATES must be >= 1")
     return s

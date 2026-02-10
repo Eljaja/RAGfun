@@ -938,7 +938,7 @@ async function askStream() {
   // Add user message + assistant placeholder
   addMessage({ role: "user", text: q });
   const assistant = addMessage({ role: "assistant", text: "" });
-  const agentToggle = document.getElementById("agent_research");
+  const agentToggle = document.getElementById("agent_toggle");
   const agentMode = !!(agentToggle && agentToggle.checked);
   let latestContext = null;
 
