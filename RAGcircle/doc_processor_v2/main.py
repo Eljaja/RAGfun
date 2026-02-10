@@ -28,9 +28,13 @@ from processing import Settings, VLMClient
 from store import BM25Store, QdrantStore
 
 
+from db_ops import DocumentEventDB
+import asyncpg
+
+
 # @asynccontextmanager
 async def lifespan(app: FastAPI = None):
-    cfg = AppConfig.from_env()
+    cfg = AppConfig()
 
     vlm = VLMClient(
         base_url=cfg.vlm_base_url,
@@ -55,6 +59,10 @@ async def lifespan(app: FastAPI = None):
     opensearch = BM25Store(url=cfg.opensearch_url)
     await opensearch.ensure_index(cfg.opensearch_index)
 
+    pool = await asyncpg.create_pool(cfg.db_addr)
+    document_event_db = DocumentEventDB(pool)
+    await document_event_db.ensure_schema()
+
     deps = PipelineDeps(
         vlm=vlm,
         settings=settings,
@@ -64,6 +72,7 @@ async def lifespan(app: FastAPI = None):
         qdrant_collection=cfg.qdrant_collection,
         opensearch_index=cfg.opensearch_index,
         embed_batch_size=cfg.embed_batch_size,
+        event_db_docs=document_event_db,
     )
 
     session = get_session()

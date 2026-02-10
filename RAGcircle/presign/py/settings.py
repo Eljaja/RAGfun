@@ -1,5 +1,5 @@
 # settings.py
-from RAGfun.RAGcircle.presign.py.presign_main import opensearch, qdrant
+# from RAGfun.RAGcircle.presign.py.presign_main import opensearch, qdrant
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import os
 
@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     max_projects_per_user: int = 5
 
     qdrant_url: str = "http://localhost:8903"
-    opensearch_url: str = "http://localhost:8904s"
+    opensearch_url: str = "http://localhost:8905"
 
 def load_settings() -> Settings:
     return Settings()

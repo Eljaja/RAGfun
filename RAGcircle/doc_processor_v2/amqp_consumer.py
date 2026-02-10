@@ -47,10 +47,13 @@ def retry_count_from_headers(headers: dict | None, *, retry_queue: str) -> int:
 async def publish_to_retry(
     *,
     message: aio_pika.IncomingMessage,
-    retry_exchange: aio_pika.Exchange,
-    routing_key: str,
+    retry_levels: list[tuple[aio_pika.Exchange, str]],
     retry_count: int,
 ) -> None:
+    """Publish to the correct retry-level queue based on the current retry count."""
+    level_idx = min(retry_count, len(retry_levels) - 1)
+    exchange, routing_key = retry_levels[level_idx]
+
     hdrs = dict(message.headers or {})
     hdrs["x-retry-count"] = retry_count + 1
     msg = aio_pika.Message(
@@ -62,7 +65,7 @@ async def publish_to_retry(
         message_id=message.message_id,
         delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
     )
-    await retry_exchange.publish(msg, routing_key=routing_key)
+    await exchange.publish(msg, routing_key=routing_key)
 
 
 async def publish_to_dlq(
@@ -95,7 +98,7 @@ async def handle_incoming_message(
     message: aio_pika.IncomingMessage,
     s3_client,
     deps: PipelineDeps,
-    retry_exchange: aio_pika.Exchange,
+    retry_levels: list[tuple[aio_pika.Exchange, str]],
     dlq_exchange: aio_pika.Exchange,
     cfg: AppConfig,
 ) -> None:
@@ -111,12 +114,16 @@ async def handle_incoming_message(
     retry_count = retry_count_from_headers(message.headers, retry_queue=cfg.amqp_retry_queue)
 
     # Parse JSON payload (DLQ immediately if invalid)
+    # well this is only about the bad json
     try:
+        
         decoded = message.body.decode("utf-8")
         event = json.loads(decoded)
         # print(event)
     except Exception as e:
-        raise e
+        # raise e
+        print(e)
+        print("BAD JSON")
         await publish_to_dlq(
             message=message,
             dlq_exchange=dlq_exchange,
@@ -144,25 +151,28 @@ async def handle_incoming_message(
         info = extract_s3_event_info(event)
     except NonRetryableError as e:
         #raise e
-        print(e)
-        await message.ack()
-        return
-        # await publish_to_dlq(
-        #     message=message,
-        #     dlq_exchange=dlq_exchange,
-        #     routing_key=cfg.amqp_dlq_routing_key,
-        #     reason=f"non_retryable:{e}",
-        #     retry_count=retry_count,
-        # )
+        # print(e)
         # await message.ack()
+        # return
+        print("BAD EVENT CANNOT PARSE", e)
+        await publish_to_dlq(
+            message=message,
+            dlq_exchange=dlq_exchange,
+            routing_key=cfg.amqp_dlq_routing_key,
+            reason=f"non_retryable:{e}",
+            retry_count=retry_count,
+        )
+        await message.ack()
         return
 
     # Main pipeline
+    print("HERE WE GO PROCESSING")
     try:
         await handle_s3_event(info=info, s3_client=s3_client, deps=deps)
         await message.ack()
         return
     except NonRetryableError as e:
+        print("STAIGHT FROM DLQ FROM NRE")
         await publish_to_dlq(
             message=message,
             dlq_exchange=dlq_exchange,
@@ -175,8 +185,10 @@ async def handle_incoming_message(
     except Exception as e:
         print(e)
         # Retryable failure
-        raise e
-        if retry_count >= cfg.amqp_max_retries:
+        # raise e
+        print("RETRY COUNT", retry_count)
+        if retry_count >= len(retry_levels):
+            print("STRAIGHT TO DLQ")
             await publish_to_dlq(
                 message=message,
                 dlq_exchange=dlq_exchange,
@@ -186,10 +198,10 @@ async def handle_incoming_message(
             )
             await message.ack()
             return
+        print("REPUBLISH")
         await publish_to_retry(
             message=message,
-            retry_exchange=retry_exchange,
-            routing_key=cfg.amqp_retry_routing_key,
+            retry_levels=retry_levels,
             retry_count=retry_count,
         )
         await message.ack()
@@ -212,18 +224,26 @@ async def consume_rabbitmq(*, s3_client, deps: PipelineDeps, cfg: AppConfig) -> 
             dlq = await channel.declare_queue(cfg.amqp_dlq_queue, durable=True)
             await dlq.bind(exchange=dlx, routing_key=cfg.amqp_dlq_routing_key)
 
-            # Retry wiring (TTL -> dead-letter back to main exchange/routing key)
-            retry_ex = await channel.declare_exchange(cfg.amqp_retry_exchange, aio_pika.ExchangeType.DIRECT, durable=True)
-            retry_q = await channel.declare_queue(
-                cfg.amqp_retry_queue,
-                durable=True,
-                arguments={
-                    "x-message-ttl": cfg.amqp_retry_ttl_ms,
-                    "x-dead-letter-exchange": cfg.amqp_exchange,
-                    "x-dead-letter-routing-key": cfg.amqp_binding_key,
-                },
-            )
-            await retry_q.bind(exchange=retry_ex, routing_key=cfg.amqp_retry_routing_key)
+            # Retry ladder: one queue per level with increasing TTL.
+            # Each queue dead-letters expired messages back to the main exchange.
+            retry_levels: list[tuple[aio_pika.Exchange, str]] = []
+            for level, ttl_ms in enumerate(cfg.amqp_retry_ttls_ms, start=1):
+                ex_name = f"{cfg.amqp_retry_exchange}.{level}"
+                q_name = f"{cfg.amqp_retry_queue}.{level}"
+                rk = f"{cfg.amqp_retry_routing_key}.{level}"
+
+                ex = await channel.declare_exchange(ex_name, aio_pika.ExchangeType.DIRECT, durable=True)
+                q = await channel.declare_queue(
+                    q_name,
+                    durable=True,
+                    arguments={
+                        "x-message-ttl": ttl_ms,
+                        "x-dead-letter-exchange": cfg.amqp_exchange,
+                        "x-dead-letter-routing-key": cfg.amqp_binding_key,
+                    },
+                )
+                await q.bind(exchange=ex, routing_key=rk)
+                retry_levels.append((ex, rk))
 
             # Main queue: RustFS-managed; we bind to exchange+routing key
             queue = await channel.declare_queue(cfg.amqp_queue, durable=True)
@@ -235,15 +255,17 @@ async def consume_rabbitmq(*, s3_client, deps: PipelineDeps, cfg: AppConfig) -> 
                         message=message,
                         s3_client=s3_client,
                         deps=deps,
-                        retry_exchange=retry_ex,
+                        retry_levels=retry_levels,
                         dlq_exchange=dlx,
                         cfg=cfg,
                     )
         except asyncio.CancelledError:
-            print("ARE WE REAL")
+            # print("ARE WE REAL")
             break
         except Exception as e:
             # basic reconnect loop; caller can add backoff/logging
             #raise e
+            print(e)
+            print("NO GOOD WE ARE HERE ACTUALLY")
             await asyncio.sleep(3)
 

@@ -19,7 +19,7 @@ from fastapi import UploadFile, File, Form, HTTPException
 from pydantic import BaseModel
 
 
-from database_ops import create_db, ProjectDB, DocumentDB
+from database_ops import DocumentEventDB, create_db, ProjectDB, DocumentDB
 from auth import UserCreds, authenticated
 from projects import authorize_project
 
@@ -72,14 +72,18 @@ def get_document_db(request: Request) -> DocumentDB:
 def get_qdrant(request: Request):
     return request.app.state.qdrant
 
+
 def get_opensearch(request: Request):
     return request.app.state.opensearch
+
+
+def get_event_db(request: Request) -> DocumentEventDB:
+    return request.app.state.event_db
 
 
 # ----------------------------
 # Lifespan
 # ----------------------------
-
 
 
 @asynccontextmanager
@@ -101,7 +105,7 @@ async def lifecycle(app: FastAPI):
         # create bucket in case it does not exist
         await create_collection(s3, settings.bucket_name, settings.aws_region, settings.queue_arn,)
 
-        project_db, document_db = await stack.enter_async_context(
+        project_db, document_db, event_db = await stack.enter_async_context(
             create_db(
                 settings.database_url,
                 max_projects_per_user=settings.max_projects_per_user,
@@ -114,6 +118,8 @@ async def lifecycle(app: FastAPI):
         app.state.s3 = s3
         app.state.project_db = project_db
         app.state.document_db = document_db
+
+        app.state.event_db = event_db
         app.state.qdrant = qdrant
         app.state.opensearch = opensearch
         app.state.settings = settings
@@ -205,7 +211,8 @@ async def delete_project(
 
     documents = await document_db.list_by_project(project_id)
     for doc in documents:
-        await s3.delete_object(Bucket="ragfun", Key=project_id + "_" + doc.get("doc_id"))
+        # probably is fine
+        await s3.delete_object(Bucket="ragfun", Key=project_id + "_" + doc.get("storage_id"))
 
     # Delete all documents for this project first
     await document_db.delete_by_project(project_id)
@@ -252,6 +259,7 @@ async def upload(
     document_db: DocumentDB = Depends(get_document_db),
     settings: Settings = Depends(get_settings),
 ):
+    doc_id = uuid.uuid4().hex
     # Verify user owns the project
     await authorize_project(user, project_id, project_db)
 
@@ -272,20 +280,43 @@ async def upload(
         content_type=content_type,
         max_bytes=1 * 1024 * 1024,
         storage_prefix=storage_prefix,
+        doc_id=doc_id,
     )
+    if upload_result.duplicate:
+        raise HTTPException(status_code=409)
 
-    await document_db.persist_document(upload_result.storage_id, project_id, upload_result, meta)
+    # Do I like that option?
+    # Not really but we can merge results and hide info about doc contents in a way
+    # well shi
+    # shi x2
+    # shi x3
+    # whatever, we do not handle millions of docs, maybe we will scale later
+    
+    await document_db.persist_document(doc_id, project_id, upload_result, meta)
 
     return {
-        "doc_id": upload_result.storage_id,
+        "doc_id": doc_id,
         "project_id": project_id,
         "size": upload_result.size,
-        "duplicate": upload_result.duplicate,
     }
+
+# TOTHINK
+# should I somehow combine info about a project into uuid + filesha256
+# NONONONONO
+# as Opus said
+# requiring project_id is
+# good practice even if doc_id is
+# globally unique. It acts as a scoping guard
+# (prevents accidentally deleting a doc
+# from the wrong project) and
+# makes authorization
+# checks straightforward.
+# I need
 
 
 @protected_router.delete("/v1/documents/{doc_id}")
 async def delete_document(
+    # project_id: str,
     doc_id: str,
     user: UserCreds = Depends(authenticated),
     project_db: ProjectDB = Depends(get_project_db),
@@ -303,9 +334,62 @@ async def delete_document(
     await authorize_project(user, doc["project_id"], project_db)
 
     deleted = await document_db.delete(doc_id)
-
-    await s3.delete_object(Bucket=settings.bucket_name, Key=doc['project_id'] + "_" + doc_id)
+    
+    await s3.delete_object(Bucket=settings.bucket_name, Key=doc['project_id'] + "_" + doc.get("storage_id"))
     return {"ok": deleted, "doc_id": doc_id}
+
+
+@protected_router.get("/v1/documents/{doc_id}")
+async def get_document_info(
+    # project_id: str,
+    doc_id: str,
+    user: UserCreds = Depends(authenticated),
+    project_db: ProjectDB = Depends(get_project_db),
+    document_db: DocumentDB = Depends(get_document_db),
+    # s3=Depends(get_s3),
+    # settings=Depends(get_settings),
+    event_db=Depends(get_event_db),
+):
+    """Delete a document (with ownership check via project)."""
+    # Get document to find its project
+    doc = await document_db.get(doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="document_not_found")
+
+    # Verify user owns the project this document belongs to
+    await authorize_project(user, doc["project_id"], project_db)
+
+    doc_obj = await document_db.get(doc_id)
+    storage_id = doc_obj.get("storage_id")
+
+    return doc_obj
+
+
+@protected_router.get("/v1/documents/{doc_id}/status")
+async def get_document_info(
+    # project_id: str,
+    doc_id: str,
+    user: UserCreds = Depends(authenticated),
+    project_db: ProjectDB = Depends(get_project_db),
+    document_db: DocumentDB = Depends(get_document_db),
+    # s3=Depends(get_s3),
+    # settings=Depends(get_settings),
+    event_db=Depends(get_event_db),
+):
+    """Delete a document (with ownership check via project)."""
+    # Get document to find its project
+    doc = await document_db.get(doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="document_not_found")
+
+    # Verify user owns the project this document belongs to
+    await authorize_project(user, doc["project_id"], project_db)
+
+    doc_obj = await document_db.get(doc_id)
+    storage_id = doc_obj.get("storage_id")
+
+    ev = await event_db.get_latest_event(doc_id=storage_id, project_id=doc_obj.get("project_id"),)
+    return ev
 
 
 # preinit bucket if possible + plus pass as a setting

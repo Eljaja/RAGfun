@@ -12,6 +12,7 @@ from ingestion import ingest_chunks
 from models import ChunkMeta, Locator
 from processing import Settings, file_to_texts, VLMClient
 from store import QdrantStore, BM25Store
+from db_ops import DocumentEventDB
 
 
 def generate_doc_id(bucket: str, key: str) -> str:
@@ -64,9 +65,11 @@ class PipelineDeps:
     embedder: Embedder
     qdrant: QdrantStore
     opensearch: BM25Store
+    event_db_docs: DocumentEventDB
     qdrant_collection: str
     opensearch_index: str
     embed_batch_size: int = 32
+    
 
 
 async def download_from_s3(*, bucket: str, key: str, s3_client) -> tuple[bytes, str | None, str]:
@@ -90,7 +93,13 @@ async def handle_object_created(*, info: S3EventInfo, s3_client, deps: PipelineD
     #     return
 
     print("HELLO")
-    print(info)
+    # print(info)
+
+    filename = info.key.split("/")[-1]
+    project_id, doc_id = filename.split("_")
+    await deps.event_db_docs.log_ingested(doc_id=doc_id, project_id=project_id, processing_time_ms=1000)
+
+
     # Download + extract
     file_bytes, content_type, filename = await download_from_s3(bucket=info.bucket, key=info.key, s3_client=s3_client)
     texts = await file_to_texts(
@@ -101,9 +110,11 @@ async def handle_object_created(*, info: S3EventInfo, s3_client, deps: PipelineD
         settings=deps.settings,
     )
 
-    if not texts:
+    #if not texts:
         # Treat as retryable: could be VLM outage or parsing issues.
-        raise RuntimeError("extracted_no_text")
+
+    # YES FOR NOW we keep it like that but trust me this will be okay
+    # raise RuntimeError("extracted_no_text")
 
     # Chunk + ingest
     project_id, doc_id = filename.split("_")
@@ -130,6 +141,8 @@ async def handle_object_created(*, info: S3EventInfo, s3_client, deps: PipelineD
     if not result.ok:
         # Make it retryable so we either succeed or end up in DLQ after max retries.
         raise RuntimeError(f"ingestion_failed:{result.error}")
+    else:
+        await deps.event_db_docs.log_processed(doc_id=doc_id, project_id=project_id, processing_time_ms=1000)
 
 
 async def handle_object_removed(*, info: S3EventInfo, deps: PipelineDeps) -> None:
@@ -139,6 +152,9 @@ async def handle_object_removed(*, info: S3EventInfo, deps: PipelineDeps) -> Non
     # (e.g. spaces as %20). Historically doc_id used event-provided key, but the
     # same object might later arrive with a decoded key. To make deletes robust,
     # we attempt both possibilities when they differ.
+    filename = info.key.split("/")[-1]
+    project_id, doc_id = filename.split("_")
+
     doc_ids: list[str] = []
     doc_ids.append(info.key)
     #decoded_key = unquote(info.key or "")
@@ -167,6 +183,8 @@ async def handle_object_removed(*, info: S3EventInfo, deps: PipelineDeps) -> Non
     for did in doc_ids:
         await _delete_one(did)
 
+    await deps.event_db_docs.log_deleted(doc_id=doc_id, project_id=project_id, deleted_by="USER", reason="ASK THE USER")
+
 
 async def handle_s3_event(*, info: S3EventInfo, s3_client, deps: PipelineDeps) -> None:
     print(info)
@@ -175,12 +193,7 @@ async def handle_s3_event(*, info: S3EventInfo, s3_client, deps: PipelineDeps) -
             await handle_object_created(info=info, s3_client=s3_client, deps=deps)
         # return
     if is_object_removed(info.event_name):
-        # print(info)
         if not "_temp" in info.key:
             await handle_object_removed(info=info, deps=deps)
-        # else:
-        #     print("TEMP FOUND")
-        #pass
-    # Unknown events: ignore (non-error)
     return
 

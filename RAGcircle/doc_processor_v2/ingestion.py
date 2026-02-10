@@ -77,7 +77,7 @@ async def ingest_to_qdrant(
         return True, len(need_embed), skipped, None
 
     except Exception as e:
-        raise
+        # raise
         return False, 0, 0, str(e)
 
 

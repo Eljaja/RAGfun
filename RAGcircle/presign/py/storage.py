@@ -195,6 +195,7 @@ async def upload_with_content_addressing(
     content_type: str,
     max_bytes: int,
     storage_prefix: str, 
+    doc_id: str,
 ) -> UploadResult:
     temp_key = f"_temp_{uuid.uuid4().hex}"
     size, sha256 = await upload_via_multipart(
@@ -204,6 +205,7 @@ async def upload_with_content_addressing(
         request_stream=request_stream,
         content_type=content_type,
         max_bytes=max_bytes,
+       
     )
     real_doc_id = sha256_hex_to_uuid_v8(sha256)
     storage_id = storage_prefix + real_doc_id
@@ -226,6 +228,7 @@ async def upload_with_content_addressing(
             MetadataDirective="REPLACE",
             Metadata={
                  "sha256": sha256,
+                 "doc_id": doc_id,
             },
         )
         await s3.delete_object(Bucket=bucket, Key=temp_key)

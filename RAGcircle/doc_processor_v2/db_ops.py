@@ -7,6 +7,8 @@ import json
 
 import asyncpg
 
+from contextlib import asynccontextmanager
+
 class DocumentEventType(str, Enum):
     INGESTED = "ingested"
     DELETED = "deleted" 
@@ -19,6 +21,7 @@ class DocumentEventType(str, Enum):
 class DocumentEvent:
     event_id: str
     doc_id: str
+    project_id: str
     event_type: DocumentEventType
     service_name: Optional[str] = None
     metadata: dict = field(default_factory=dict)
@@ -29,6 +32,7 @@ class DocumentEvent:
         return cls(
             event_id=row["event_id"],
             doc_id=row["doc_id"],
+            project_id=row["project_id"],
             event_type=DocumentEventType(row["event_type"]),
             service_name=row["service_name"],
             metadata=row["metadata"] if row["metadata"] else {},
@@ -52,15 +56,17 @@ class DocumentEventDB:
         """Ensure documents and document_events tables exist."""
         async with self.pool.acquire() as conn:
             # Documents table
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS documents (...)
-            """)
+            # await conn.execute("""
+            #     CREATE TABLE IF NOT EXISTS documents (...)
+            # """)
             
             # Document events table (append-only)
+            # REFERENCES documents(doc_id) ON DELETE CASCADE,
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS document_events (
                     event_id TEXT PRIMARY KEY,
-                    doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+                    doc_id TEXT NOT NULL, 
+                    project_id TEXT NOT NULL,
                     event_type TEXT NOT NULL,
                     service_name TEXT,
                     metadata JSONB DEFAULT '{}',
@@ -85,30 +91,34 @@ class DocumentEventDB:
     async def log_event(
         self,
         doc_id: str,
+        project_id,
         event_type: DocumentEventType,
         service_name: str | None = None,
         metadata: dict | None = None,
+        
     ) -> DocumentEvent:
         """Append a new event to the document event log."""
         async with self.pool.acquire() as conn:
             event_id = str(uuid.uuid4())
             row = await conn.fetchrow("""
                 INSERT INTO document_events 
-                (event_id, doc_id, event_type, service_name, metadata)
-                VALUES ($1, $2, $3, $4, $5)
+                (event_id, doc_id, project_id, event_type, service_name, metadata)
+                VALUES ($1, $2, $3, $4, $5, $6)
                 RETURNING *
-            """, event_id, doc_id, event_type.value, service_name, json.dumps(metadata or {}))
+            """, event_id, doc_id, project_id, event_type.value, service_name, json.dumps(metadata or {}))
             return DocumentEvent.from_row(row)
 
     async def log_ingested(
         self,
         doc_id: str,
+        project_id: str,
         service_name: str = "presign_service",
         **extra_metadata
     ) -> DocumentEvent:
         """Log that a document was ingested."""
         return await self.log_event(
             doc_id=doc_id,
+            project_id=project_id,
             event_type=DocumentEventType.INGESTED,
             service_name=service_name,
             metadata=extra_metadata,
@@ -117,12 +127,14 @@ class DocumentEventDB:
     async def log_deleted(
         self,
         doc_id: str,
+        project_id: str,
         deleted_by: str | None = None,
         reason: str | None = None,
     ) -> DocumentEvent:
         """Log that a document was deleted."""
         return await self.log_event(
             doc_id=doc_id,
+            project_id=project_id,
             event_type=DocumentEventType.DELETED,
             service_name="presign_service",
             metadata={"deleted_by": deleted_by, "reason": reason} if deleted_by or reason else {},
@@ -131,6 +143,7 @@ class DocumentEventDB:
     async def log_processed(
         self,
         doc_id: str,
+        project_id: str,
         service_name: str = "doc_processor v2",
         processing_time_ms: int | None = None,
         **extra
@@ -141,6 +154,7 @@ class DocumentEventDB:
             metadata["processing_time_ms"] = processing_time_ms
         return await self.log_event(
             doc_id=doc_id,
+            project_id=project_id,
             event_type=DocumentEventType.PROCESSED,
             service_name=service_name,
             metadata=metadata,
@@ -149,6 +163,7 @@ class DocumentEventDB:
     async def log_error(
         self,
         doc_id: str,
+        project_id: str,
         error_message: str,
         error_type: str | None = None,
         service_name: str = "doc_processor v2",
@@ -156,6 +171,7 @@ class DocumentEventDB:
         """Log a processing error."""
         return await self.log_event(
             doc_id=doc_id,
+            project_id=project_id,
             event_type=DocumentEventType.ERROR_PROCESSING,
             service_name=service_name,
             metadata={

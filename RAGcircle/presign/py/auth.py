@@ -237,7 +237,7 @@ def call_endpoint(url: str, method: str = "GET", headers: dict = None):
 
 
 async def authenticated(request: Request) -> UserCreds:
-    return UserCreds("user_id_lol_2", {})
+    return UserCreds("user_id_lol_4", {})
 
 
 
