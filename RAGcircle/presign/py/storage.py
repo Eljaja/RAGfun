@@ -225,10 +225,13 @@ async def upload_with_content_addressing(
             CopySource=f"{bucket}/{temp_key}",
             Key=storage_id,
             ContentType=content_type,
+            # THESE TWO LINES DO NOT WORK PROPERLY NOW 
+            # ON ONE HAND WE CANNOT TRACE OBJECT NAME WHEN 
+            # LOOKING AT MULTIPART EVENTS
             MetadataDirective="REPLACE",
             Metadata={
-                 "sha256": sha256,
-                 "doc_id": doc_id,
+                 "sha": sha256,
+                 "doc-id": doc_id,
             },
         )
         await s3.delete_object(Bucket=bucket, Key=temp_key)

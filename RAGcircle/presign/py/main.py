@@ -388,7 +388,7 @@ async def get_document_info(
     doc_obj = await document_db.get(doc_id)
     storage_id = doc_obj.get("storage_id")
 
-    ev = await event_db.get_latest_event(doc_id=storage_id, project_id=doc_obj.get("project_id"),)
+    ev = await event_db.get_latest_event(doc_id=storage_id)
     return ev
 
 
