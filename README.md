@@ -162,13 +162,13 @@ See **[docs/AGENT_SEARCH.md](./docs/AGENT_SEARCH.md)** for API reference and con
 
 ## Current Direction
 
-- ✅ Hybrid retrieval (BM25 + vectors) with RRF fusion
-- ✅ VLM-based document extraction (Granite-Docling)
-- ✅ SOTA improvements: semantic chunking, contextual headers, local reranker
-- ✅ Advanced retrieval features (multi-query, two-pass, reranking)
-- ✅ Full observability stack (Prometheus, Grafana, structured logging)
-- 🔄 Exploring GraphRAG approaches and continuous knowledge graph updates
-- 🔄 Benchmarking with BRIGHT, T²-RAGBench, and custom datasets
+- Hybrid retrieval (BM25 + vectors) with RRF fusion
+- VLM-based document extraction (Granite-Docling)
+- SOTA: semantic chunking, contextual headers, local reranker
+- Multi-query, two-pass retrieval, reranking
+- Observability: Prometheus, Grafana, structured logging
+- BRIGHT chunk tuning: `scripts/bright_tune_chunking.py` (full benchmark: `--splits all --eval-splits all --docs-from-gold 100000`). Defaults 1024/50 from full BRIGHT.
+- Exploring GraphRAG, T²-RAGBench and custom benchmarks
 
 ## Planned Work
 
@@ -207,7 +207,8 @@ python -m app.main
 - Update `service/app/fusion.py` (RRF fusion and reranking)
 
 **Changing chunking:**
-- Update `service/app/chunking.py` or `doc-processor/app/chunking.py`
+- Retrieval (mode=document): `service/app/chunking.py` — strategies `semantic` (section-based) or `token` (paragraph + sliding window). Params: `RAG_CHUNK_STRATEGY`, `RAG_CHUNK_MAX_TOKENS`, `RAG_CHUNK_OVERLAP_TOKENS` (tuned on BRIGHT: 1024/50).
+- Doc-processor: `doc-processor/app/chunking.py` when using pre-chunked input.
 
 **Adding API endpoints:**
 - Update `gate/app/main.py` for new routes
@@ -218,10 +219,24 @@ python -m app.main
 
 ### Testing
 
-**BRIGHT benchmark:**
+**BRIGHT benchmark** (index + retrieval-only eval; chunk tuning):
+
+Index documents and run eval (single domain, e.g. biology):
 ```bash
-/home/ubuntu/run_bright_validation.sh --stack rugfunsota --domain biology --limit 50
+python scripts/index_bright.py --retrieval-url http://localhost:8085 --splits biology --docs-from-gold 500 --project-id bright
+python scripts/bright_eval.py --retrieval-url http://localhost:8085 --bright-split biology --project-id bright --out results/bright_eval.jsonl
 ```
+
+Tune chunking parameters on BRIGHT (multiple configs, optional eval on all 12 domains):
+```bash
+# Single domain (fast)
+python scripts/bright_tune_chunking.py --retrieval-url http://localhost:8085 --bright-split biology --docs-from-gold 500
+
+# Full benchmark: all 12 splits, all 1384 queries (use docs-from-gold so gold docs are in index)
+python scripts/bright_tune_chunking.py --retrieval-url http://localhost:8085 --splits all --eval-splits all --docs-from-gold 100000 --configs "256:0,512:0,512:50,1024:50"
+```
+
+Results: `results/bright_chunk_tune_summary.json` and table in stdout. Default chunk params (1024 tokens, 50 overlap) were tuned on full BRIGHT.
 
 **BEIR eval** (direct / full pipeline):
 ```bash
@@ -363,9 +378,11 @@ VECTOR_WEIGHT=0.5
 ENABLE_RERANK=true
 RERANK_TOP_K=20
 
-# Chunking
-CHUNK_TOKEN_SIZE=512
-CHUNK_OVERLAP=50
+# Chunking (retrieval service: RAG_CHUNK_* in docker-compose / .env)
+# Tuned on BRIGHT (all 12 splits): 1024/50 best. Strategy: semantic (section-based) or token (paragraph + sliding window).
+RAG_CHUNK_STRATEGY=semantic
+RAG_CHUNK_MAX_TOKENS=1024
+RAG_CHUNK_OVERLAP_TOKENS=50
 
 # Advanced Features
 ENABLE_MULTI_QUERY=false
@@ -451,12 +468,11 @@ For rugfunsota see [RUN_RUGFUNSOTA.md](./RUN_RUGFUNSOTA.md).
 
 **Current Status:** Active Development
 
-- ✅ Core hybrid retrieval pipeline functional
-- ✅ VLM-based document processing working
-- ✅ SOTA improvements (semantic chunking, CCH, local reranker)
-- ✅ Full monitoring stack deployed
-- 🔄 Exploring GraphRAG integration
-- 🔄 Expanding benchmark coverage
+- Core hybrid retrieval pipeline functional
+- VLM-based document processing working
+- SOTA: semantic chunking, CCH, local reranker
+- Full monitoring stack deployed
+- Exploring GraphRAG integration and benchmark coverage
 
 **Stability:** Experimental - expect breaking changes as new approaches are tested.
 

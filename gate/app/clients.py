@@ -266,7 +266,7 @@ class LLMClient:
             f"- request_hash: {h}\n"
             f"- question: {user[:500]}\n"
             "\n"
-            "Настрой `GATE_LLM_PROVIDER=openai_compat` и `GATE_LLM_API_KEY`, чтобы получать реальный ответ модели."
+            "Set GATE_LLM_PROVIDER=openai_compat and GATE_LLM_API_KEY for real model responses."
         )
 
     async def _mock_stream(self, messages: list[dict[str, str]]):

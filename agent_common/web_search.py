@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 """
 Web search client for agent-search.
 
