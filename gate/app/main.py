@@ -87,7 +87,7 @@ def _norm_query(q: str) -> str:
 
 
 def _strip_diacritics(s: str) -> str:
-    # Helps matching answers like "Улья́новск" vs "Ульяновск" (combining accents).
+    # Normalize combining accents for answer matching (e.g. Cyrillic with stress marks).
     s = unicodedata.normalize("NFKD", s or "")
     return "".join(ch for ch in s if not unicodedata.combining(ch))
 

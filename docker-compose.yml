@@ -98,8 +98,7 @@ services:
     networks:
       - rag-network
 
-  # RustFS: по умолчанию не поднимаем — используем уже запущенный (presign-rustfs-1).
-  # Чтобы поднять свой: docker compose --profile local-rustfs up -d
+  # RustFS: not started by default; use existing presign-rustfs-1. To run own: docker compose --profile local-rustfs up -d
   rustfs:
     profiles:
       - local-rustfs
@@ -216,9 +215,9 @@ services:
       # Contextual Chunk Headers (CCH) for embeddings (opt-in; requires re-index/re-embed when enabled)
       - RAG_EMBEDDING_CONTEXTUAL_HEADERS_ENABLED=true
       - RAG_EMBEDDING_CONTEXTUAL_HEADERS_MAX_CHARS=400
-      # Chunking (mode=document): semantic (section-based) or token
+      # Chunking (mode=document): semantic (section-based) or token (tuned on BRIGHT all 12 splits: 1024/50 best)
       - RAG_CHUNK_STRATEGY=semantic
-      - RAG_CHUNK_MAX_TOKENS=300
+      - RAG_CHUNK_MAX_TOKENS=1024
       - RAG_CHUNK_OVERLAP_TOKENS=50
       # Candidate pool (QUALITY): increase recall before fusion/rerank
       - RAG_DEFAULT_TOP_K=20
@@ -258,17 +257,17 @@ services:
         condition: service_healthy
       qdrant:
         condition: service_healthy
-      # infinity-embed / infinity-rerank: опциональны, если заданы RAG_EMBEDDING_URL / RAG_RERANK_URL (внешние)
+      # infinity-embed / infinity-rerank optional when RAG_EMBEDDING_URL / RAG_RERANK_URL point to external services
       # infinity-embed:
       #   condition: service_started
       # infinity-rerank:
       #   condition: service_started
     networks:
       - rag-network
-      # Опционально: использовать уже поднятые infinity-embed/rerank из другого стека (rag_fun)
+      # Optional: attach to rag_fun stack network for shared infinity-embed/rerank
       # - rag_fun_rag-network
 
-  # Document Storage Service (S3 = уже поднятый presign-rustfs-1 в сети presign_rustfs-net)
+  # Document Storage (S3: use existing presign-rustfs-1 on presign_rustfs-net)
   document-storage:
     build:
       context: ./document-storage
@@ -278,10 +277,10 @@ services:
       - STORAGE_SERVICE_NAME=document-storage
       - STORAGE_ENVIRONMENT=dev
       - STORAGE_LOG_LEVEL=INFO
-      # По умолчанию local — стек работает без внешнего RustFS. Для S3: STORAGE_STORAGE_BACKEND=s3 и presign_rustfs-net.
+      # Default local; for S3 set STORAGE_STORAGE_BACKEND=s3 and presign_rustfs-net
       - STORAGE_STORAGE_BACKEND=${STORAGE_STORAGE_BACKEND:-local}
       - STORAGE_STORAGE_PATH=/data/documents
-      # S3 (если STORAGE_STORAGE_BACKEND=s3): уже поднятый RustFS (presign-rustfs-1) или свой: --profile local-rustfs
+      # S3: existing presign-rustfs-1 or run own with --profile local-rustfs
       - STORAGE_S3_ENDPOINT=${STORAGE_S3_ENDPOINT:-http://presign-rustfs-1:9000}
       - STORAGE_S3_BUCKET=${STORAGE_S3_BUCKET:-documents}
       - STORAGE_S3_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
@@ -303,7 +302,7 @@ services:
       - rag-network
       - presign_rustfs-net
 
-  # vLLM (OpenAI-compatible) hosting Granite-Docling VLM. 1 GPU: 0, 2 GPU: 0 (или 1)
+  # vLLM (OpenAI-compatible) hosting Granite-Docling VLM. Single GPU: 0; multi-GPU: 0 or 1
   vllm-docling:
     image: vllm/vllm-openai:latest
     command: ["--model", "ibm-granite/granite-docling-258M", "--port", "8123"]
@@ -358,8 +357,7 @@ services:
         condition: service_started
       retrieval:
         condition: service_started
-      # vllm-docling не обязателен для .txt: doc-processor использует extract_text_non_vlm.
-      # Для PDF/DOCX поднимите vllm-docling отдельно (или добавьте обратно condition: service_started).
+      # vllm-docling optional for .txt (doc-processor uses extract_text_non_vlm). For PDF/DOCX start vllm-docling or add condition: service_started
       # vllm-docling:
       #   condition: service_started
     networks:
@@ -675,9 +673,9 @@ networks:
     driver: bridge
   rustfs-network:
     driver: bridge
-  # Сеть уже поднятого RustFS (presign-rustfs-1)
+  # Network of existing RustFS (presign-rustfs-1)
   presign_rustfs-net:
     external: true
-  # Сеть стека rag_fun (если поднят) — для доступа retrieval к infinity-embed/rerank при отсутствии GPU
+  # rag_fun stack network for retrieval to use shared infinity-embed/rerank when no GPU
   rag_fun_rag-network:
     external: true

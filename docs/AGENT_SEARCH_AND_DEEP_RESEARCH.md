@@ -1,58 +1,58 @@
-# Agent-Search и Deep-Research API
+# Agent-Search and Deep-Research API
 
-Оба сервиса поднимаются профилем `agent-search`:  
+Both services start with profile `agent-search`:  
 `docker compose --profile agent-search up -d`
 
 ---
 
-## Agent-Search (порт 8093)
+## Agent-Search (port 8093)
 
-LLM-поиск: **plan** → опционально HyDE → **Gate.chat** → проверка качества → опционально **fact queries** → **answer** с цитированием [1], [2].
+LLM-driven search: **plan** → optional HyDE → **Gate.chat** → quality check → optional **fact queries** → **answer** with citations [1], [2].
 
-### Эндпоинты
+### Endpoints
 
-| Метод | Путь | Описание |
-|-------|------|----------|
-| POST | `/v1/agent` | Ответ одним JSON: `answer`, `sources`, `context`, `mode`, `partial`, `degraded` |
-| POST | `/v1/agent/stream` | SSE: события `init`, `trace`, `retrieval`, `token`, `done`, `error` |
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/v1/agent` | Single JSON: `answer`, `sources`, `context`, `mode`, `partial`, `degraded` |
+| POST | `/v1/agent/stream` | SSE: `init`, `trace`, `retrieval`, `token`, `done`, `error` |
 
-### Тело запроса (AgentRequest)
+### Request body (AgentRequest)
 
-| Поле | Тип | Описание |
-|------|-----|----------|
-| `query` | string | Вопрос пользователя (обязательно) |
-| `history` | array | История диалога `[{role, content}]` |
-| `filters` | object | Фильтры Gate (`project_id`, `source` и т.д.) |
-| `include_sources` | bool | Включать источники (по умолчанию true) |
-| `top_k` | int | Переопределить top_k (5..24) |
-| `use_adaptive_k` | bool | Adaptive-k (переопределение env) |
-| `max_llm_calls` | int | Макс. вызовов LLM на запрос |
-| `max_fact_queries` | int | Макс. fact-запросов |
-| `use_hyde` | bool | Включить HyDE |
-| `use_fact_queries` | bool | Включить fact queries |
-| `use_retry` | bool | Повтор при неполном ответе |
-| `use_tools` | bool | Калькулятор и выполнение кода |
-| `mode` | string | Пресет: `minimal` \| `conservative` \| `aggressive` |
+| Field | Type | Description |
+|-------|------|-------------|
+| `query` | string | User question (required) |
+| `history` | array | Chat history `[{role, content}]` |
+| `filters` | object | Gate filters (`project_id`, `source`, etc.) |
+| `include_sources` | bool | Include sources (default true) |
+| `top_k` | int | Override top_k (5..24) |
+| `use_adaptive_k` | bool | Adaptive-k (overrides env) |
+| `max_llm_calls` | int | Max LLM calls per request |
+| `max_fact_queries` | int | Max fact queries |
+| `use_hyde` | bool | Enable HyDE |
+| `use_fact_queries` | bool | Enable fact queries |
+| `use_retry` | bool | Retry on incomplete answer |
+| `use_tools` | bool | Calculator and code execution |
+| `mode` | string | Preset: `minimal` \| `conservative` \| `aggressive` |
 
-Пресеты: **minimal** (без HyDE/fact/retry, 4 LLM), **conservative** (6 LLM), **aggressive** (HyDE, fact, retry, 16 LLM, 4 fact queries).
+Presets: **minimal** (no HyDE/fact/retry, 4 LLM), **conservative** (6 LLM), **aggressive** (HyDE, fact, retry, 16 LLM, 4 fact queries).
 
-### Переменные окружения (agent-search)
+### Environment (agent-search)
 
-- `AGENT_GATE_URL` — URL Gate (напр. http://rag-gate:8090)
-- `AGENT_GATE_TIMEOUT_S` — таймаут вызовов Gate
+- `AGENT_GATE_URL` — Gate URL (e.g. http://rag-gate:8090)
+- `AGENT_GATE_TIMEOUT_S` — Gate call timeout
 - `AGENT_MAX_LLM_CALLS`, `AGENT_MAX_FACT_QUERIES`
 - `AGENT_USE_HYDE`, `AGENT_USE_FACT_QUERIES`, `AGENT_USE_RETRY`
 - `AGENT_LLM_BASE_URL`, `AGENT_LLM_MODEL`, `AGENT_LLM_API_KEY` (fallback: GATE_*)
 
-### Пример (agent-search)
+### Example (agent-search)
 
 ```bash
-# Стриминг
+# Streaming
 curl -N -X POST "http://localhost:8093/v1/agent/stream" \
   -H "Content-Type: application/json" \
   -d '{"query":"What is RAG?","include_sources":true,"mode":"conservative"}'
 
-# Без стриминга
+# Non-streaming
 curl -s -X POST "http://localhost:8093/v1/agent" \
   -H "Content-Type: application/json" \
   -d '{"query":"What is RAG?","include_sources":true}' | jq .
@@ -60,60 +60,60 @@ curl -s -X POST "http://localhost:8093/v1/agent" \
 
 ---
 
-## Deep-Research (порт 8094)
+## Deep-Research (port 8094)
 
-Итеративное исследование (LangGraph): **plan** → **scope** (план + запросы) → цикл **research** (батч вызовов Gate, заметки, следующие запросы) → ранняя остановка по min gain → **write** (стриминг отчёта).
+Iterative research (LangGraph): **plan** → **scope** (plan + queries) → **research** loop (batch Gate calls, notes, next queries) → early stop on min gain → **write** (streaming report).
 
-### Эндпоинт
+### Endpoint
 
-| Метод | Путь | Описание |
-|-------|------|----------|
-| POST | `/v1/deep-research/stream` | Единственный эндпоинт; ответ — SSE-поток событий |
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/v1/deep-research/stream` | Single endpoint; response is SSE stream |
 
-### Тело запроса (DeepResearchRequest)
+### Request body (DeepResearchRequest)
 
-| Поле | Тип | Описание |
-|------|-----|----------|
-| `query` | string | Исследовательский вопрос (обязательно) |
-| `history` | array | История диалога `[{role, content}]` |
-| `filters` | object | Фильтры Gate (`project_id`, `source` и т.д.) |
-| `include_sources` | bool | Включать источники в ответе (по умолчанию true) |
-| `max_iterations` | int | Макс. итераций цикла research (по умолчанию 2) |
-| `retrieval_mode` | string | Режим retrieval: hybrid \| bm25 \| vector |
-| `top_k` | int | Top-k на один запрос к Gate |
-| `rerank` | bool | Включить rerank |
-| `use_web_search` | bool | Включить веб-поиск |
-| `web_search_num` | int | Макс. результатов веб-поиска |
-| `web_search_timeout_s` | float | Таймаут веб-поиска (сек) |
+| Field | Type | Description |
+|-------|------|-------------|
+| `query` | string | Research question (required) |
+| `history` | array | Chat history `[{role, content}]` |
+| `filters` | object | Gate filters (`project_id`, `source`, etc.) |
+| `include_sources` | bool | Include sources in response (default true) |
+| `max_iterations` | int | Max research loop iterations (default 2) |
+| `retrieval_mode` | string | hybrid \| bm25 \| vector |
+| `top_k` | int | Top-k per Gate request |
+| `rerank` | bool | Enable rerank |
+| `use_web_search` | bool | Enable web search |
+| `web_search_num` | int | Max web search results |
+| `web_search_timeout_s` | float | Web search timeout (s) |
 
-### События SSE (deep-research)
+### SSE events (deep-research)
 
-Сервер шлёт строки `data: <json>`:
+Server sends `data: <json>` lines:
 
-| type | Описание |
-|------|----------|
-| `progress` | Этап: `plan`, `scope`, `research`, `write`, `done`; может быть `stage`, `percent`, `message` |
-| `retrieval` | Промежуточные хиты/контекст (если отдаётся) |
-| `token` | Фрагмент отчёта (стриминг текста) |
-| `done` | Финальное событие: `answer` (полный отчёт), `sources` |
-| `error` | Ошибка: `error` (строка) |
+| type | Description |
+|------|-------------|
+| `progress` | Stage: `plan`, `scope`, `research`, `write`, `done`; may include `stage`, `percent`, `message` |
+| `retrieval` | Intermediate hits/context (if requested) |
+| `token` | Report fragment (streaming text) |
+| `done` | Final: `answer` (full report), `sources` |
+| `error` | Error: `error` (string) |
 
-### Переменные окружения (deep-research)
+### Environment (deep-research)
 
 - **Gate / LLM:** `DEEP_GATE_URL`, `DEEP_GATE_TIMEOUT_S`; `DEEP_LLM_PROVIDER`, `DEEP_LLM_BASE_URL`, `DEEP_LLM_MODEL`, `DEEP_LLM_API_KEY`, `DEEP_LLM_TEMPERATURE` (fallback: GATE_*)
-- **Итерации:** `DEEP_MAX_ITERATIONS` (макс. итераций цикла research)
-- **Ранняя остановка:** `DEEP_EARLY_STOP_MIN_GAIN` (мин. прирост для продолжения)
-- **Батч:** `DEEP_RESEARCH_BATCH` (размер батча запросов в research), `DEEP_RESEARCH_MAX_DOCS`, `DEEP_RESEARCH_MAX_CHARS`
-- **Retrieval:** `DEEP_TOP_K`, `DEEP_RERANK`, `DEEP_RETRIEVAL_MODE` (hybrid \| bm25 \| vector)
-- **Веб-поиск:** `DEEP_USE_WEB_SEARCH`; при включённом веб-поиске также `WEB_SEARCH_PROVIDER`, `WEB_SEARCH_NUM`, `WEB_SEARCH_TIMEOUT_S`
-- **Шаблон отчёта:** `DEEP_RESEARCH_TEMPLATE` (текст с инструкциями для этапа write)
-- **Логирование:** `DEEP_LOG_LEVEL`
-- **MCP (опционально):** `DEEP_MCP_CONFIG` — путь к конфигу MCP gate
+- **Iterations:** `DEEP_MAX_ITERATIONS` (max research loop iterations)
+- **Early stop:** `DEEP_EARLY_STOP_MIN_GAIN` (min gain to continue)
+- **Batch:** `DEEP_RESEARCH_BATCH`, `DEEP_RESEARCH_MAX_DOCS`, `DEEP_RESEARCH_MAX_CHARS`
+- **Retrieval:** `DEEP_TOP_K`, `DEEP_RERANK`, `DEEP_RETRIEVAL_MODE`
+- **Web search:** `DEEP_USE_WEB_SEARCH`; when enabled: `WEB_SEARCH_PROVIDER`, `WEB_SEARCH_NUM`, `WEB_SEARCH_TIMEOUT_S`
+- **Report template:** `DEEP_RESEARCH_TEMPLATE`
+- **Logging:** `DEEP_LOG_LEVEL`
+- **MCP (optional):** `DEEP_MCP_CONFIG` — path to MCP gate config
 
-### Пример (deep-research)
+### Example (deep-research)
 
 ```bash
-# Стриминг отчёта
+# Streaming report
 curl -N -X POST "http://localhost:8094/v1/deep-research/stream" \
   -H "Content-Type: application/json" \
   -d '{
@@ -124,7 +124,7 @@ curl -N -X POST "http://localhost:8094/v1/deep-research/stream" \
   }'
 ```
 
-Разбор событий (jq):
+Parse events (jq):
 
 ```bash
 curl -N -s -X POST "http://localhost:8094/v1/deep-research/stream" \
@@ -139,9 +139,9 @@ curl -N -s -X POST "http://localhost:8094/v1/deep-research/stream" \
 
 ---
 
-## Общее
+## Summary
 
-- Оба сервиса вызывают **Gate** (`/v1/chat`) для retrieval и контекста; LLM используется для плана, факт-запросов и ответа/отчёта.
-- **agent-search** — один проход (план → Gate → ответ с опциональными fact queries и retry).
-- **deep-research** — цикл: несколько итераций research с батч-запросами к Gate, накопление заметок и финальный стриминг отчёта.
-- В `.env` / `env.example` для deep-research задаются переменные с префиксом `DEEP_*` (см. выше).
+- Both services call **Gate** (`/v1/chat`) for retrieval and context; LLM used for plan, fact queries, and answer/report.
+- **agent-search:** single pass (plan → Gate → answer with optional fact queries and retry).
+- **deep-research:** loop of research iterations (batch Gate calls, notes), then streaming report.
+- `.env` / `env.example`: deep-research uses `DEEP_*` prefix (see above).
