@@ -48,5 +48,11 @@ class Settings(BaseSettings):
     qdrant_url: str = "http://localhost:8903"
     opensearch_url: str = "http://localhost:8905"
 
+
+# can we automate this?
+# 2026 and I am still not good at metaprogramming
 def load_settings() -> Settings:
     return Settings()
+
+def load_constants() -> Constants:
+    return Constants()

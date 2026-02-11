@@ -83,12 +83,6 @@ def extract_s3_event_info(event: dict) -> S3EventInfo:
 
 
 def is_object_created(event_name: str) -> bool:
-    # if "ObjectCreated" in event_name:
-    #     if "CompleteMultipartUpload" in event_name:
-    #         print("CompleteMultipartUpload")
-    #         return False
-    #     return True
-
     return "ObjectCreated" in (event_name or "")
 
 

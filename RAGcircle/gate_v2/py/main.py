@@ -389,6 +389,24 @@ async def get_document_info(
     storage_id = doc_obj.get("storage_id")
 
     ev = await event_db.get_latest_event(doc_id=storage_id, project_id=doc_obj.get("project_id"))
+    
+    # this is truly meh on large scale 
+    # blaaaaaaaaat 
+    # blaaaaaaaaat
+    # this is really bad 
+    # nonononoo
+    # nonononononono
+    # shit 
+    # no nono nonononono
+    # what is the point? 
+    # this is bad you cannot ship this 
+    # no no no no no no no
+    # 
+
+    # well here is another idea -> we track prev event for all of the methods except ingestion
+    # is this shit? 
+    # maybe 
+    ev.doc_id = doc_id
     return ev
 
 

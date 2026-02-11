@@ -1,9 +1,13 @@
 # services/store.py
 from __future__ import annotations
 
+import hashlib
+
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct
-import hashlib
+
+from embed_caller import Embedder
+from hash_strategy import ExistingChunk, ContentHashStrategy, filter_chunks_needing_embedding
 
 def _chunk_to_point_id(chunk_id: str) -> int:
     """Convert chunk_id to a deterministic positive int for Qdrant."""
@@ -31,10 +35,6 @@ class QdrantStore:
     async def upsert(self, chunks: list, vectors: list[list[float]], collection: str):
         """Upsert ChunkMeta objects with their vectors."""
         from hash_strategy import sha256_hex
-
-        # print(collection)
-
-        #print(chunks[0])
 
         points = [
             PointStruct(
@@ -84,6 +84,46 @@ class QdrantStore:
         except Exception:
             return {}
 
+    async def ingest_chunks(
+        self,
+        chunks: list,
+        embedder: Embedder,
+        collection: str,
+        *,
+        batch_size: int = 32,
+    ) -> None:
+        """Embed and upsert chunks, skipping unchanged ones via content hash."""
+        if not chunks:
+            return
+
+        # Check which chunks already exist with same content
+        chunk_ids = [c.chunk_id for c in chunks]
+        existing_raw = await self.get_existing_chunks(chunk_ids, collection)
+
+        existing_by_id = {
+            cid: ExistingChunk(
+                exists=data.get("exists", False),
+                content_hash=data.get("content_hash"),
+            )
+            for cid, data in existing_raw.items()
+        }
+
+        need_embed, _skipped = filter_chunks_needing_embedding(
+            chunks, existing_by_id, ContentHashStrategy()
+        )
+
+        if not need_embed:
+            return
+
+        # Embed in batches
+        all_vectors: list[list[float]] = []
+        for i in range(0, len(need_embed), batch_size):
+            texts = [c.text for c in need_embed[i : i + batch_size]]
+            vectors = await embedder.embed(texts)
+            all_vectors.extend(vectors)
+
+        await self.upsert(need_embed, all_vectors, collection)
+
     async def delete_by_doc_id(self, doc_id: str, collection: str):
         """Delete all chunks for a document."""
         from qdrant_client.models import Filter, FieldCondition, MatchValue
@@ -100,8 +140,6 @@ class QdrantStore:
     async def close(self):
         await self.client.close()
 
-    
-    # In QdrantStore
     async def delete_collection(self, collection: str):
         """Delete an entire collection."""
         if await self.client.collection_exists(collection):
@@ -120,8 +158,9 @@ class BM25Store:
     async def ensure_index(self, index: str):
         """Ensure an index exists."""
         exists = await self.client.indices.exists(index=index)
+        print(f"[OS] ensure_index '{index}': exists={exists}")
         if not exists:
-            await self.client.indices.create(index=index, body={
+            resp = await self.client.indices.create(index=index, body={
                 "settings": {
                     "analysis": {
                         "filter": {
@@ -148,11 +187,15 @@ class BM25Store:
                     }
                 }
             })
+            print(f"[OS] created index '{index}': {resp}")
 
     async def upsert(self, chunks: list, index: str):
         """Bulk upsert ChunkMeta objects."""
         if not chunks:
+            print("[OS] upsert called with empty chunks, skipping")
             return
+
+        # print(f"[OS] upsert called: {len(chunks)} chunks -> index '{index}'")
 
         # Use bulk API for efficiency
         actions = []
@@ -168,8 +211,18 @@ class BM25Store:
                 "page": c.locator.page if c.locator else None,
             })
 
-        if actions:
-            await self.client.bulk(body=actions)
+
+        resp = await self.client.bulk(body=actions)
+        # if actions:
+        #     print(f"[OS] sending bulk request: {len(actions)//2} docs, first id='{chunks[0].chunk_id}'")
+        #     resp = await self.client.bulk(body=actions)
+        #     print(f"[OS] bulk response: errors={resp.get('errors')}, took={resp.get('took')}ms")
+        #     if resp.get("errors"):
+        #         for item in resp.get("items", []):
+        #             act = item.get("index", {})
+        #             if act.get("error"):
+        #                 print(f"[OS] BULK ERROR id={act.get('_id')}: {act['error']}")
+        await self.client.indices.refresh(index=index)
 
     async def delete_by_doc_id(self, doc_id: str, index: str):
 
@@ -198,7 +251,6 @@ class BM25Store:
         return resp["_source"]
 
 
-    # In BM25Store  
     async def delete_index(self, index: str):
         """Delete an entire index."""
         if await self.client.indices.exists(index=index):

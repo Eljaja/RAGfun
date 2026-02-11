@@ -1,4 +1,5 @@
-from fastapi import HTTPException, Request
+from fastapi import Depends, HTTPException, Request
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from returns.maybe import Maybe, Some, Nothing
 from returns.result import Result, Success, Failure
 from returns.pipeline import flow
@@ -11,7 +12,7 @@ import os
 
 import httpx
 
-from settings import load_settings#Settings
+from settings import load_settings
 
 T = TypeVar('T')
 
@@ -187,57 +188,58 @@ def call_endpoint(url: str, method: str = "GET", headers: dict = None):
 # Main auth dependency
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# async def authenticated(request: Request) -> UserCreds:
-#     """FastAPI dependency: validates token, returns user creds (cached)"""
-    
-#     # cache = request.app.state.cache
-#     #http_client = request.app.state.http_client
-#     # http_client = httpx.HttpClient()
-    
-#     # 1. Parse & validate token (functional)
-#     auth_header = request.headers.get("authorization")
-#     token_result = parse_token_functional(auth_header)
-    
-#     match token_result:
-#         case Failure(error):
-#             raise HTTPException(status_code=401, detail=error)
-#         case Success(token):
-#             pass  # continue with valid token
-    
-#     token = token_result.unwrap()
-    
-#     # 2. Build the fetcher closure (captures token + client)
-#     async def fetch_from_auth() -> Result[UserCreds, str]:
-#         async with httpx.AsyncClient(timeout=30) as http_client:
-#             fetch = call_endpoint(
-#                 url=f"{AUTH_SERVER}/verify-token?token={token}",
-#                 method="GET", 
-#                 headers = {"X-Cudo-Admin": f"Bearer {ADMIN_SECRET_TOKEN}"},
-#             )
-#             result = await fetch(http_client)
-#             return result.map(lambda data: UserCreds(
-#                 user_id=data.get("user_id", ""),
-#                 limits=data.get("limits", {})
-#             ))
-    
-#     # # 3. Cache-aside: check cache, fallback to fetch + cache
-#     # creds_result = await cache_aside(
-#     #     key=token,
-#     #     cache_get=cache.get,
-#     #     fetcher=fetch_from_auth,
-#     #     cache_set=cache.set
-#     # )
-#     creds_result = await fetch_from_auth()
-    
-#     match creds_result:
-#         case Success(creds):
-#             return creds
-#         case Failure(error):
-#             raise HTTPException(status_code=503, detail=error)
+_bearer_scheme = HTTPBearer(auto_error=False)
 
 
-async def authenticated(request: Request) -> UserCreds:
-    return UserCreds("user_id_lol_4", {})
+async def authenticated(
+    request: Request,
+    _: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> UserCreds:
+    """FastAPI dependency: validates token, returns user creds (cached)"""
+    
+    # 1. Parse & validate token (functional)
+    auth_header = request.headers.get("authorization")
+    token_result = parse_token_functional(auth_header)
+    
+    match token_result:
+        case Failure(error):
+            raise HTTPException(status_code=401, detail=error)
+        case Success(token):
+            pass  # continue with valid token
+    
+    token = token_result.unwrap()
+    
+    # 2. Build the fetcher closure (captures token + client)
+    async def fetch_from_auth() -> Result[UserCreds, str]:
+        async with httpx.AsyncClient(timeout=30) as http_client:
+            fetch = call_endpoint(
+                url=f"{AUTH_SERVER}/verify-token?token={token}",
+                method="GET", 
+                headers = {"X-Cudo-Admin": f"Bearer {ADMIN_SECRET_TOKEN}"},
+            )
+            result = await fetch(http_client)
+            return result.map(lambda data: UserCreds(
+                user_id=data.get("user_id", ""),
+                limits=data.get("limits", {})
+            ))
+    
+    # # 3. Cache-aside: check cache, fallback to fetch + cache
+    # creds_result = await cache_aside(
+    #     key=token,
+    #     cache_get=cache.get,
+    #     fetcher=fetch_from_auth,
+    #     cache_set=cache.set
+    # )
+    creds_result = await fetch_from_auth()
+    
+    match creds_result:
+        case Success(creds):
+            return creds
+        case Failure(error):
+            raise HTTPException(status_code=503, detail=error)
+
+
+
 
 
 

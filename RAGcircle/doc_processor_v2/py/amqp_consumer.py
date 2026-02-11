@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+from marshal import load
 
 import aio_pika
 
@@ -10,6 +12,9 @@ from errors import NonRetryableError
 from s3_events import extract_s3_event_info
 from pipeline import PipelineDeps, handle_s3_event
 
+
+
+logger = logging.getLogger("data.processing")
 
 def retry_count_from_headers(headers: dict | None, *, retry_queue: str) -> int:
     """
@@ -76,8 +81,8 @@ async def publish_to_dlq(
     reason: str,
     retry_count: int,
 ) -> None:
-    #print("GOES HERE")
-    #print(reason)
+
+    logger.debug("TO DLQ")
     hdrs = dict(message.headers or {})
     hdrs["dlq_reason"] = reason
     hdrs["x-retry-count"] = retry_count
@@ -110,7 +115,7 @@ async def handle_incoming_message(
     - If publish fails, we do NOT ACK; the message will be redelivered.
     """
 
-    #print("INCOMING")
+    logger.debug("INCOMING MESSAGE")
     retry_count = retry_count_from_headers(message.headers, retry_queue=cfg.amqp_retry_queue)
 
     # Parse JSON payload (DLQ immediately if invalid)
@@ -119,11 +124,8 @@ async def handle_incoming_message(
         
         decoded = message.body.decode("utf-8")
         event = json.loads(decoded)
-        # print(event)
     except Exception as e:
-        # raise e
-        print(e)
-        print("BAD JSON")
+        logging.debug("BAD JSON")
         await publish_to_dlq(
             message=message,
             dlq_exchange=dlq_exchange,
@@ -150,11 +152,7 @@ async def handle_incoming_message(
     try:
         info = extract_s3_event_info(event)
     except NonRetryableError as e:
-        #raise e
-        # print(e)
-        # await message.ack()
-        # return
-        print("BAD EVENT CANNOT PARSE", e)
+        logger.debug("FOUND BAD MESSAGE")
         await publish_to_dlq(
             message=message,
             dlq_exchange=dlq_exchange,
@@ -166,13 +164,13 @@ async def handle_incoming_message(
         return
 
     # Main pipeline
-    print("HERE WE GO PROCESSING")
+    logger.debug("PROCESSING STARTS")
     try:
         await handle_s3_event(info=info, s3_client=s3_client, deps=deps)
         await message.ack()
         return
     except NonRetryableError as e:
-        print("STAIGHT FROM DLQ FROM NRE")
+        logging.debug("STAIGHT FROM DLQ FROM NRE")
         await publish_to_dlq(
             message=message,
             dlq_exchange=dlq_exchange,
@@ -183,12 +181,10 @@ async def handle_incoming_message(
         await message.ack()
         return
     except Exception as e:
-        print(e)
-        # Retryable failure
-        # raise e
-        print("RETRY COUNT", retry_count)
+        logging.debug(e)
+        logging.debug(f"RETRY COUNT: {retry_count}")
         if retry_count >= len(retry_levels):
-            print("STRAIGHT TO DLQ")
+            logging.debug("STRAIGHT TO DLQ")
             await publish_to_dlq(
                 message=message,
                 dlq_exchange=dlq_exchange,
@@ -198,7 +194,6 @@ async def handle_incoming_message(
             )
             await message.ack()
             return
-        print("REPUBLISH")
         await publish_to_retry(
             message=message,
             retry_levels=retry_levels,
@@ -260,12 +255,10 @@ async def consume_rabbitmq(*, s3_client, deps: PipelineDeps, cfg: AppConfig) -> 
                         cfg=cfg,
                     )
         except asyncio.CancelledError:
-            # print("ARE WE REAL")
             break
         except Exception as e:
             # basic reconnect loop; caller can add backoff/logging
             #raise e
-            print(e)
-            print("NO GOOD WE ARE HERE ACTUALLY")
+            logger.debug(e)
             await asyncio.sleep(3)
 

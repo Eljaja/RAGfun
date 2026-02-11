@@ -34,28 +34,30 @@ class Settings:
 # VLM Client
 # ─────────────────────────────────────────────────────────────
 # TODO: Move to separate module (e.g., clients/vlm.py)
-# TODO: Add connection pooling / reuse httpx client
 # TODO: Add retry logic with exponential backoff
-# TODO: Return Result[str, VLMError] instead of raising
 
 class VLMClient:
     """
     OpenAI-compatible chat completions client for multimodal extraction in vLLM.
+
+    Creates a persistent httpx.AsyncClient — call close() on shutdown.
     """
 
     def __init__(self, *, base_url: str, api_key: str | None, model: str, timeout_s: float) -> None:
         self._base_url = base_url.rstrip("/")
-        self._api_key = api_key
         self._model = model
-        self._timeout_s = timeout_s
-        # TODO: Create persistent httpx.AsyncClient here, close in __aexit__
+        headers = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        self._client = httpx.AsyncClient(
+            base_url=self._base_url,
+            headers=headers,
+            timeout=timeout_s,
+        )
 
     async def page_to_text(self, *, png_bytes: bytes) -> str:
         data_url = "data:image/png;base64," + \
             base64.b64encode(png_bytes).decode("ascii")
-        headers = {}
-        if self._api_key:
-            headers["Authorization"] = f"Bearer {self._api_key}"
 
         payload = {
             "model": self._model,
@@ -78,15 +80,15 @@ class VLMClient:
             ],
         }
 
-        async with httpx.AsyncClient(timeout=self._timeout_s) as client:
-            r = await client.post(f"{self._base_url}/chat/completions", json=payload, headers=headers)
-            r.raise_for_status()
-            j = r.json()
+        r = await self._client.post("/chat/completions", json=payload)
+        r.raise_for_status()
         try:
-            return str(j["choices"][0]["message"]["content"] or "").strip()
-        except Exception:
-            # logger.error("vlm_unexpected_response", extra={"extra": {"keys": list(j.keys())}})
+            return str(r.json()["choices"][0]["message"]["content"] or "").strip()
+        except (KeyError, IndexError):
             raise RuntimeError("vlm_unexpected_response")
+
+    async def close(self) -> None:
+        await self._client.aclose()
 
 
 class ToText(Protocol):
