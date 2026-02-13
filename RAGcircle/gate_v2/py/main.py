@@ -1,7 +1,8 @@
 from __future__ import annotations
 import uvicorn
 import uuid
-from storage import UploadMeta, upload_with_content_addressing, detect_content_type
+import re
+from storage import UploadMeta, upload_with_content_addressing, detect_content_type, download_from_s3
 from collectors import QdrantStore, BM25Store
 from collectors import BM25Store, QdrantStore, create_bm25_store, create_qdrant_store
 
@@ -10,6 +11,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 
 from aiobotocore.session import get_session
 from fastapi import APIRouter, Depends, FastAPI, Request
+from fastapi.responses import StreamingResponse
 
 from settings import Settings
 from exceptions import register_exception_handlers
@@ -22,6 +24,7 @@ from pydantic import BaseModel
 from database_ops import DocumentEventDB, create_db, ProjectDB, DocumentDB
 from auth import UserCreds, authenticated
 from projects import authorize_project
+from settings import Constants
 
 
 from ops_bucket import create_collection
@@ -266,6 +269,18 @@ async def upload(
     content_type = await detect_content_type(file)
     meta = UploadMeta(title=title, description=description)
 
+    # Validate content type
+    constants = Constants()
+    is_allowed = (
+        content_type in constants.allowed_content_types or
+        re.match(constants.allowed_text_pattern, content_type)
+    )
+    if not is_allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Content type '{content_type}' is not allowed"
+        )
+
     async def file_stream():
         while chunk := await file.read(64 * 1024):
             yield chunk
@@ -299,6 +314,185 @@ async def upload(
         "project_id": project_id,
         "size": upload_result.size,
     }
+
+
+@protected_router.post("/v1/documents/upload")
+async def upload(
+    file: UploadFile = File(...),
+    project_id: str = Form(...),
+    title: str = Form(...),
+    description: str | None = Form(None),
+
+    user: UserCreds = Depends(authenticated),
+    s3_client=Depends(get_s3),
+    project_db: ProjectDB = Depends(get_project_db),
+    document_db: DocumentDB = Depends(get_document_db),
+    settings: Settings = Depends(get_settings),
+):
+    doc_id = uuid.uuid4().hex
+    # Verify user owns the project
+    await authorize_project(user, project_id, project_db)
+
+    content_type = await detect_content_type(file)
+    meta = UploadMeta(title=title, description=description)
+
+    # Validate content type
+    constants = Constants()
+    is_allowed = (
+        content_type in constants.allowed_content_types or
+        re.match(constants.allowed_text_pattern, content_type)
+    )
+    if not is_allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Content type '{content_type}' is not allowed"
+        )
+
+    async def file_stream():
+        while chunk := await file.read(64 * 1024):
+            yield chunk
+
+    # Use project_id as storage prefix for S3 organization
+    storage_prefix = f"{project_id}_"
+
+    upload_result = await upload_with_content_addressing(
+        s3=s3_client,
+        bucket=settings.bucket_name,
+        request_stream=file_stream(),
+        content_type=content_type,
+        max_bytes=1 * 1024 * 1024,
+        storage_prefix=storage_prefix,
+        doc_id=doc_id,
+    )
+    if upload_result.duplicate:
+        raise HTTPException(status_code=409)
+
+    # Do I like that option?
+    # Not really but we can merge results and hide info about doc contents in a way
+    # well shi
+    # shi x2
+    # shi x3
+    # whatever, we do not handle millions of docs, maybe we will scale later
+    
+    await document_db.persist_document(doc_id, project_id, upload_result, meta)
+
+    return {
+        "doc_id": doc_id,
+        "project_id": project_id,
+        "size": upload_result.size,
+    }
+
+
+@protected_router.post("/v1/documents/upload")
+async def upload(
+    file: UploadFile = File(...),
+    project_id: str = Form(...),
+    title: str = Form(...),
+    description: str | None = Form(None),
+
+    user: UserCreds = Depends(authenticated),
+    s3_client=Depends(get_s3),
+    project_db: ProjectDB = Depends(get_project_db),
+    document_db: DocumentDB = Depends(get_document_db),
+    settings: Settings = Depends(get_settings),
+):
+    doc_id = uuid.uuid4().hex
+    # Verify user owns the project
+    await authorize_project(user, project_id, project_db)
+
+    content_type = await detect_content_type(file)
+    meta = UploadMeta(title=title, description=description)
+
+    # Validate content type
+    constants = Constants()
+    is_allowed = (
+        content_type in constants.allowed_content_types or
+        re.match(constants.allowed_text_pattern, content_type)
+    )
+    if not is_allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Content type '{content_type}' is not allowed"
+        )
+
+    async def file_stream():
+        while chunk := await file.read(64 * 1024):
+            yield chunk
+
+    # Use project_id as storage prefix for S3 organization
+    storage_prefix = f"{project_id}_"
+
+    upload_result = await upload_with_content_addressing(
+        s3=s3_client,
+        bucket=settings.bucket_name,
+        request_stream=file_stream(),
+        content_type=content_type,
+        max_bytes=1 * 1024 * 1024,
+        storage_prefix=storage_prefix,
+        doc_id=doc_id,
+    )
+    if upload_result.duplicate:
+        raise HTTPException(status_code=409)
+
+    # Do I like that option?
+    # Not really but we can merge results and hide info about doc contents in a way
+    # well shi
+    # shi x2
+    # shi x3
+    # whatever, we do not handle millions of docs, maybe we will scale later
+    
+    await document_db.persist_document(doc_id, project_id, upload_result, meta)
+
+    return {
+        "doc_id": doc_id,
+        "project_id": project_id,
+        "size": upload_result.size,
+    }
+
+
+@protected_router.get("/v1/documents/{doc_id}/download")
+async def download_document(
+    doc_id: str,
+    user: UserCreds = Depends(authenticated),
+    s3_client=Depends(get_s3),
+    project_db: ProjectDB = Depends(get_project_db),
+    document_db: DocumentDB = Depends(get_document_db),
+    settings: Settings = Depends(get_settings),
+):
+    """Download a document by its ID (with ownership check via project)."""
+    # Get document to find its project and storage info
+    doc = await document_db.get(doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="document_not_found")
+
+    # Verify user owns the project this document belongs to
+    await authorize_project(user, doc["project_id"], project_db)
+
+    # Construct the S3 key using the same pattern as upload
+    storage_key = f"{doc['project_id']}_{doc['storage_id']}"
+
+    # Get content type from doc metadata or default to binary
+    content_type = doc.get("content_type", "application/octet-stream")
+
+    # Stream the file from S3
+    file_stream = download_from_s3(
+        s3=s3_client,
+        bucket=settings.bucket_name,
+        key=storage_key,
+    )
+
+    # Create a filename from the document title
+    filename = f"{doc.get('title', doc_id)}.bin"
+
+    return StreamingResponse(
+        file_stream,
+        media_type=content_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(doc.get("size", 0)),
+        },
+    )
+
 
 # TOTHINK
 # should I somehow combine info about a project into uuid + filesha256

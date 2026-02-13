@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from urllib.parse import unquote
 
 from chunker import chunk_text_chars
 from embed_caller import Embedder
+from errors import NonRetryableError
 from s3_events import S3EventInfo
 from ingestion import ingest_chunks
 from models import ChunkMeta, Locator
 from processing import Settings, file_to_texts, VLMClient
 from store import QdrantStore, BM25Store
 from db_ops import DocumentEventDB
+
+logger = logging.getLogger("data.processing.pipeline")
 
 
 def generate_doc_id(bucket: str, key: str) -> str:
@@ -85,13 +89,31 @@ async def download_from_s3(*, bucket: str, key: str, s3_client) -> tuple[bytes, 
     return file_bytes, content_type, filename
 
 
-async def handle_object_created(*, info: S3EventInfo, s3_client, deps: PipelineDeps) -> None:
-    
-    filename = info.key.split("/")[-1]
-    
-    project_id, doc_id = filename.split("_")
-    await deps.event_db_docs.log_ingested(doc_id=doc_id, project_id=project_id, processing_time_ms=1000)
+def _parse_filename(key: str) -> tuple[str, str]:
+    """Extract (project_id, doc_id) from an S3 key like 'prefix/projectId_docId.ext'.
 
+    Raises NonRetryableError when the filename doesn't match the expected format —
+    retrying the same message will never fix a structural naming issue.
+    """
+    filename = key.split("/")[-1]
+    try:
+        project_id, doc_id = filename.split("_", 1)
+    except ValueError as e:
+        raise NonRetryableError(
+            f"malformed_filename:{filename} (expected 'projectId_docId')",
+            cause=e,
+        ) from e
+    if not project_id or not doc_id:
+        raise NonRetryableError(
+            f"malformed_filename:{filename} (empty project_id or doc_id)",
+        )
+    return project_id, doc_id
+
+
+async def handle_object_created(*, info: S3EventInfo, s3_client, deps: PipelineDeps) -> None:
+
+    project_id, doc_id = _parse_filename(info.key)
+    await deps.event_db_docs.log_ingested(doc_id=doc_id, project_id=project_id, processing_time_ms=1000)
 
     # Download + extract
     file_bytes, content_type, filename = await download_from_s3(bucket=info.bucket, key=info.key, s3_client=s3_client)
@@ -104,7 +126,7 @@ async def handle_object_created(*, info: S3EventInfo, s3_client, deps: PipelineD
     )
 
     # Chunk + ingest
-    project_id, doc_id = filename.split("_")
+    project_id, doc_id = _parse_filename(info.key)
     source = f"s3://{info.bucket}/{unquote(info.key or '')}"
     chunks = create_chunks_from_texts(
         doc_id=doc_id,
@@ -129,8 +151,7 @@ async def handle_object_created(*, info: S3EventInfo, s3_client, deps: PipelineD
 
 async def handle_object_removed(*, info: S3EventInfo, deps: PipelineDeps) -> None:
     """Cleanup indexed data for a removed S3 object."""
-    filename = info.key.split("/")[-1]
-    project_id, doc_id = filename.split("_")
+    project_id, doc_id = _parse_filename(info.key)
 
     tasks = []
     if deps.qdrant is not None:

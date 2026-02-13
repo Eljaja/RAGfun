@@ -225,9 +225,6 @@ async def upload_with_content_addressing(
             CopySource=f"{bucket}/{temp_key}",
             Key=storage_id,
             ContentType=content_type,
-            # THESE TWO LINES DO NOT WORK PROPERLY NOW 
-            # ON ONE HAND WE CANNOT TRACE OBJECT NAME WHEN 
-            # LOOKING AT MULTIPART EVENTS
             MetadataDirective="REPLACE",
             Metadata={
                  "sha": sha256,
@@ -235,16 +232,7 @@ async def upload_with_content_addressing(
             },
         )
         await s3.delete_object(Bucket=bucket, Key=temp_key)
-    
-    # await db.create_document(
-    #     doc_id=doc_id,
-    #     storage_id=storage_id,
-    #     title=meta.title,
-    #     description=meta.description,
-    #     size=size,
-    #     content_type=content_type,
-    # )
-    
+        
     return UploadResult(storage_id=real_doc_id, size=size, sha256=sha256, duplicate=exists)
 
 
@@ -270,9 +258,23 @@ async def detect_content_type(file: UploadFile) -> str:
 
 
 # upload
-# can attach 256sha so we could check this stuff in advance 
-# delete 
-# simple 
+# can attach 256sha so we could check this stuff in advance
+# delete
+# simple
+
+
+async def download_from_s3(
+    s3,
+    bucket: str,
+    key: str,
+) -> AsyncIterator[bytes]:
+    """
+    Stream download from S3.
+    Yields chunks of the file content.
+    """
+    async with s3.get_object(Bucket=bucket, Key=key) as response:
+        async for chunk in response["Body"]:
+            yield chunk
 
 
 

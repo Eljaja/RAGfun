@@ -66,6 +66,9 @@ class AppConfig(BaseSettings):
         validation_alias=AliasChoices("db_addr", "postgre_url"),
     )
 
+    # ── Logging ───────────────────────────────────────────────────────
+    log_level: str = "DEBUG"
+
     # ── Validators ───────────────────────────────────────────────────────
 
     @model_validator(mode="before")

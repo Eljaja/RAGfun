@@ -2,12 +2,36 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct
+from qdrant_client.http.exceptions import UnexpectedResponse
 
 from embed_caller import Embedder
+from errors import NonRetryableError
 from hash_strategy import ExistingChunk, ContentHashStrategy, filter_chunks_needing_embedding
+
+logger = logging.getLogger("data.processing.store")
+
+# ─────────────────────────────────────────────────────────────
+# Qdrant error classification
+# ─────────────────────────────────────────────────────────────
+
+# Status codes that will never succeed on retry
+_QDRANT_NON_RETRYABLE_CODES = {400, 401, 403, 409, 422}
+
+
+def _classify_qdrant_error(e: Exception, *, operation: str) -> Exception:
+    """Return NonRetryableError when retrying is pointless, otherwise return *e* unchanged."""
+    if isinstance(e, UnexpectedResponse) and e.status_code in _QDRANT_NON_RETRYABLE_CODES:
+        return NonRetryableError(
+            f"qdrant_{operation}:{e.status_code}:{e.reason_phrase}",
+            cause=e,
+        )
+    # Timeouts, 5xx, connection refused → retryable (return as-is)
+    return e
+
 
 def _chunk_to_point_id(chunk_id: str) -> int:
     """Convert chunk_id to a deterministic positive int for Qdrant."""
@@ -25,12 +49,15 @@ class QdrantStore:
         Ensure a collection exists. If dimension is not provided, uses the default dimension.
         """
         dim = dimension if dimension is not None else self.dimension
-        exists = await self.client.collection_exists(collection)
-        if not exists:
-            await self.client.create_collection(
-                collection,
-                vectors_config=VectorParams(size=dim, distance=Distance.COSINE)
-            )
+        try:
+            exists = await self.client.collection_exists(collection)
+            if not exists:
+                await self.client.create_collection(
+                    collection,
+                    vectors_config=VectorParams(size=dim, distance=Distance.COSINE)
+                )
+        except Exception as e:
+            raise _classify_qdrant_error(e, operation="ensure_collection") from e
 
     async def upsert(self, chunks: list, vectors: list[list[float]], collection: str):
         """Upsert ChunkMeta objects with their vectors."""
@@ -53,12 +80,18 @@ class QdrantStore:
             )
             for c, v in zip(chunks, vectors)
         ]
-        await self.client.upsert(collection, points)
+        try:
+            await self.client.upsert(collection, points)
+        except Exception as e:
+            raise _classify_qdrant_error(e, operation="upsert") from e
 
     async def get_existing_chunks(self, chunk_ids: list[str], collection: str) -> dict[str, dict]:
         """
         Retrieve existing chunk metadata from Qdrant.
         Returns {chunk_id: {"exists": True, "content_hash": ...}} for found chunks.
+
+        On failure, logs a warning and returns {} (the caller will re-embed everything,
+        which is wasteful but not data-losing).
         """
         if not chunk_ids:
             return {}
@@ -82,6 +115,12 @@ class QdrantStore:
                         }
             return result
         except Exception:
+            logger.warning(
+                "Failed to retrieve existing chunks from qdrant "
+                "(collection=%s, %d chunk_ids) — will re-embed all",
+                collection, len(chunk_ids),
+                exc_info=True,
+            )
             return {}
 
     async def ingest_chunks(
@@ -127,15 +166,18 @@ class QdrantStore:
     async def delete_by_doc_id(self, doc_id: str, collection: str):
         """Delete all chunks for a document."""
         from qdrant_client.models import Filter, FieldCondition, MatchValue
-        if not await self.client.collection_exists(collection):
-            return
+        try:
+            if not await self.client.collection_exists(collection):
+                return
 
-        await self.client.delete(
-            collection,
-            points_selector=Filter(
-                must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]
+            await self.client.delete(
+                collection,
+                points_selector=Filter(
+                    must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]
+                )
             )
-        )
+        except Exception as e:
+            raise _classify_qdrant_error(e, operation="delete_by_doc_id") from e
 
     async def close(self):
         await self.client.close()
@@ -149,6 +191,35 @@ class QdrantStore:
 
 # services/bm25_store.py
 from opensearchpy import AsyncOpenSearch
+from opensearchpy.exceptions import (
+    AuthorizationException,
+    AuthenticationException,
+    RequestError,
+    NotFoundError,
+    ConflictError,
+)
+
+# ─────────────────────────────────────────────────────────────
+# OpenSearch error classification
+# ─────────────────────────────────────────────────────────────
+
+_OS_NON_RETRYABLE = (AuthorizationException, AuthenticationException, RequestError, ConflictError)
+
+
+def _classify_opensearch_error(e: Exception, *, operation: str) -> Exception:
+    """Return NonRetryableError when retrying is pointless, otherwise return *e* unchanged."""
+    if isinstance(e, _OS_NON_RETRYABLE):
+        return NonRetryableError(
+            f"opensearch_{operation}:{type(e).__name__}:{e}",
+            cause=e,
+        )
+    if isinstance(e, NotFoundError) and operation != "delete":
+        # Missing index on delete is fine; on upsert/search it's a config problem
+        return NonRetryableError(
+            f"opensearch_{operation}:index_not_found", cause=e,
+        )
+    # Timeouts, connection errors, 5xx → retryable
+    return e
 
 
 class BM25Store:
@@ -157,45 +228,47 @@ class BM25Store:
 
     async def ensure_index(self, index: str):
         """Ensure an index exists."""
-        exists = await self.client.indices.exists(index=index)
-        print(f"[OS] ensure_index '{index}': exists={exists}")
-        if not exists:
-            resp = await self.client.indices.create(index=index, body={
-                "settings": {
-                    "analysis": {
-                        "filter": {
-                            "russian_stemmer": {"type": "stemmer", "language": "russian"}
-                        },
-                        "analyzer": {
-                            "russian": {
-                                "type": "custom",
-                                "tokenizer": "standard",
-                                "filter": ["lowercase", "russian_stemmer"]
+        try:
+            exists = await self.client.indices.exists(index=index)
+            logger.debug("ensure_index '%s': exists=%s", index, exists)
+            if not exists:
+                resp = await self.client.indices.create(index=index, body={
+                    "settings": {
+                        "number_of_replicas": 0,
+                        "analysis": {
+                            "filter": {
+                                "russian_stemmer": {"type": "stemmer", "language": "russian"}
+                            },
+                            "analyzer": {
+                                "russian": {
+                                    "type": "custom",
+                                    "tokenizer": "standard",
+                                    "filter": ["lowercase", "russian_stemmer"]
+                                }
                             }
                         }
+                    },
+                    "mappings": {
+                        "properties": {
+                            "chunk_id": {"type": "keyword"},
+                            "doc_id": {"type": "keyword"},
+                            "chunk_index": {"type": "integer"},
+                            "text": {"type": "text", "analyzer": "russian"},
+                            "source": {"type": "keyword"},
+                            "uri": {"type": "keyword"},
+                            "page": {"type": "integer"},
+                        }
                     }
-                },
-                "mappings": {
-                    "properties": {
-                        "chunk_id": {"type": "keyword"},
-                        "doc_id": {"type": "keyword"},
-                        "chunk_index": {"type": "integer"},
-                        "text": {"type": "text", "analyzer": "russian"},
-                        "source": {"type": "keyword"},
-                        "uri": {"type": "keyword"},
-                        "page": {"type": "integer"},
-                    }
-                }
-            })
-            print(f"[OS] created index '{index}': {resp}")
+                })
+                logger.info("Created opensearch index '%s': %s", index, resp)
+        except Exception as e:
+            raise _classify_opensearch_error(e, operation="ensure_index") from e
 
     async def upsert(self, chunks: list, index: str):
         """Bulk upsert ChunkMeta objects."""
         if not chunks:
-            print("[OS] upsert called with empty chunks, skipping")
+            logger.debug("upsert called with empty chunks, skipping")
             return
-
-        # print(f"[OS] upsert called: {len(chunks)} chunks -> index '{index}'")
 
         # Use bulk API for efficiency
         actions = []
@@ -211,45 +284,72 @@ class BM25Store:
                 "page": c.locator.page if c.locator else None,
             })
 
+        try:
+            resp = await self.client.bulk(body=actions)
+        except Exception as e:
+            raise _classify_opensearch_error(e, operation="upsert") from e
 
-        resp = await self.client.bulk(body=actions)
-        # if actions:
-        #     print(f"[OS] sending bulk request: {len(actions)//2} docs, first id='{chunks[0].chunk_id}'")
-        #     resp = await self.client.bulk(body=actions)
-        #     print(f"[OS] bulk response: errors={resp.get('errors')}, took={resp.get('took')}ms")
-        #     if resp.get("errors"):
-        #         for item in resp.get("items", []):
-        #             act = item.get("index", {})
-        #             if act.get("error"):
-        #                 print(f"[OS] BULK ERROR id={act.get('_id')}: {act['error']}")
+        # Check for partial bulk failures (OpenSearch returns 200 with errors in body)
+        if resp.get("errors"):
+            failed_items = []
+            non_retryable_detected = False
+            for item in resp.get("items", []):
+                act = item.get("index", {})
+                err = act.get("error")
+                if err:
+                    err_type = err.get("type", "unknown") if isinstance(err, dict) else str(err)
+                    err_reason = err.get("reason", "") if isinstance(err, dict) else ""
+                    failed_items.append(f"id={act.get('_id')} type={err_type} reason={err_reason}")
+                    # Mapping errors are non-retryable (schema mismatch)
+                    if isinstance(err, dict) and err.get("type") in (
+                        "mapper_parsing_exception",
+                        "strict_dynamic_mapping_exception",
+                        "illegal_argument_exception",
+                    ):
+                        non_retryable_detected = True
+            logger.error(
+                "OpenSearch bulk partial failure: %d/%d items failed in index '%s': %s",
+                len(failed_items), len(chunks), index, "; ".join(failed_items[:10]),
+            )
+            if non_retryable_detected:
+                raise NonRetryableError(
+                    f"opensearch_upsert:bulk_mapping_error:{len(failed_items)}_items_failed",
+                )
+
         await self.client.indices.refresh(index=index)
 
     async def delete_by_doc_id(self, doc_id: str, index: str):
-
         """Delete all chunks for a document."""
-        if not await self.client.indices.exists(index=index):
+        try:
+            if not await self.client.indices.exists(index=index):
+                return
+
+            await self.client.delete_by_query(
+                index=index,
+                body={"query": {"term": {"doc_id": doc_id}}}
+            )
+        except NotFoundError:
+            # Index or doc already gone — idempotent, nothing to do
             return
-        
-        await self.client.delete_by_query(
-            index=index,
-            body={"query": {"term": {"doc_id": doc_id}}}
-        )
+        except Exception as e:
+            raise _classify_opensearch_error(e, operation="delete") from e
 
     async def search(self, query: str, index: str, top_k: int = 20) -> list[tuple[str, float]]:
-        resp = await self.client.search(
-            index=index,
-            body={"query": {"match": {"text": query}}, "size": top_k}
-        )
-        return [(hit["_id"], hit["_score"]) for hit in resp["hits"]["hits"]]
+        try:
+            resp = await self.client.search(
+                index=index,
+                body={"query": {"match": {"text": query}}, "size": top_k}
+            )
+            return [(hit["_id"], hit["_score"]) for hit in resp["hits"]["hits"]]
+        except Exception as e:
+            raise _classify_opensearch_error(e, operation="search") from e
 
     async def close(self):
         await self.client.close()
 
     async def get(self, doc_id: str, index: str) -> dict | None:
         resp = await self.client.get(index=index, id=doc_id)
-        print("THIS IS RESP", resp)
         return resp["_source"]
-
 
     async def delete_index(self, index: str):
         """Delete an entire index."""

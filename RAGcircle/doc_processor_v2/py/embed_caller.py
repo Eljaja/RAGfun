@@ -4,6 +4,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
+from errors import NonRetryableError
+
 class EmbeddingResponseData(BaseModel):
     embedding: list[float]
     index: int
@@ -30,7 +32,7 @@ class Embedder:
             return []
 
         if any(not isinstance(t, str) for t in texts):
-            raise ValueError("All inputs must be strings")
+            raise NonRetryableError("embed:all_inputs_must_be_strings")
 
         try:
             resp = await self.client.post(
@@ -45,9 +47,22 @@ class Embedder:
             return [item.embedding for item in sorted_data]
 
         except httpx.HTTPStatusError as e:
-            raise RuntimeError(f"Embedding API failed: {e.response.status_code} {e.response.text}") from e
+            code = e.response.status_code
+            if 400 <= code < 500:
+                # 4xx → bad input / auth / model not found — will never succeed on retry
+                raise NonRetryableError(
+                    f"embedding_api:{code}:{e.response.text[:300]}",
+                    cause=e,
+                ) from e
+            # 5xx → server-side, retryable
+            raise RuntimeError(
+                f"Embedding API server error: {code} {e.response.text[:300]}"
+            ) from e
         except (ValidationError, KeyError, TypeError) as e:
-            raise ValueError(f"Unexpected response format from embedding API: {e}") from e
+            # Response shape doesn't match our model — API contract broken, non-retryable
+            raise NonRetryableError(
+                f"embedding_api:unexpected_response_format:{e}", cause=e,
+            ) from e
 
     async def close(self) -> None:
         await self.client.aclose()

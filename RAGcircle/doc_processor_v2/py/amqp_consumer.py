@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from marshal import load
+import traceback as _tb
 
 import aio_pika
 
@@ -11,7 +11,6 @@ from config import AppConfig
 from errors import NonRetryableError
 from s3_events import extract_s3_event_info
 from pipeline import PipelineDeps, handle_s3_event
-
 
 
 logger = logging.getLogger("data.processing")
@@ -80,12 +79,25 @@ async def publish_to_dlq(
     routing_key: str,
     reason: str,
     retry_count: int,
+    exc: Exception | None = None,
 ) -> None:
-
-    logger.debug("TO DLQ")
+    """Publish a message to the dead-letter queue with error context in headers."""
+    logger.warning("Publishing message to DLQ: %s", reason)
     hdrs = dict(message.headers or {})
     hdrs["dlq_reason"] = reason
     hdrs["x-retry-count"] = retry_count
+
+    # Attach traceback so DLQ consumers can diagnose without re-running
+    if exc is not None:
+        if isinstance(exc, NonRetryableError) and exc.original_traceback:
+            hdrs["x-original-error-type"] = type(exc.original_error).__name__ if exc.original_error else ""
+            hdrs["x-original-traceback"] = exc.original_traceback[:3000]
+        else:
+            hdrs["x-error-type"] = type(exc).__name__
+            hdrs["x-error-traceback"] = "".join(
+                _tb.format_exception(type(exc), exc, exc.__traceback__)
+            )[:3000]
+
     msg = aio_pika.Message(
         body=message.body,
         headers=hdrs,
@@ -115,29 +127,28 @@ async def handle_incoming_message(
     - If publish fails, we do NOT ACK; the message will be redelivered.
     """
 
-    logger.debug("INCOMING MESSAGE")
+    logger.debug("Incoming message received")
     retry_count = retry_count_from_headers(message.headers, retry_queue=cfg.amqp_retry_queue)
 
     # Parse JSON payload (DLQ immediately if invalid)
-    # well this is only about the bad json
     try:
-        
         decoded = message.body.decode("utf-8")
         event = json.loads(decoded)
     except Exception as e:
-        logging.debug("BAD JSON")
+        logger.error("Invalid JSON in message body", exc_info=True)
         await publish_to_dlq(
             message=message,
             dlq_exchange=dlq_exchange,
             routing_key=cfg.amqp_dlq_routing_key,
             reason=f"invalid_json:{type(e).__name__}",
             retry_count=retry_count,
+            exc=e,
         )
         await message.ack()
         return
 
     if not isinstance(event, dict):
-       
+        logger.error("Event payload is not a dict: %s", type(event).__name__)
         await publish_to_dlq(
             message=message,
             dlq_exchange=dlq_exchange,
@@ -152,45 +163,58 @@ async def handle_incoming_message(
     try:
         info = extract_s3_event_info(event)
     except NonRetryableError as e:
-        logger.debug("FOUND BAD MESSAGE")
+        logger.error("Malformed S3 event — sending to DLQ: %s", e, exc_info=True)
         await publish_to_dlq(
             message=message,
             dlq_exchange=dlq_exchange,
             routing_key=cfg.amqp_dlq_routing_key,
             reason=f"non_retryable:{e}",
             retry_count=retry_count,
+            exc=e,
         )
         await message.ack()
         return
 
     # Main pipeline
-    logger.debug("PROCESSING STARTS")
+    logger.debug("Processing event: %s/%s", info.bucket, info.key)
     try:
         await handle_s3_event(info=info, s3_client=s3_client, deps=deps)
         await message.ack()
         return
     except NonRetryableError as e:
-        logging.debug("STAIGHT FROM DLQ FROM NRE")
+        logger.error(
+            "Non-retryable error processing %s/%s — sending to DLQ: %s",
+            info.bucket, info.key, e,
+            exc_info=True,
+        )
         await publish_to_dlq(
             message=message,
             dlq_exchange=dlq_exchange,
             routing_key=cfg.amqp_dlq_routing_key,
             reason=f"non_retryable:{e}",
             retry_count=retry_count,
+            exc=e,
         )
         await message.ack()
         return
     except Exception as e:
-        logging.debug(e)
-        logging.debug(f"RETRY COUNT: {retry_count}")
+        logger.error(
+            "Pipeline error processing %s/%s (retry=%d/%d): %s",
+            info.bucket, info.key, retry_count, len(retry_levels), e,
+            exc_info=True,
+        )
         if retry_count >= len(retry_levels):
-            logging.debug("STRAIGHT TO DLQ")
+            logger.error(
+                "Max retries exceeded for %s/%s — sending to DLQ",
+                info.bucket, info.key,
+            )
             await publish_to_dlq(
                 message=message,
                 dlq_exchange=dlq_exchange,
                 routing_key=cfg.amqp_dlq_routing_key,
                 reason=f"max_retries_exceeded:{type(e).__name__}:{e}",
                 retry_count=retry_count,
+                exc=e,
             )
             await message.ack()
             return
@@ -256,9 +280,7 @@ async def consume_rabbitmq(*, s3_client, deps: PipelineDeps, cfg: AppConfig) -> 
                     )
         except asyncio.CancelledError:
             break
-        except Exception as e:
-            # basic reconnect loop; caller can add backoff/logging
-            #raise e
-            logger.debug(e)
+        except Exception:
+            logger.error("RabbitMQ connection lost, reconnecting in 3s", exc_info=True)
             await asyncio.sleep(3)
 

@@ -16,6 +16,7 @@ Core logic is split into:
 from __future__ import annotations
 
 import asyncio
+import logging
 import signal
 from contextlib import AsyncExitStack
 
@@ -31,8 +32,26 @@ from store import BM25Store, QdrantStore
 from db_ops import DocumentEventDB
 
 
+def _setup_logging(level: str) -> None:
+    """Configure root logging once at process start.
+
+    All modules use ``logging.getLogger("data.processing.*")`` — configuring
+    the root logger ensures every child logger inherits the level + format.
+    """
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    # Quieten noisy third-party libraries — even at DEBUG we only want
+    # to debug our own code, not heartbeat frames and HTTP internals.
+    for noisy in ("aiobotocore", "botocore", "urllib3", "aio_pika", "aiormq", "pamqp", "httpx", "httpcore", "opensearch", "opensearchpy"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
 async def main() -> None:
     cfg = AppConfig()
+    _setup_logging(cfg.log_level)
 
     vlm = VLMClient(
         base_url=cfg.vlm_base_url,

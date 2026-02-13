@@ -18,6 +18,19 @@ class Constants(BaseSettings):
 
     max_file_size: int = 100 * 1024
     max_link_ttl: int = 3600
+    allowed_content_types: list[str] = [
+        # Documents
+        "application/pdf",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.ms-excel",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.ms-powerpoint",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/rtf",
+        "application/epub+zip",
+    ]
+    allowed_text_pattern: str = r"^(text\/|application\/(json|xml|javascript|typescript|python|x-python))"
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
