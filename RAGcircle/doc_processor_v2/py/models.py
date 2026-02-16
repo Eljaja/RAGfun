@@ -25,6 +25,7 @@ class Locator(BaseModel):
 class ChunkMeta(BaseModel):
     chunk_id: str
     doc_id: str
+    db_id: str
     chunk_index: int
     text: str
     locator: Locator | None = None

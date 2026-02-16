@@ -69,6 +69,7 @@ class QdrantStore:
                 vector=v,
                 payload={
                     "chunk_id": c.chunk_id,
+                    "db_id": c.db_id,
                     "doc_id": c.doc_id,
                     "chunk_index": c.chunk_index,
                     "text": c.text,
@@ -130,6 +131,7 @@ class QdrantStore:
         collection: str,
         *,
         batch_size: int = 32,
+        model: str | None = None,
     ) -> None:
         """Embed and upsert chunks, skipping unchanged ones via content hash."""
         if not chunks:
@@ -158,7 +160,7 @@ class QdrantStore:
         all_vectors: list[list[float]] = []
         for i in range(0, len(need_embed), batch_size):
             texts = [c.text for c in need_embed[i : i + batch_size]]
-            vectors = await embedder.embed(texts)
+            vectors = await embedder.embed(texts, model=model)
             all_vectors.extend(vectors)
 
         await self.upsert(need_embed, all_vectors, collection)
@@ -251,6 +253,7 @@ class BM25Store:
                     "mappings": {
                         "properties": {
                             "chunk_id": {"type": "keyword"},
+                            "db_id": {"type": "keyword"},
                             "doc_id": {"type": "keyword"},
                             "chunk_index": {"type": "integer"},
                             "text": {"type": "text", "analyzer": "russian"},
@@ -276,6 +279,7 @@ class BM25Store:
             actions.append({"index": {"_index": index, "_id": c.chunk_id}})
             actions.append({
                 "chunk_id": c.chunk_id,
+                "db_id": c.db_id,
                 "doc_id": c.doc_id,
                 "chunk_index": c.chunk_index,
                 "text": c.text,

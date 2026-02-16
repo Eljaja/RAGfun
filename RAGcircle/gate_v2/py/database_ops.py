@@ -67,6 +67,11 @@ class ProjectDB:
                     user_id TEXT NOT NULL,
                     name TEXT NOT NULL,
                     description TEXT,
+                    embedding_model TEXT NOT NULL DEFAULT 'intfloat/multilingual-e5-base',
+                    chunk_size INT NOT NULL DEFAULT 512,
+                    chunk_overlap INT NOT NULL DEFAULT 64,
+                    language TEXT NOT NULL DEFAULT 'ru',
+                    llm_model TEXT NOT NULL DEFAULT 'gemma-3-12b',
                     status TEXT NOT NULL DEFAULT 'active',
                     created_at TIMESTAMPTZ DEFAULT NOW(),
                     updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -81,7 +86,12 @@ class ProjectDB:
         self,
         user_id: str,
         name: str,
-        description: Optional[str] = None
+        description: Optional[str] = None,
+        embedding_model: str = "intfloat/multilingual-e5-base",
+        chunk_size: int = 512,
+        chunk_overlap: int = 64,
+        language: str = "ru",
+        llm_model: str = "gemma-3-12b",
     ) -> Project:
         """Create a new project. Raises 400 if limit reached."""
         async with self.pool.acquire() as conn:
@@ -98,10 +108,15 @@ class ProjectDB:
 
             project_id = str(uuid.uuid4())
             row = await conn.fetchrow("""
-                INSERT INTO projects (project_id, user_id, name, description, status)
-                VALUES ($1, $2, $3, $4, 'active')
+                INSERT INTO projects (
+                    project_id, user_id, name, description,
+                    embedding_model, chunk_size, chunk_overlap, language, llm_model,
+                    status
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'active')
                 RETURNING *
-            """, project_id, user_id, name, description)
+            """, project_id, user_id, name, description,
+                embedding_model, chunk_size, chunk_overlap, language, llm_model)
 
             return Project.from_row(row)
 
@@ -241,15 +256,23 @@ class DocumentDB:
                 return None
             return dict(row)
 
-    async def list_by_project(self, project_id: str) -> list[dict]:
-        """List all documents for a project."""
+    async def list_by_project(
+        self, project_id: str, *, limit: int = 50, offset: int = 0
+    ) -> tuple[list[dict], int]:
+        """List documents for a project with pagination. Returns (docs, total)."""
         async with self.pool.acquire() as conn:
+            total = await conn.fetchval(
+                "SELECT COUNT(*) FROM documents WHERE project_id = $1",
+                project_id,
+            )
+            # probably deterministic 
             rows = await conn.fetch("""
                 SELECT * FROM documents 
                 WHERE project_id = $1 
-                ORDER BY created_at DESC
-            """, project_id)
-            return [dict(row) for row in rows]
+                ORDER BY created_at DESC, doc_id
+                LIMIT $2 OFFSET $3
+            """, project_id, limit, offset)
+            return [dict(row) for row in rows], total
 
     async def delete(self, doc_id: str) -> bool:
         """Delete a document by ID. Returns True if deleted."""
@@ -556,13 +579,12 @@ async def create_db(dsn: str, max_projects_per_user: int = 5, **kwargs):
 
     project_db = ProjectDB(pool, max_projects_per_user)
     document_db = DocumentDB(pool)
-
     event_db = DocumentEventDB(pool)
 
     # Projects table must be created first (documents references it)
     await project_db.ensure_schema()
     await document_db.ensure_schema()
-    await document_db.ensure_schema()
+    await event_db.ensure_schema()
 
     try:
         yield project_db, document_db, event_db

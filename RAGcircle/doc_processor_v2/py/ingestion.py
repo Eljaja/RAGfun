@@ -21,13 +21,14 @@ async def ingest_chunks(
     opensearch_index: str,
     *,
     embed_batch_size: int = 32,
+    model: str | None = None,
 ) -> None:
     """Ingest chunks into both stores in parallel. Raises on failure."""
     if not chunks:
         return
     # If one fails both are cancelled and propagated
     await asyncio.gather(
-        qdrant.ingest_chunks(chunks, embedder, qdrant_collection, batch_size=embed_batch_size),
+        qdrant.ingest_chunks(chunks, embedder, qdrant_collection, batch_size=embed_batch_size, model=model),
         opensearch.upsert(chunks, opensearch_index),
     )
 

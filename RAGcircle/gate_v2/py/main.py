@@ -17,7 +17,8 @@ from settings import Settings
 from exceptions import register_exception_handlers
 
 
-from fastapi import UploadFile, File, Form, HTTPException
+from fastapi import UploadFile, File, Form, HTTPException, Query
+from inspect import Parameter, Signature
 from pydantic import BaseModel
 
 
@@ -39,11 +40,28 @@ logger = logging.getLogger(__name__)
 class ProjectCreate(BaseModel):
     name: str
     description: str | None = None
+    # Immutable after creation — changing these requires re-indexing all docs
+    embedding_model: str = "intfloat/multilingual-e5-base"
+    chunk_size: int = 512
+    chunk_overlap: int = 64
+    language: str = "ru"
+    # Mutable — can be changed freely
+    llm_model: str = "gemma-3-12b"
 
 
 class ProjectUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
+    llm_model: str | None = None
+
+
+EMBEDDING_DIMENSIONS: dict[str, int] = {
+    "intfloat/multilingual-e5-base": 768,
+    "intfloat/multilingual-e5-large": 1024,
+    "intfloat/e5-base-v2": 768,
+    "intfloat/e5-large-v2": 1024,
+    "BAAI/bge-m3": 1024,
+}
 
 
 # ----------------------------
@@ -164,11 +182,17 @@ async def create_project(
         user_id=user.user_id,
         name=payload.name,
         description=payload.description,
+        embedding_model=payload.embedding_model,
+        chunk_size=payload.chunk_size,
+        chunk_overlap=payload.chunk_overlap,
+        language=payload.language,
+        llm_model=payload.llm_model,
     )
 
-    await qdrant.ensure_collection(project.project_id, dimension=768)
+    dimension = EMBEDDING_DIMENSIONS.get(payload.embedding_model, 768)
+    await qdrant.ensure_collection(project.project_id, dimension=dimension)
     await opensearch.ensure_index(project.project_id)
-    return {"ok": True, "project": project.to_dict()}
+    return {"project": project.to_dict()}
 
 
 @protected_router.get("/v1/projects")
@@ -178,7 +202,7 @@ async def list_projects(
 ):
     """List all projects owned by the authenticated user."""
     projects = await project_db.list_for_user(user.user_id)
-    return {"ok": True, "projects": [p.to_dict() for p in projects]}
+    return {"projects": [p.to_dict() for p in projects]}
 
 
 @protected_router.get("/v1/projects/{project_id}")
@@ -189,7 +213,7 @@ async def get_project(
 ):
     """Get a single project (with ownership check)."""
     project = await authorize_project(user, project_id, project_db)
-    return {"ok": True, "project": project.to_dict()}
+    return {"project": project.to_dict()}
 
 
 @protected_router.delete("/v1/projects/{project_id}")
@@ -212,7 +236,7 @@ async def delete_project(
     await qdrant.delete_collection(project_id)
     await opensearch.delete_index(project_id)
 
-    documents = await document_db.list_by_project(project_id)
+    documents, _ = await document_db.list_by_project(project_id, limit=10_000)
     for doc in documents:
         # probably is fine
         await s3.delete_object(Bucket="ragfun", Key=project_id + "_" + doc.get("storage_id"))
@@ -223,22 +247,30 @@ async def delete_project(
     # Soft-delete the project
     deleted = await project_db.delete(project_id, user.user_id)
 
-    return {"ok": deleted, "project_id": project_id}
+    return {"project_id": project_id}
 
 
 @protected_router.get("/v1/projects/{project_id}/documents")
 async def list_project_documents(
     project_id: str,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     user: UserCreds = Depends(authenticated),
     project_db: ProjectDB = Depends(get_project_db),
     document_db: DocumentDB = Depends(get_document_db),
 ):
-    """List all documents in a project."""
-    # Verify user owns the project
+    """List documents in a project with pagination."""
     await authorize_project(user, project_id, project_db)
 
-    documents = await document_db.list_by_project(project_id)
-    return {"ok": True, "documents": documents}
+    documents, total = await document_db.list_by_project(
+        project_id, limit=limit, offset=offset
+    )
+    return {
+        "documents": documents,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 # ----------------------------
@@ -249,13 +281,50 @@ async def list_project_documents(
 # what could be improved
 # user permissions/max_file_size
 #
-@protected_router.post("/v1/documents/upload")
-async def upload(
-    file: UploadFile = File(...),
-    project_id: str = Form(...),
-    title: str = Form(...),
-    description: str | None = Form(None),
 
+# another topic to look into
+# well well well
+class DocAttributes(BaseModel):
+    title: str
+    description: str | None = None
+    uri: str | None = None
+    source: str | None = None
+    lang: str | None = None
+    tags: str | None = None  # comma-separated
+    acl: str | None = None  # comma-separated
+    refresh: bool = False
+
+    @classmethod
+    def as_form(cls):
+        params = []
+        for field_name, field_info in cls.model_fields.items():
+            if field_info.is_required():
+                default = Form(...)
+            else:
+                default = Form(field_info.default)
+            params.append(
+                Parameter(
+                    field_name,
+                    Parameter.POSITIONAL_OR_KEYWORD,
+                    default=default,
+                    annotation=field_info.annotation,
+                )
+            )
+
+        async def form_body(**data):
+            return cls(**data)
+
+        form_body.__signature__ = Signature(params)
+        return form_body
+
+
+@protected_router.post("/v1/projects/{project_id}/upload")
+async def upload(
+    project_id: str,
+    file: UploadFile = File(...),
+
+    # Dependencies 
+    attrs: DocAttributes = Depends(DocAttributes.as_form()),
     user: UserCreds = Depends(authenticated),
     s3_client=Depends(get_s3),
     project_db: ProjectDB = Depends(get_project_db),
@@ -264,10 +333,10 @@ async def upload(
 ):
     doc_id = uuid.uuid4().hex
     # Verify user owns the project
-    await authorize_project(user, project_id, project_db)
+    project = await authorize_project(user, project_id, project_db)
 
     content_type = await detect_content_type(file)
-    meta = UploadMeta(title=title, description=description)
+    meta = UploadMeta(title=attrs.title, description=attrs.description)
 
     # Validate content type
     constants = Constants()
@@ -288,6 +357,11 @@ async def upload(
     # Use project_id as storage prefix for S3 organization
     storage_prefix = f"{project_id}_"
 
+
+    all_attrs = {
+        **{f"doc__{k}": str(v) for k, v in attrs.model_dump().items() if v is not None},
+        **{f"project__{k}": str(v) for k, v in project.to_dict().items() if v is not None},
+    }
     upload_result = await upload_with_content_addressing(
         s3=s3_client,
         bucket=settings.bucket_name,
@@ -296,6 +370,8 @@ async def upload(
         max_bytes=1 * 1024 * 1024,
         storage_prefix=storage_prefix,
         doc_id=doc_id,
+        # TODO: fix mixed up pydantic and dataclasses
+        doc_attrs = all_attrs, 
     )
     if upload_result.duplicate:
         raise HTTPException(status_code=409)
@@ -315,139 +391,6 @@ async def upload(
         "size": upload_result.size,
     }
 
-
-@protected_router.post("/v1/documents/upload")
-async def upload(
-    file: UploadFile = File(...),
-    project_id: str = Form(...),
-    title: str = Form(...),
-    description: str | None = Form(None),
-
-    user: UserCreds = Depends(authenticated),
-    s3_client=Depends(get_s3),
-    project_db: ProjectDB = Depends(get_project_db),
-    document_db: DocumentDB = Depends(get_document_db),
-    settings: Settings = Depends(get_settings),
-):
-    doc_id = uuid.uuid4().hex
-    # Verify user owns the project
-    await authorize_project(user, project_id, project_db)
-
-    content_type = await detect_content_type(file)
-    meta = UploadMeta(title=title, description=description)
-
-    # Validate content type
-    constants = Constants()
-    is_allowed = (
-        content_type in constants.allowed_content_types or
-        re.match(constants.allowed_text_pattern, content_type)
-    )
-    if not is_allowed:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Content type '{content_type}' is not allowed"
-        )
-
-    async def file_stream():
-        while chunk := await file.read(64 * 1024):
-            yield chunk
-
-    # Use project_id as storage prefix for S3 organization
-    storage_prefix = f"{project_id}_"
-
-    upload_result = await upload_with_content_addressing(
-        s3=s3_client,
-        bucket=settings.bucket_name,
-        request_stream=file_stream(),
-        content_type=content_type,
-        max_bytes=1 * 1024 * 1024,
-        storage_prefix=storage_prefix,
-        doc_id=doc_id,
-    )
-    if upload_result.duplicate:
-        raise HTTPException(status_code=409)
-
-    # Do I like that option?
-    # Not really but we can merge results and hide info about doc contents in a way
-    # well shi
-    # shi x2
-    # shi x3
-    # whatever, we do not handle millions of docs, maybe we will scale later
-    
-    await document_db.persist_document(doc_id, project_id, upload_result, meta)
-
-    return {
-        "doc_id": doc_id,
-        "project_id": project_id,
-        "size": upload_result.size,
-    }
-
-
-@protected_router.post("/v1/documents/upload")
-async def upload(
-    file: UploadFile = File(...),
-    project_id: str = Form(...),
-    title: str = Form(...),
-    description: str | None = Form(None),
-
-    user: UserCreds = Depends(authenticated),
-    s3_client=Depends(get_s3),
-    project_db: ProjectDB = Depends(get_project_db),
-    document_db: DocumentDB = Depends(get_document_db),
-    settings: Settings = Depends(get_settings),
-):
-    doc_id = uuid.uuid4().hex
-    # Verify user owns the project
-    await authorize_project(user, project_id, project_db)
-
-    content_type = await detect_content_type(file)
-    meta = UploadMeta(title=title, description=description)
-
-    # Validate content type
-    constants = Constants()
-    is_allowed = (
-        content_type in constants.allowed_content_types or
-        re.match(constants.allowed_text_pattern, content_type)
-    )
-    if not is_allowed:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Content type '{content_type}' is not allowed"
-        )
-
-    async def file_stream():
-        while chunk := await file.read(64 * 1024):
-            yield chunk
-
-    # Use project_id as storage prefix for S3 organization
-    storage_prefix = f"{project_id}_"
-
-    upload_result = await upload_with_content_addressing(
-        s3=s3_client,
-        bucket=settings.bucket_name,
-        request_stream=file_stream(),
-        content_type=content_type,
-        max_bytes=1 * 1024 * 1024,
-        storage_prefix=storage_prefix,
-        doc_id=doc_id,
-    )
-    if upload_result.duplicate:
-        raise HTTPException(status_code=409)
-
-    # Do I like that option?
-    # Not really but we can merge results and hide info about doc contents in a way
-    # well shi
-    # shi x2
-    # shi x3
-    # whatever, we do not handle millions of docs, maybe we will scale later
-    
-    await document_db.persist_document(doc_id, project_id, upload_result, meta)
-
-    return {
-        "doc_id": doc_id,
-        "project_id": project_id,
-        "size": upload_result.size,
-    }
 
 
 @protected_router.get("/v1/documents/{doc_id}/download")
@@ -530,7 +473,7 @@ async def delete_document(
     deleted = await document_db.delete(doc_id)
     
     await s3.delete_object(Bucket=settings.bucket_name, Key=doc['project_id'] + "_" + doc.get("storage_id"))
-    return {"ok": deleted, "doc_id": doc_id}
+    return {"doc_id": doc_id}
 
 
 @protected_router.get("/v1/documents/{doc_id}")
@@ -619,9 +562,9 @@ async def get_document_info(
 # ----------------------------
 
 app = FastAPI(lifespan=lifecycle, title="S3 Presign API")
-register_exception_handlers(app)
+# register_exception_handlers(app)
 app.include_router(public_router)
 app.include_router(protected_router)
 
 
-uvicorn.run(app=app, port=8912, host="localhost")
+uvicorn.run(app=app, port=8913, host="localhost")

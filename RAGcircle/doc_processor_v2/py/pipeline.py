@@ -25,13 +25,23 @@ def generate_doc_id(bucket: str, key: str) -> str:
 
 
 def create_chunks_from_texts(
+    db_id: str,
     doc_id: str,
     texts: list[str],
     settings: Settings,
-    *,
-    source: str | None = None,
-    uri: str | None = None,
+    meta: S3ObjectMeta,
 ) -> list[ChunkMeta]:
+    doc = meta.doc
+    project = meta.project
+
+    # Prefer project-level chunk settings, fall back to pipeline defaults
+    chunk_size = int(project.get("chunk_size", settings.chunk_size_chars))
+    chunk_overlap = int(project.get("chunk_overlap", settings.chunk_overlap_chars))
+
+    # Parse comma-separated fields into lists
+    tags = [t.strip() for t in doc.get("tags", "").split(",") if t.strip()]
+    acl = [a.strip() for a in doc.get("acl", "").split(",") if a.strip()]
+
     chunks: list[ChunkMeta] = []
     global_idx = 0
     has_pages = len(texts) > 1
@@ -42,22 +52,28 @@ def create_chunks_from_texts(
 
         for part in chunk_text_chars(
             page_text,
-            chunk_size=settings.chunk_size_chars,
-            overlap=settings.chunk_overlap_chars,
+            chunk_size=chunk_size,
+            overlap=chunk_overlap,
         ):
             chunks.append(
                 ChunkMeta(
                     chunk_id=f"{doc_id}:{global_idx}",
+                    db_id=db_id,
                     doc_id=doc_id,
                     chunk_index=global_idx,
                     text=part,
                     locator=Locator(page=page_idx + 1) if has_pages else None,
-                    source=source,
-                    uri=uri,
+                    title=doc.get("title"),
+                    source=doc.get("source"),
+                    uri=doc.get("uri"),
+                    lang=doc.get("lang") or project.get("language"),
+                    tags=tags,
+                    acl=acl,
+                    project_id=project.get("project_id"),
                 )
             )
             global_idx += 1
-
+    logger.info(f"Created {chunks[0]}")
     return chunks
 
 
@@ -75,9 +91,39 @@ class PipelineDeps:
     
 
 
-async def download_from_s3(*, bucket: str, key: str, s3_client) -> tuple[bytes, str | None, str]:
+@dataclass(frozen=True)
+class S3ObjectMeta:
+    """Parsed S3 user-defined metadata, split by prefix."""
+    doc: dict[str, str]
+    project: dict[str, str]
+    extra: dict[str, str]
+
+
+def parse_s3_metadata(raw: dict[str, str]) -> S3ObjectMeta:
+    """Split flat S3 metadata into doc/project/extra buckets by prefix."""
+    doc, project, extra = {}, {}, {}
+    for k, v in raw.items():
+        match k.split("__", 1):
+            case ["doc", rest]:
+                doc[rest] = v
+            case ["project", rest]:
+                project[rest] = v
+            case _:
+                extra[k] = v
+    return S3ObjectMeta(doc=doc, project=project, extra=extra)
+
+
+@dataclass(frozen=True)
+class S3Download:
+    file_bytes: bytes
+    content_type: str | None
+    filename: str
+    meta: S3ObjectMeta
+
+
+async def download_from_s3(*, bucket: str, key: str, s3_client) -> S3Download:
     """
-    Download object from S3 and return (bytes, content_type, filename).
+    Download object from S3 and return file bytes + parsed metadata.
 
     NOTE: key in events may be URL-encoded; we decode for actual S3 lookup.
     """
@@ -85,8 +131,10 @@ async def download_from_s3(*, bucket: str, key: str, s3_client) -> tuple[bytes, 
     response = await s3_client.get_object(Bucket=bucket, Key=decoded_key)
     file_bytes = await response["Body"].read()
     content_type = response.get("ContentType")
+    meta = parse_s3_metadata(response.get("Metadata") or {})
+    # print(meta)
     filename = decoded_key.split("/")[-1] if "/" in decoded_key else decoded_key
-    return file_bytes, content_type, filename
+    return S3Download(file_bytes=file_bytes, content_type=content_type, filename=filename, meta=meta)
 
 
 def _parse_filename(key: str) -> tuple[str, str]:
@@ -116,24 +164,23 @@ async def handle_object_created(*, info: S3EventInfo, s3_client, deps: PipelineD
     await deps.event_db_docs.log_ingested(doc_id=doc_id, project_id=project_id, processing_time_ms=1000)
 
     # Download + extract
-    file_bytes, content_type, filename = await download_from_s3(bucket=info.bucket, key=info.key, s3_client=s3_client)
+    dl = await download_from_s3(bucket=info.bucket, key=info.key, s3_client=s3_client)
     texts = await file_to_texts(
-        raw=file_bytes,
-        content_type=content_type,
-        filename=filename,
+        raw=dl.file_bytes,
+        content_type=dl.content_type,
+        filename=dl.filename,
         vlm=deps.vlm,
         settings=deps.settings,
     )
 
     # Chunk + ingest
     project_id, doc_id = _parse_filename(info.key)
-    source = f"s3://{info.bucket}/{unquote(info.key or '')}"
     chunks = create_chunks_from_texts(
+        db_id=dl.meta.extra.get("doc-id"),
         doc_id=doc_id,
         texts=texts,
         settings=deps.settings,
-        source=source,
-        uri=source,
+        meta=dl.meta,
     )
 
     await ingest_chunks(
@@ -144,6 +191,7 @@ async def handle_object_created(*, info: S3EventInfo, s3_client, deps: PipelineD
         qdrant_collection=project_id,
         opensearch_index=project_id,
         embed_batch_size=deps.embed_batch_size,
+        model=dl.meta.project.get("embedding_model"),
     )
 
     await deps.event_db_docs.log_processed(doc_id=doc_id, project_id=project_id, processing_time_ms=1000)

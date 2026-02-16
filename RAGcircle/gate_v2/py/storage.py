@@ -1,3 +1,5 @@
+import mimetypes
+import magic
 import hashlib
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -24,11 +26,11 @@ class StreamStats:
 
 class PartBuffer:
     """Accumulates chunks and yields full parts."""
-    
+
     def __init__(self, part_size: int = 8 * 1024 * 1024):
         self.part_size = part_size
         self._buffer = bytearray()
-    
+
     def add(self, chunk: bytes) -> bytes | None:
         """Add chunk, return part data if buffer is full."""
         self._buffer.extend(chunk)
@@ -37,7 +39,7 @@ class PartBuffer:
             self._buffer = bytearray(self._buffer[self.part_size:])
             return part
         return None
-    
+
     def flush(self) -> bytes | None:
         """Return remaining data."""
         if self._buffer:
@@ -58,7 +60,7 @@ async def multipart_upload(s3, bucket: str, key: str, content_type: str):
     )
     upload_id = resp["UploadId"]
     parts: list[UploadPart] = []
-    
+
     async def upload_part(data: bytes) -> None:
         part_num = len(parts) + 1
         resp = await s3.upload_part(
@@ -69,7 +71,7 @@ async def multipart_upload(s3, bucket: str, key: str, content_type: str):
             Body=data,
         )
         parts.append(UploadPart(etag=resp["ETag"], number=part_num))
-    
+
     async def complete() -> None:
         if parts:
             await s3.complete_multipart_upload(
@@ -84,7 +86,7 @@ async def multipart_upload(s3, bucket: str, key: str, content_type: str):
             # Empty file fallback
             await s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
             await s3.put_object(Bucket=bucket, Key=key, Body=b"", ContentType=content_type)
-    
+
     try:
         yield upload_part, complete
     except Exception:
@@ -102,12 +104,13 @@ async def validated_stream(
     """
     hasher = hashlib.sha256()
     total = 0
-    
+
     async for chunk in stream:
         total += len(chunk)
         if total > max_bytes:
-            # TODO: switch to domain exceptions + exception handlers 
-            raise HTTPException(413, f"File exceeds {max_bytes // (1024*1024)}MB")
+            # TODO: switch to domain exceptions + exception handlers
+            raise HTTPException(
+                413, f"File exceeds {max_bytes // (1024*1024)}MB")
         hasher.update(chunk)
         yield chunk, StreamStats(size=total, sha256=hasher.hexdigest())
 
@@ -125,22 +128,21 @@ async def upload_via_multipart(
     # TODO: add metadata
 ) -> tuple[int, str]:
     """Stream upload via S3 multipart. Returns (size, sha256)."""
-    
+
     buffer = PartBuffer(part_size)
     stats = StreamStats()
-    
+
     async with multipart_upload(s3, bucket, storage_id, content_type) as (upload_part, complete):
         async for chunk, stats in validated_stream(request_stream, max_bytes):
             if part_data := buffer.add(chunk):
                 await upload_part(part_data)
-        
+
         if remaining := buffer.flush():
             await upload_part(remaining)
-        
-        await complete()
-    
-    return stats.size, stats.sha256
 
+        await complete()
+
+    return stats.size, stats.sha256
 
 
 """
@@ -165,8 +167,6 @@ class UploadResult:
     duplicate: bool
 
 
-
-
 def sha256_hex_to_uuid_v8(sha256_hex: str) -> uuid.UUID:
     """
     Convert 64-char SHA-256 hex → UUIDv8.
@@ -174,18 +174,17 @@ def sha256_hex_to_uuid_v8(sha256_hex: str) -> uuid.UUID:
     """
     if len(sha256_hex) != 64 or not all(c in '0123456789abcdefABCDEF' for c in sha256_hex):
         raise ValueError("Must be exactly 64 hex chars")
-    
+
     digest = bytes.fromhex(sha256_hex)  # 32 raw bytes from hex
     bytes_arr = bytearray(digest[:16])  # Only take first 16 bytes for UUID
-    
+
     # Set version to 8 (bits 0b1000 in the high nibble of byte 6)
     bytes_arr[6] = (bytes_arr[6] & 0x0F) | 0x80
-    
+
     # Set variant to RFC 4122 (bits 0b10 in the high 2 bits of byte 8)
     bytes_arr[8] = (bytes_arr[8] & 0x3F) | 0x80
-    
-    return str(uuid.UUID(bytes=bytes(bytes_arr)))
 
+    return str(uuid.UUID(bytes=bytes(bytes_arr)))
 
 
 async def upload_with_content_addressing(
@@ -194,8 +193,9 @@ async def upload_with_content_addressing(
     request_stream,
     content_type: str,
     max_bytes: int,
-    storage_prefix: str, 
+    storage_prefix: str,
     doc_id: str,
+    doc_attrs: dict = {},
 ) -> UploadResult:
     temp_key = f"_temp_{uuid.uuid4().hex}"
     size, sha256 = await upload_via_multipart(
@@ -205,18 +205,18 @@ async def upload_with_content_addressing(
         request_stream=request_stream,
         content_type=content_type,
         max_bytes=max_bytes,
-       
+
     )
     real_doc_id = sha256_hex_to_uuid_v8(sha256)
     storage_id = storage_prefix + real_doc_id
-    
+
     # Check if content already exists
     try:
         await s3.head_object(Bucket=bucket, Key=storage_id)
         exists = True
     except s3.exceptions.ClientError:
         exists = False
-    
+
     if exists:
         await s3.delete_object(Bucket=bucket, Key=temp_key)
     else:
@@ -227,34 +227,32 @@ async def upload_with_content_addressing(
             ContentType=content_type,
             MetadataDirective="REPLACE",
             Metadata={
-                 "sha": sha256,
-                 "doc-id": doc_id,
-            },
+                "sha": sha256,
+                "doc-id": doc_id,
+            } | doc_attrs,
         )
         await s3.delete_object(Bucket=bucket, Key=temp_key)
-        
+
     return UploadResult(storage_id=real_doc_id, size=size, sha256=sha256, duplicate=exists)
 
 
 # @app.post("/upload")
-import magic
-import mimetypes
+
 
 async def detect_content_type(file: UploadFile) -> str:
     # Try magic bytes first
     header = await file.read(2048)
     await file.seek(0)
-    
+
     mime = magic.from_buffer(header, mime=True)
-    
+
     # Fall back to extension if magic gives generic result
     if mime in ("application/octet-stream", "text/plain") and file.filename:
         ext_mime, _ = mimetypes.guess_type(file.filename)
         if ext_mime:
             return ext_mime
-    
-    return mime or "application/octet-stream"
 
+    return mime or "application/octet-stream"
 
 
 # upload
@@ -275,7 +273,3 @@ async def download_from_s3(
     async with s3.get_object(Bucket=bucket, Key=key) as response:
         async for chunk in response["Body"]:
             yield chunk
-
-
-
-

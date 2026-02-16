@@ -65,6 +65,7 @@ class BM25Store:
                     "properties": {
                         "chunk_id": {"type": "keyword"},
                         "doc_id": {"type": "keyword"},
+                        "db_id": {"type": "keyword"},
                         "chunk_index": {"type": "integer"},
                         "text": {"type": "text", "analyzer": "russian"},
                         "source": {"type": "keyword"},

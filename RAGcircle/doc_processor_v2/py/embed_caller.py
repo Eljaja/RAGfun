@@ -27,7 +27,7 @@ class Embedder:
         )
         self.model = model
 
-    async def embed(self, texts: list[str]) -> list[list[float]]:
+    async def embed(self, texts: list[str], *, model: str | None = None) -> list[list[float]]:
         if not texts:
             return []
 
@@ -37,7 +37,7 @@ class Embedder:
         try:
             resp = await self.client.post(
                 "/embeddings",
-                json={"model": self.model, "input": texts},
+                json={"model": model or self.model, "input": texts},
             )
             resp.raise_for_status()
 

@@ -4,6 +4,7 @@ Quick script to check available collections/indexes in Qdrant and OpenSearch.
 """
 import asyncio
 import argparse
+import textwrap
 import httpx
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import Filter
@@ -183,6 +184,112 @@ async def list_opensearch_doc_ids(index: str, url: str = "http://localhost:8905"
         print(f"❌ Error: {e}")
 
 
+async def show_qdrant_chunk(collection: str, chunk_num: int = 1, url: str = "http://localhost:8903"):
+    """Show a specific chunk (by 1-based position) from a Qdrant collection."""
+    print(f"\n{'='*60}")
+    print(f"Qdrant Chunk #{chunk_num} from: {collection}")
+    print(f"URL: {url}")
+    print(f"{'='*60}")
+
+    try:
+        client = AsyncQdrantClient(url=url)
+
+        exists = await client.collection_exists(collection)
+        if not exists:
+            print(f"❌ Collection '{collection}' does not exist.")
+            await client.close()
+            return
+
+        # Scroll to the requested chunk position
+        offset = None
+        seen = 0
+        target = chunk_num  # 1-based
+
+        while True:
+            points, next_offset = await client.scroll(
+                collection,
+                limit=min(target - seen, 100),
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+
+            if not points:
+                print(f"❌ Only {seen} chunk(s) in collection — requested #{chunk_num}.")
+                await client.close()
+                return
+
+            seen += len(points)
+            if seen >= target:
+                point = points[-(seen - target + 1)]
+                _print_chunk_payload(point.payload, point_id=point.id)
+                await client.close()
+                return
+
+            if next_offset is None:
+                print(f"❌ Only {seen} chunk(s) in collection — requested #{chunk_num}.")
+                await client.close()
+                return
+            offset = next_offset
+
+    except Exception as e:
+        print(f"❌ Error: {e}")
+
+
+async def show_opensearch_chunk(index: str, chunk_num: int = 1, url: str = "http://localhost:8905"):
+    """Show a specific chunk (by 1-based position) from an OpenSearch index."""
+    print(f"\n{'='*60}")
+    print(f"OpenSearch Chunk #{chunk_num} from: {index}")
+    print(f"URL: {url}")
+    print(f"{'='*60}")
+
+    try:
+        client = AsyncOpenSearch(hosts=[url], use_ssl=False)
+
+        exists = await client.indices.exists(index=index)
+        if not exists:
+            print(f"❌ Index '{index}' does not exist.")
+            await client.close()
+            return
+
+        response = await client.search(
+            index=index,
+            body={
+                "from": chunk_num - 1,
+                "size": 1,
+                "sort": [{"chunk_index": {"order": "asc"}}, "_score"],
+            },
+        )
+
+        hits = response["hits"]["hits"]
+        if not hits:
+            total = response["hits"]["total"]["value"]
+            print(f"❌ Only {total} chunk(s) in index — requested #{chunk_num}.")
+            await client.close()
+            return
+
+        hit = hits[0]
+        _print_chunk_payload(hit["_source"], point_id=hit["_id"])
+        await client.close()
+
+    except Exception as e:
+        print(f"❌ Error: {e}")
+
+
+def _print_chunk_payload(payload: dict, *, point_id=None):
+    """Pretty-print a chunk payload."""
+    print()
+    if point_id is not None:
+        print(f"  🆔 point_id:    {point_id}")
+    for key in ("chunk_id", "db_id", "doc_id", "chunk_index", "source", "uri", "page", "content_hash"):
+        if key in payload:
+            print(f"  📎 {key:14s} {payload[key]}")
+    text = payload.get("text", "")
+    print(f"\n  📝 text ({len(text)} chars):\n")
+    print(textwrap.indent(text, "     "))
+    print()
+
+
 async def main():
     """Check both stores or list doc_ids for a specific collection/index."""
     parser = argparse.ArgumentParser(
@@ -199,6 +306,15 @@ async def main():
         help="OpenSearch index name to list doc_ids for"
     )
     parser.add_argument(
+        "--show-chunk",
+        type=int,
+        nargs="?",
+        const=1,
+        default=None,
+        metavar="N",
+        help="Show chunk at 1-based position N (default: 1). Use with --collection or --index."
+    )
+    parser.add_argument(
         "--qdrant-url",
         type=str,
         default="http://localhost:8903",
@@ -213,7 +329,14 @@ async def main():
     
     args = parser.parse_args()
     
-    if args.collection:
+    if args.show_chunk is not None:
+        if args.collection:
+            await show_qdrant_chunk(args.collection, args.show_chunk, args.qdrant_url)
+        elif args.index:
+            await show_opensearch_chunk(args.index, args.show_chunk, args.opensearch_url)
+        else:
+            print("❌ --show-chunk requires --collection or --index")
+    elif args.collection:
         await list_qdrant_doc_ids(args.collection, args.qdrant_url)
     elif args.index:
         await list_opensearch_doc_ids(args.index, args.opensearch_url)
@@ -223,6 +346,7 @@ async def main():
         await check_opensearch_indices(args.opensearch_url)
         print(f"\n{'='*60}\n")
         print("💡 Tip: Use --collection <name> or --index <name> to list doc_ids for a specific collection/index")
+        print("💡 Tip: Use --collection <name> --show-chunk [N] to display a chunk")
 
 
 if __name__ == "__main__":
