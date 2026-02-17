@@ -133,54 +133,6 @@ def _answer_is_in_context(*, answer: str, context_text: str) -> bool:
     return bool(n_ans and n_ctx and n_ans in n_ctx)
 
 
-async def _enforce_extractive_or_refuse(
-    *,
-    llm: LLMClient,
-    messages: list[dict[str, str]],
-    answer: str,
-    context_text: str,
-) -> str:
-    """
-    Best-effort anti-hallucination for factoid QA when include_sources=False:
-    if the produced short answer is not present in sources, do one rewrite attempt
-    forcing a verbatim span. If it still fails, refuse.
-    """
-    ans = (answer or "").strip()
-    if not ans:
-        return ans
-    ctx = (context_text or "").strip()
-    if not ctx:
-        return ans
-
-    # Apply only to short answers (entity/one-liner). Lists are hard to substring-match reliably.
-    ans_toks = _TOKEN_RE.findall(ans)
-    if len(ans_toks) > 6:
-        return ans
-    if "," in ans or "\n" in ans:
-        return ans
-
-    n_ans = _norm_text_for_contains(ans)
-    n_ctx = _norm_text_for_contains(ctx)
-    if n_ans and n_ans in n_ctx:
-        return ans
-
-    rewrite_prompt = (
-        "Your previous answer is NOT a verbatim span from the provided Sources.\n"
-        "Rewrite your answer STRICTLY as follows:\n"
-        "- Output ONLY the exact answer phrase copied verbatim from Sources (no extra words).\n"
-        "- Do NOT add citations like [1].\n"
-        "- If the exact answer phrase is not explicitly present in Sources, reply exactly with \"I don't know\" (English) OR \"Не знаю.\" (Russian), matching the user's language.\n"
-    )
-    retry_messages = list(messages) + [{"role": "user", "content": rewrite_prompt}]
-    rewritten = (await llm.chat(messages=retry_messages)).strip()
-    if rewritten == "I don't know":
-        return rewritten
-    n_rew = _norm_text_for_contains(rewritten)
-    if n_rew and n_rew in n_ctx:
-        return rewritten
-    return "I don't know"
-
-
 def _dedupe_queries(qs: list[str], *, threshold: int = 92) -> list[str]:
     out: list[str] = []
     norms: list[str] = []
@@ -529,37 +481,6 @@ def _ingestion_state_from_doc(doc: dict[str, Any]) -> str:
     ing = ing.get("ingestion") if isinstance(ing, dict) else None
     state = (ing or {}).get("state")
     return str(state).strip().lower() if state else "unknown"
-
-
-async def _enforce_citations_or_refuse(
-    *,
-    llm: LLMClient,
-    messages: list[dict[str, str]],
-    answer: str,
-    refs: list[int],
-) -> str:
-    """
-    If sources exist and the model returned an answer without citations, do one strict rewrite attempt.
-    If it still fails, refuse (to avoid "fake grounding" by auto-adding citations).
-    """
-    if not refs:
-        return answer
-    if _has_inline_citations(answer):
-        return answer
-
-    suffix = "".join([f"[{r}]" for r in refs])
-    rewrite_prompt = (
-        "Rewrite your answer to comply STRICTLY with citations.\n"
-        f"- Every factual claim MUST include inline citations like {suffix}\n"
-        "- If you cannot answer using the provided sources, reply exactly: \"I don't know\" (no citations).\n"
-        "- Do NOT add any facts, numbers, commands, or code that are not explicitly present in the sources.\n"
-        "- Do NOT use generic advice or filler.\n"
-    )
-    retry_messages = list(messages) + [{"role": "user", "content": rewrite_prompt}]
-    rewritten = await llm.chat(messages=retry_messages)
-    if _has_inline_citations(rewritten) or rewritten.strip() == "I don't know":
-        return rewritten
-    return "I don't know"
 
 
 class AppState:
@@ -921,13 +842,9 @@ async def chat(payload: ChatRequest):
 
     with LAT.labels("llm").time():
         answer = await state.llm.chat(messages=messages)
-        if payload.include_sources:
-            refs = [int(s.get("ref")) for s in (sources or []) if s.get("ref") is not None]
-            answer = await _enforce_citations_or_refuse(llm=state.llm, messages=messages, answer=answer, refs=refs)
-        else:
+        if not payload.include_sources:
             # ru_eval runs with include_sources=False. For short factoid answers:
-            # 1) If the answer doesn't appear in the provided context, expand within top docs and retry once.
-            # 2) Enforce "verbatim span from sources" (or refuse) to avoid entity hallucinations.
+            # If the answer doesn't appear in the provided context, expand within top docs and retry once.
             if _is_factoid_like_question(payload.query):
                 if not _answer_is_in_context(answer=answer, context_text=context_text):
                     # Expand inside the top doc(s) to fetch a more relevant chunk from the same page.
@@ -998,13 +915,6 @@ async def chat(payload: ChatRequest):
                                 sources = sources2
                                 messages = messages2
                                 answer = answer2
-
-                answer = await _enforce_extractive_or_refuse(
-                    llm=state.llm,
-                    messages=messages,
-                    answer=answer,
-                    context_text=context_text,
-                )
 
     ref_by_key = {(str(s.get("doc_id")), s.get("uri")): s.get("ref") for s in (sources or [])}
 
@@ -1383,6 +1293,8 @@ async def documents_stats(
     collections: str | None = None,  # comma-separated project_ids ("collections")
     page_size: int = 500,
     max_docs: int = 200_000,
+    include_indexed: bool = True,
+    max_indexed_docs: int = 50_000,
 ):
     """
     Aggregate document stats server-side to avoid loading all docs in the UI.
@@ -1398,99 +1310,75 @@ async def documents_stats(
     collection_ids = [c.strip() for c in (collections or "").split(",") if c.strip()] if collections else None
     page_size = max(1, min(int(page_size), 2000))
     max_docs = max(1, min(int(max_docs), 1_000_000))
+    max_indexed_docs = max(1, min(int(max_indexed_docs), 1_000_000))
 
-    stats: dict[str, Any] = {
-        "ok": True,
-        "total": 0,
-        "docs_seen": 0,
-        "bytes": 0,
-        "partial": False,
-        "indexed": 0,
-        "not_indexed": 0,
-        "ingestion": {
-            "queued": 0,
-            "processing": 0,
-            "retrying": 0,
-            "failed": 0,
-            "completed": 0,
-            "unknown": 0,
-        },
-        "by_content_type": {},
-        "by_source": {},
-        "by_lang": {},
-        "by_collection": {},
-    }
-
-    offset = 0
-    indexed_available = bool(state.retrieval)
-    while stats["docs_seen"] < max_docs:
-        result = await state.storage.search_documents(
+    try:
+        stats = await state.storage.documents_stats(
             source=source,
             tags=tags_list,
             lang=lang,
             project_ids=collection_ids,
-            limit=page_size,
-            offset=offset,
         )
-        docs = list(result.get("documents") or [])
-        if "total" in result and isinstance(result.get("total"), int):
-            stats["total"] = int(result.get("total") or 0)
+    except Exception as e:
+        REQS.labels(endpoint="/v1/documents/stats", status="500").inc()
+        logger.error("documents_stats_error", extra={"extra": {"error": str(e)}})
+        return {"ok": False, "error": str(e)}
 
-        if not docs:
-            break
+    if not isinstance(stats, dict) or not stats.get("ok"):
+        REQS.labels(endpoint="/v1/documents/stats", status="500").inc()
+        return {"ok": False, "error": "storage_stats_failed"}
 
-        indexed_set: set[str] = set()
-        if state.retrieval:
-            doc_ids = [str(d.get("doc_id")) for d in docs if d.get("doc_id")]
-            if doc_ids:
-                try:
-                    exists = await state.retrieval.index_exists(doc_ids=doc_ids)
-                    indexed_set = set(str(x) for x in (exists.get("indexed_doc_ids") or []))
-                except Exception:
-                    indexed_set = set()
-                    indexed_available = False
+    stats.setdefault("indexed", 0)
+    stats.setdefault("not_indexed", 0)
 
-        for doc in docs:
-            if stats["docs_seen"] >= max_docs:
-                stats["partial"] = True
-                break
-            stats["docs_seen"] += 1
-            try:
-                stats["bytes"] += int(doc.get("size") or 0)
-            except Exception:
-                pass
+    indexed_available = bool(state.retrieval)
+    total_docs = int(stats.get("total") or 0)
+    if include_indexed and indexed_available:
+        if total_docs > max_indexed_docs:
+            indexed_available = False
+            stats["indexed_skipped"] = True
+        else:
+            offset = 0
+            indexed = 0
+            not_indexed = 0
+            while offset < total_docs and offset < max_docs:
+                result = await state.storage.search_documents(
+                    source=source,
+                    tags=tags_list,
+                    lang=lang,
+                    project_ids=collection_ids,
+                    limit=page_size,
+                    offset=offset,
+                )
+                docs = list(result.get("documents") or [])
+                if not docs:
+                    break
+                doc_ids = [str(d.get("doc_id")) for d in docs if d.get("doc_id")]
+                indexed_set: set[str] = set()
+                if doc_ids:
+                    try:
+                        exists = await state.retrieval.index_exists(doc_ids=doc_ids)
+                        indexed_set = set(str(x) for x in (exists.get("indexed_doc_ids") or []))
+                    except Exception:
+                        indexed_set = set()
+                        indexed_available = False
+                        break
 
-            content_type = (doc.get("content_type") or "unknown").strip() or "unknown"
-            _inc_count(stats["by_content_type"], content_type)
+                for doc_id in doc_ids:
+                    if doc_id in indexed_set:
+                        indexed += 1
+                    else:
+                        not_indexed += 1
 
-            source_val = (doc.get("source") or "unknown").strip() or "unknown"
-            _inc_count(stats["by_source"], source_val)
+                offset += len(docs)
+                if len(docs) < page_size:
+                    break
 
-            lang_val = (doc.get("lang") or "unknown").strip() or "unknown"
-            _inc_count(stats["by_lang"], lang_val)
-
-            collection_val = (doc.get("project_id") or "unassigned").strip() or "unassigned"
-            _inc_count(stats["by_collection"], collection_val)
-
-            ing_state = _ingestion_state_from_doc(doc)
-            if ing_state in stats["ingestion"]:
-                stats["ingestion"][ing_state] += 1
-            else:
-                stats["ingestion"]["unknown"] += 1
-
-            doc_id = str(doc.get("doc_id") or "")
-            if indexed_available and doc_id:
-                if doc_id in indexed_set:
-                    stats["indexed"] += 1
-                else:
-                    stats["not_indexed"] += 1
-
-        offset += len(docs)
-        if len(docs) < page_size:
-            break
-
-    if stats["total"] and stats["docs_seen"] < stats["total"] and stats["docs_seen"] >= max_docs:
-        stats["partial"] = True
+            if indexed_available:
+                stats["indexed"] = indexed
+                stats["not_indexed"] = not_indexed
+            elif total_docs > max_indexed_docs:
+                stats["indexed_skipped"] = True
 
     stats["indexed_available"] = indexed_available
     REQS.labels(endpoint="/v1/documents/stats", status="200").inc()
@@ -1899,11 +1787,7 @@ async def chat_stream(payload: ChatRequest):
 
             # Send final answer and metadata
             full_answer = "".join(answer_parts)
-            if payload.include_sources:
-                refs = [int(s.get("ref")) for s in (sources or []) if s.get("ref") is not None]
-                # Streaming: cannot easily re-run the full generation. Enforce strictness by refusing if citations are missing.
-                if refs and not _has_inline_citations(full_answer):
-                    full_answer = "I don't know"
+            # Streaming: keep the model answer as-is (no forced refusals).
             yield f"data: {json.dumps({'type': 'done', 'answer': full_answer, 'mode': mode, 'degraded': list(degraded), 'partial': partial, 'sources': sources if payload.include_sources else [], 'context': [c.model_dump() for c in ctx]})}\n\n"
 
             REQS.labels(endpoint="/v1/chat/stream", status="200").inc()
