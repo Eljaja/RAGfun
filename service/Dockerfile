@@ -8,13 +8,15 @@ ARG INSTALL_RERANK=0
 
 WORKDIR /app
 
-COPY requirements.txt /app/requirements.txt
+COPY service/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY requirements-rerank.txt /app/requirements-rerank.txt
+COPY service/requirements-rerank.txt /app/requirements-rerank.txt
 RUN if [ "$INSTALL_RERANK" = "1" ]; then pip install --no-cache-dir -r /app/requirements-rerank.txt; fi
 
-COPY app /app/app
+COPY agent_common /app/agent_common
+COPY service/app /app/app
+ENV PYTHONPATH=/app
 
 EXPOSE 8080
 

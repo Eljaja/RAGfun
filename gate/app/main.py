@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
+from agent_common.retrieval import adaptive_k_cutoff
 from app.clients import DocProcessorClient, DocumentStorageClient, LLMClient, RetrievalClient
 from app.config import Settings, load_settings
 from app.html_text import html_to_text
@@ -338,34 +339,9 @@ def _rrf_merge_hits_by_chunk_id(
     return merged
 
 
-def _adaptive_k_cutoff(
-    hits: list[dict[str, Any]],
-    *,
-    score_key: str = "multi_rrf_score",
-    min_k: int = 3,
-    max_k: int = 24,
-    cap: int | None = None,
-) -> list[dict[str, Any]]:
-    """
-    Apply adaptive-k: cut at steepest score drop. Uses metadata[score_key] or hit["score"].
-    """
-    if len(hits) <= 1:
-        return hits
-    scores = []
-    for h in hits:
-        s = (h.get("metadata") or {}).get(score_key)
-        if s is None:
-            s = h.get("score")
-        scores.append(float(s) if s is not None else 0.0)
-    gaps = [scores[i] - scores[i + 1] for i in range(len(scores) - 1)]
-    if not gaps:
-        return hits
-    best_i = max(range(len(gaps)), key=lambda i: gaps[i])
-    effective_k = best_i + 1
-    effective_k = max(min_k, min(max_k, effective_k))
-    if cap is not None:
-        effective_k = min(effective_k, cap)
-    return hits[:effective_k]
+def _get_hit_score(h: dict[str, Any], score_key: str = "multi_rrf_score") -> float:
+    s = (h.get("metadata") or {}).get(score_key) or h.get("score")
+    return float(s) if s is not None else 0.0
 
 
 async def _apply_bm25_anchor_pass(
@@ -729,9 +705,9 @@ async def chat(payload: ChatRequest):
 
                 # Adaptive-k on merged RRF list
                 if adaptive_k_multi == "after_rrf" and len(merged_hits) > 1:
-                    merged_hits = _adaptive_k_cutoff(
+                    merged_hits = adaptive_k_cutoff(
                         merged_hits,
-                        score_key="multi_rrf_score",
+                        get_score=lambda h: _get_hit_score(h, "multi_rrf_score"),
                         min_k=getattr(state.settings, "adaptive_k_min", 3),
                         max_k=getattr(state.settings, "adaptive_k_max", 24),
                         cap=max(1, int(top_k)),

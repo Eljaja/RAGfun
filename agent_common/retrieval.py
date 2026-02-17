@@ -9,7 +9,31 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Any
+from typing import Any, Callable, TypeVar
+
+T = TypeVar("T")
+
+
+def adaptive_k_cutoff(
+    hits: list[T],
+    *,
+    get_score: Callable[[T], float],
+    min_k: int = 3,
+    max_k: int = 24,
+    cap: int | None = None,
+) -> list[T]:
+    """Cut at steepest score drop. Returns hits[:effective_k]."""
+    if len(hits) <= 1:
+        return hits
+    scores = [get_score(h) for h in hits]
+    gaps = [scores[i] - scores[i + 1] for i in range(len(scores) - 1)]
+    if not gaps:
+        return hits
+    best_i = max(range(len(gaps)), key=lambda i: gaps[i])
+    effective_k = max(min_k, min(max_k, best_i + 1))
+    if cap is not None:
+        effective_k = min(effective_k, cap)
+    return hits[:effective_k]
 
 
 def strip_thinking(text: str) -> str:
