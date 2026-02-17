@@ -99,8 +99,8 @@ curl -X POST http://localhost:8092/v1/chat \
 The system consists of **8 microservices** organized into application, ML, and infrastructure layers:
 
 #### Application Services
-- **rag-gate** (`:8090`, rugfunsota: `:8092`) - FastAPI gateway; orchestrates uploads, chat, and streaming responses
-- **retrieval** (`:8080`, rugfunsota: `:8085`) - Hybrid search engine (BM25 + vectors); stateless and horizontally scalable
+- **rag-gate** (`:8092`) - FastAPI gateway; orchestrates uploads, chat, and streaming responses (internal port `:8090`)
+- **retrieval** (`:8085`) - Hybrid search engine (BM25 + vectors); stateless and horizontally scalable (internal port `:8080`)
 - **document-storage** (`:8081`) - Stores document bytes (S3-compatible) and metadata (Postgres)
 - **doc-processor** (`:8082`) - Async worker for document extraction, chunking, and indexing
 - **agent-search** (`:8093`, profile `agent-search`) - LLM-driven search: plan, HyDE, fact queries, retry

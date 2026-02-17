@@ -14,6 +14,7 @@ from agent_common.prompts import (
     PLAN_USER,
 )
 from agent_common.retrieval import (
+    adaptive_k_cutoff,
     build_context,
     context_from_hits,
     merge_hits,
@@ -37,6 +38,7 @@ __all__ = [
     "KEYWORD_QUERIES_USER",
     "PLAN_SYSTEM",
     "PLAN_USER",
+    "adaptive_k_cutoff",
     "quality_is_poor",
     "merge_hits",
     "build_context",

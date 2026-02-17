@@ -175,7 +175,8 @@ services:
   # Stateless Hybrid Retrieval microservice (scale this one for multiple replicas)
   retrieval:
     build:
-      context: ./service
+      context: .
+      dockerfile: service/Dockerfile
     ports:
       - "${RUGFUNSOTA_RETRIEVAL_PORT:-8085}:8080"
     environment:
@@ -399,7 +400,8 @@ services:
   # RAG LLM gate (calls retrieval + LLM)
   rag-gate:
     build:
-      context: ./gate
+      context: .
+      dockerfile: gate/Dockerfile
     ports:
       - "${RUGFUNSOTA_GATE_PORT:-8092}:8090"
     environment:
