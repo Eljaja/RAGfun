@@ -123,6 +123,26 @@ services:
         condition: service_started
     restart: unless-stopped
 
+  retrieval:
+    build:
+      context: ./retrieval_v2
+    env_file:
+      - ./retrieval_v2/.env
+    network_mode: host
+    profiles: [apps]
+    restart: unless-stopped
+
+  generator:
+    build:
+      context: ./generator_v2
+    env_file:
+      - ./generator_v2/.env
+    network_mode: host
+    profiles: [apps]
+    depends_on:
+      - retrieval
+    restart: unless-stopped
+
   # ── Reverse Proxy ───────────────────────────────────────
   nginx-gate:
     image: nginx:alpine

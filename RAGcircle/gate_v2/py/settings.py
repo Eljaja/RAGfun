@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     qdrant_url: str = "http://localhost:8903"
     opensearch_url: str = "http://localhost:8905"
 
+    # ── Downstream services ──────────────────────────────────
+    retrieval_url: str = "http://localhost:8920"
+    generator_url: str = "http://localhost:8930"
+
 
 # can we automate this?
 # 2026 and I am still not good at metaprogramming

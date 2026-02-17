@@ -2,6 +2,7 @@ from __future__ import annotations
 import uvicorn
 import uuid
 import re
+import httpx
 from storage import UploadMeta, upload_with_content_addressing, detect_content_type, download_from_s3
 from collectors import QdrantStore, BM25Store
 from collectors import BM25Store, QdrantStore, create_bm25_store, create_qdrant_store
@@ -102,6 +103,10 @@ def get_event_db(request: Request) -> DocumentEventDB:
     return request.app.state.event_db
 
 
+def get_http_client(request: Request) -> httpx.AsyncClient:
+    return request.app.state.http_client
+
+
 # ----------------------------
 # Lifespan
 # ----------------------------
@@ -136,6 +141,8 @@ async def lifecycle(app: FastAPI):
         qdrant: QdrantStore = await stack.enter_async_context(create_qdrant_store(settings.qdrant_url))
         opensearch: BM25Store = await stack.enter_async_context(create_bm25_store(settings.opensearch_url))
 
+        http_client = httpx.AsyncClient(timeout=120.0)
+
         app.state.s3 = s3
         app.state.project_db = project_db
         app.state.document_db = document_db
@@ -144,7 +151,10 @@ async def lifecycle(app: FastAPI):
         app.state.qdrant = qdrant
         app.state.opensearch = opensearch
         app.state.settings = settings
+        app.state.http_client = http_client
         yield
+
+        await http_client.aclose()
 
 
 # ----------------------------
@@ -542,9 +552,86 @@ async def get_document_info(
 
     # well here is another idea -> we track prev event for all of the methods except ingestion
     # is this shit? 
-    # maybe 
-    ev.doc_id = doc_id
+    # maybe
+    if getattr(ev, "doc_id"): 
+        ev.doc_id = doc_id
     return ev
+
+
+class RetrieveRequest(BaseModel):
+    query: str
+    top_k: int = 5
+    rerank: bool = True
+    strategy: str = "hybrid"
+
+
+class ChatRequestBody(BaseModel):
+    query: str
+    top_k: int = 5
+    rerank: bool = True
+    strategy: str = "hybrid"
+    max_retries: int = 1
+    reflection_enabled: bool = True
+
+
+@protected_router.post("/v1/projects/{project_id}/retrieve")
+async def retrieve_documents(
+    project_id: str,
+    body: RetrieveRequest,
+    user: UserCreds = Depends(authenticated),
+    project_db: ProjectDB = Depends(get_project_db),
+    settings: Settings = Depends(get_settings),
+    client: httpx.AsyncClient = Depends(get_http_client),
+):
+    await authorize_project(project_db, project_id, user.user_id)
+
+    resp = await client.post(
+        f"{settings.retrieval_url}/retrieve",
+        json={
+            "project_id": project_id,
+            "query": body.query,
+            "top_k": body.top_k,
+            "rerank": body.rerank,
+            "strategy": body.strategy,
+        },
+    )
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail="Retrieval service error")
+
+    return resp.json()
+
+
+@protected_router.post("/v1/projects/{project_id}/chat")
+async def chat_with_documents(
+    project_id: str,
+    body: ChatRequestBody,
+    user: UserCreds = Depends(authenticated),
+    project_db: ProjectDB = Depends(get_project_db),
+    settings: Settings = Depends(get_settings),
+    client: httpx.AsyncClient = Depends(get_http_client),
+):
+    await authorize_project(project_db, project_id, user.user_id)
+
+    resp = await client.post(
+        f"{settings.generator_url}/chat",
+        json={
+            "project_id": project_id,
+            "query": body.query,
+            "top_k": body.top_k,
+            "rerank": body.rerank,
+            "strategy": body.strategy,
+            "max_retries": body.max_retries,
+            "reflection_enabled": body.reflection_enabled,
+        },
+    )
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail="Generator service error")
+
+    return resp.json()
+
+
 
 
 # preinit bucket if possible + plus pass as a setting
