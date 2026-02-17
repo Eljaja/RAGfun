@@ -62,15 +62,34 @@ async function callChatStream(query, onToken, onComplete, onError, onRetrieval) 
 
 async function callAgentStream(query, onToken, onComplete, onError, onRetrieval, onTrace) {
   const filters = buildChatFilters();
-  const r = await fetch("/agent-api/v1/agent/stream", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      query,
-      include_sources: true,
-      filters,
-    }),
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 150000);
+
+  let r;
+  let gotDone = false;
+  let gotError = false;
+  try {
+    r = await fetch("/agent-api/v1/agent/stream", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        query,
+        include_sources: true,
+        filters,
+      }),
+      signal: controller.signal,
+    });
+  } catch (e) {
+    clearTimeout(timeoutId);
+    if (e.name === "AbortError") {
+      onError(new Error("Timeout 150s. Check agent-search and LLM availability."));
+    } else {
+      onError(e);
+    }
+    return;
+  }
+
+  clearTimeout(timeoutId);
 
   if (!r.ok) {
     const data = await r.json().catch(() => ({}));
@@ -98,15 +117,20 @@ async function callAgentStream(query, onToken, onComplete, onError, onRetrieval,
         if (!dataStr) continue;
         try {
           const data = JSON.parse(dataStr);
-          if (data.type === "token" && data.content) {
+          if (data.type === "init") {
+            if (typeof onTrace === "function") onTrace({ kind: "thought", label: "Connected", content: "" });
+          } else if (data.type === "token" && data.content) {
             onToken(data.content);
           } else if (data.type === "retrieval") {
             if (typeof onRetrieval === "function") onRetrieval(data);
           } else if (data.type === "trace") {
             if (typeof onTrace === "function") onTrace(data);
           } else if (data.type === "done") {
+            gotDone = true;
             onComplete(data);
+            return;
           } else if (data.type === "error") {
+            gotError = true;
             onError(new Error(data.error));
             return;
           }
@@ -115,8 +139,16 @@ async function callAgentStream(query, onToken, onComplete, onError, onRetrieval,
         }
       }
     }
+    // Stream ended without explicit done/error -> stop spinners in UI
+    if (!gotDone && !gotError) {
+      onError(new Error("Stream ended without done/error (check agent-search logs)."));
+    }
   } catch (e) {
-    onError(e);
+    if (e.name === "AbortError") {
+      onError(new Error("Timeout. No response received."));
+    } else {
+      onError(e);
+    }
   }
 }
 
@@ -282,17 +314,30 @@ function fmtSources(sources) {
   }));
 }
 
+function isHttpUrl(str) {
+  if (!str || typeof str !== "string") return false;
+  const t = str.trim();
+  return /^https?:\/\/[^\s]+$/i.test(t);
+}
+
 function sourcesHtml(sources) {
   if (!sources || !sources.length) return "";
   return sources
     .map(
-      s => `
+      s => {
+        const uriBlock = s.uri
+          ? isHttpUrl(s.uri)
+            ? `<div class="source-uri"><a href="${escapeHtml(s.uri)}" target="_blank" rel="noopener noreferrer">${escapeHtml(s.uri)}</a></div>`
+            : `<div class="source-uri" style="color: var(--text-secondary);">${escapeHtml(s.uri)}</div>`
+          : "";
+        return `
       <div class="source-item">
         <div class="source-title">${escapeHtml(s.ref ? `[${s.ref}] ` : "")}${escapeHtml(s.title || s.doc_id)}</div>
-        ${s.uri ? `<div class="source-uri">${escapeHtml(s.uri)}</div>` : ""}
+        ${uriBlock}
         <div style="font-size: 11px; color: var(--text-secondary); margin-top: 4px;">doc_id: ${escapeHtml(s.doc_id)}</div>
       </div>
-    `
+    `;
+      }
     )
     .join("");
 }
@@ -449,8 +494,14 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
+function stripThinking(text) {
+  if (!text || typeof text !== "string") return text || "";
+  return text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+}
+
 function formatMessageText(text) {
   if (!text) return "";
+  text = stripThinking(text);
 
   // First, escape HTML to prevent XSS
   let escaped = escapeHtml(text);
@@ -789,12 +840,28 @@ function startWaveText(traceState, el, text) {
   el.textContent = String(text || "");
 }
 
+function traceStatusText(data) {
+  const name = (data.name || "").toLowerCase();
+  const label = (data.label || "").toLowerCase();
+  if (name === "llm.plan" || label.includes("plan")) return "Plan...";
+  if (name === "gate.chat" || label.includes("gate")) return "Search...";
+  if (name === "llm.answer" || label.includes("answer")) return "Answer...";
+  if (name === "llm.hyde") return "HyDE...";
+  if (name === "llm.fact_split") return "Fact queries...";
+  if (data.label) return data.label + "...";
+  return "Working...";
+}
+
 function addTraceItem(traceState, data) {
   if (!traceState || !traceState.log) return;
+  // Only the latest trace item should be "in progress"
+  stopTraceSpinner(traceState);
   const kind = data.kind || "thought";
   const logEl = traceState.log;
 
-  logEl.innerHTML = "";
+  const statusEl = document.getElementById("status");
+  if (statusEl) statusEl.textContent = traceStatusText(data);
+
   if (traceState.waveTimer) {
     clearInterval(traceState.waveTimer);
     traceState.waveTimer = null;
@@ -808,7 +875,7 @@ function addTraceItem(traceState, data) {
   if (kind === "tool") {
     title.textContent = `Tool: ${data.name || "unknown"}`;
   } else if (kind === "thought") {
-    title.textContent = data.label || "думание";
+    title.textContent = data.label || "thinking";
   } else {
     title.textContent = data.label || kind;
   }
@@ -979,6 +1046,9 @@ async function askStream() {
         error => {
           if (assistant && assistant.bubbleText) assistant.bubbleText.innerHTML = escapeHtml(`Error: ${error.message}`).replace(/\n/g, '<br>');
           setBusy(false, "Error");
+          if (assistant && assistant.wrapper && assistant.wrapper._agentTrace) {
+            stopTraceSpinner(assistant.wrapper._agentTrace);
+          }
         },
         data => {
           if (!assistant || !assistant.wrapper) return;

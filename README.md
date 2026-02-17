@@ -60,15 +60,15 @@ The default `docker-compose.yml` includes the Infinity embeddings service (BAAI/
 4. **Wait for services to be ready** (typically 2-3 minutes):
    ```bash
    # Check service health
-   curl http://localhost:8090/v1/readyz  # Gate API
+   curl http://localhost:8092/v1/readyz  # Gate API
    curl http://localhost:8080/v1/readyz  # Retrieval service
    curl http://localhost:9200/_cluster/health  # OpenSearch
    curl http://localhost:6333/health  # Qdrant
    ```
 
 5. **Access the UI:**
-   - **Web UI**: http://localhost:3300
-   - **Gateway API**: http://localhost:8090
+   - **Web UI**: http://localhost:3301
+   - **Gateway API**: http://localhost:8092
    - **Grafana Dashboards**: http://localhost:3000 (admin/admin)
    - **Prometheus**: http://localhost:9090
    - **RabbitMQ Management**: http://localhost:15672 (guest/guest)
@@ -78,16 +78,16 @@ The default `docker-compose.yml` includes the Infinity embeddings service (BAAI/
 Upload a document and query it:
 
 ```bash
-# Upload a document
-curl -X POST http://localhost:8090/v1/documents/upload \
+# Upload a document (Gate on 8092 in this setup)
+curl -X POST http://localhost:8092/v1/documents/upload \
   -F "file=@/path/to/your/document.pdf" \
   -F "filename=test.pdf"
 
 # Wait for ingestion to complete (check status)
-curl http://localhost:8090/v1/documents/{doc_id}/status
+curl http://localhost:8092/v1/documents/{doc_id}/status
 
 # Query the document
-curl -X POST http://localhost:8090/v1/chat \
+curl -X POST http://localhost:8092/v1/chat \
   -H "Content-Type: application/json" \
   -d '{"query": "What is this document about?", "stream": false}'
 ```
@@ -104,7 +104,7 @@ The system consists of **8 microservices** organized into application, ML, and i
 - **document-storage** (`:8081`) - Stores document bytes (S3-compatible) and metadata (Postgres)
 - **doc-processor** (`:8082`) - Async worker for document extraction, chunking, and indexing
 - **agent-search** (`:8093`, profile `agent-search`) - LLM-driven search: plan, HyDE, fact queries, retry
-- **ui** (`:3300`) - Nginx-served SPA with SSE streaming support
+- **ui** (`:3301`) - Nginx-served SPA with SSE streaming support
 
 #### ML/Embedding Services
 - **infinity** (`:7997`) - BAAI/bge-m3 multilingual embeddings (1024-dim, 100+ languages)
@@ -167,7 +167,7 @@ See **[docs/AGENT_SEARCH.md](./docs/AGENT_SEARCH.md)** for API reference and con
 - SOTA: semantic chunking, contextual headers, local reranker
 - Multi-query, two-pass retrieval, reranking
 - Observability: Prometheus, Grafana, structured logging
-- BRIGHT chunk tuning: `scripts/bright_tune_chunking.py` (full benchmark: `--splits all --eval-splits all --docs-from-gold 100000`). Defaults 1024/50 from full BRIGHT.
+- BRIGHT chunk tuning: `scripts/bright_tune_chunking.py` (full benchmark: `--splits all --eval-splits all --docs-from-gold 100000`). Default chunking: **semchunk** 512/50 in `docker-compose.yml`; for **semantic** 512/50 use `docker-compose-semantic.yml` override.
 - Exploring GraphRAG, T²-RAGBench and custom benchmarks
 
 ## Planned Work
@@ -207,7 +207,7 @@ python -m app.main
 - Update `service/app/fusion.py` (RRF fusion and reranking)
 
 **Changing chunking:**
-- Retrieval (mode=document): `service/app/chunking.py` — strategies `semantic` (section-based) or `token` (paragraph + sliding window). Params: `RAG_CHUNK_STRATEGY`, `RAG_CHUNK_MAX_TOKENS`, `RAG_CHUNK_OVERLAP_TOKENS` (tuned on BRIGHT: 1024/50).
+- Retrieval (mode=document): `service/app/chunking.py` — strategies `semchunk` (default, 512/50) or `semantic` (section-based). Default: `docker-compose.yml` uses semchunk; for semantic 512/50 run with `-f docker-compose-semantic.yml`. Params: `RAG_CHUNK_STRATEGY`, `RAG_CHUNK_MAX_TOKENS`, `RAG_CHUNK_OVERLAP_TOKENS`.
 - Doc-processor: `doc-processor/app/chunking.py` when using pre-chunked input.
 
 **Adding API endpoints:**
@@ -236,7 +236,7 @@ python scripts/bright_tune_chunking.py --retrieval-url http://localhost:8085 --b
 python scripts/bright_tune_chunking.py --retrieval-url http://localhost:8085 --splits all --eval-splits all --docs-from-gold 100000 --configs "256:0,512:0,512:50,1024:50"
 ```
 
-Results: `results/bright_chunk_tune_summary.json` and table in stdout. Default chunk params (1024 tokens, 50 overlap) were tuned on full BRIGHT.
+Results: `results/bright_chunk_tune_summary.json` and table in stdout. Default in this repo: semchunk 512/50; use `docker-compose-semantic.yml` for semantic 512/50.
 
 **BEIR eval** (direct / full pipeline):
 ```bash
@@ -378,10 +378,10 @@ VECTOR_WEIGHT=0.5
 ENABLE_RERANK=true
 RERANK_TOP_K=20
 
-# Chunking (retrieval service: RAG_CHUNK_* in docker-compose / .env)
-# Tuned on BRIGHT (all 12 splits): 1024/50 best. Strategy: semantic (section-based) or token (paragraph + sliding window).
-RAG_CHUNK_STRATEGY=semantic
-RAG_CHUNK_MAX_TOKENS=1024
+# Chunking (retrieval: RAG_CHUNK_* in docker-compose.yml; default semchunk 512/50)
+# For semantic 512/50: docker compose -f docker-compose.yml -f docker-compose-semantic.yml up
+RAG_CHUNK_STRATEGY=semchunk
+RAG_CHUNK_MAX_TOKENS=512
 RAG_CHUNK_OVERLAP_TOKENS=50
 
 # Advanced Features
@@ -419,7 +419,6 @@ Services that scale horizontally:
 
 ## Documentation
 
-- **[RUN_RUGFUNSOTA.md](./RUN_RUGFUNSOTA.md)** — Rugfunsota stack setup
 - **[docs/AGENT_SEARCH.md](./docs/AGENT_SEARCH.md)** — Agent-search API
 - **[docs/ENDPOINTS_EXAMPLES.md](./docs/ENDPOINTS_EXAMPLES.md)** — Retrieval API examples
 - **[docs/gate/GATE_API.md](./docs/gate/GATE_API.md)** — Gate API
@@ -462,7 +461,7 @@ Services that scale horizontally:
 2. Check timeout settings: `DOCLING_TIMEOUT`
 3. Monitor vLLM service health: `curl http://localhost:8123/health`
 
-For rugfunsota see [RUN_RUGFUNSOTA.md](./RUN_RUGFUNSOTA.md).
+For rugfunsota use the same docker-compose (project name `rugfunsota`).
 
 ## Status
 

@@ -19,6 +19,7 @@ from agent_common.retrieval import (
     merge_hits,
     quality_is_poor,
     sources_from_context,
+    strip_thinking,
 )
 from agent_common.gate_client import AsyncGateClient
 from agent_common.events import EventType
@@ -41,6 +42,7 @@ __all__ = [
     "build_context",
     "context_from_hits",
     "sources_from_context",
+    "strip_thinking",
     "AsyncGateClient",
     "EventType",
     "run_calculator",

@@ -27,7 +27,7 @@ else:
 
 
 def _get_encoding():
-    """Get tiktoken encoding, fallback to None if not available."""
+    """Lazy tiktoken encoding or None if unavailable."""
     global _encoding_cache
     if _encoding_cache is not None:
         return _encoding_cache
@@ -43,10 +43,7 @@ def _get_encoding():
 
 
 def token_count(text: str, encoding=None) -> int:
-    """
-    Accurate token count using tiktoken.
-    Falls back to approximation if tiktoken is not available.
-    """
+    """Tiktoken count; fallback to word-based approx if unavailable."""
     if encoding is None:
         encoding = _get_encoding()
     
@@ -61,11 +58,7 @@ def token_count(text: str, encoding=None) -> int:
 
 
 def chunk_text(text: str, max_tokens: int, overlap_tokens: int) -> list[tuple[int, str, int]]:
-    """
-    Returns list of (chunk_index, chunk_text, token_count).
-    Chunking strategy: paragraph-aware + sliding window on tokens.
-    Uses tiktoken for accurate token counting (cl100k_base encoding).
-    """
+    """List of (chunk_index, chunk_text, token_count). Paragraph-aware + sliding window; tiktoken cl100k_base."""
     text = text.strip()
     if not text:
         return []
@@ -83,25 +76,17 @@ def chunk_text(text: str, max_tokens: int, overlap_tokens: int) -> list[tuple[in
     if not blocks:
         return []
     
-    # Encode all blocks to tokens and track block boundaries
     all_tokens: list[int] = []
-    block_boundaries: list[int] = []  # token indices where blocks end
-    
+    block_boundaries: list[int] = []
+
     for i, block in enumerate(blocks):
         try:
             block_tokens = encoding.encode(block, allowed_special="all")
             all_tokens.extend(block_tokens)
-            # Add separator tokens between blocks
-            if i < len(blocks) - 1:  # Don't add separator after last block
-                separator_tokens = encoding.encode("\n\n", allowed_special="all")
-                all_tokens.extend(separator_tokens)
-                # Block boundary is after the separator
-                block_boundaries.append(len(all_tokens))
-            else:
-                # Last block: boundary is at the end
-                block_boundaries.append(len(all_tokens))
+            if i < len(blocks) - 1:
+                all_tokens.extend(encoding.encode("\n\n", allowed_special="all"))
+            block_boundaries.append(len(all_tokens))
         except Exception:
-            # If encoding fails for a block, skip it
             continue
     
     if not all_tokens:
@@ -115,13 +100,11 @@ def chunk_text(text: str, max_tokens: int, overlap_tokens: int) -> list[tuple[in
     while start < n:
         end = min(n, start + max_tokens)
         
-        # Try to cut on a block boundary if close (within 20 tokens)
         for boundary in block_boundaries:
             if start < boundary <= end and (end - boundary) <= 20:
                 end = boundary
                 break
         
-        # Extract tokens for this chunk
         chunk_tokens = all_tokens[start:end]
         
         if not chunk_tokens:

@@ -44,13 +44,15 @@ KEYWORD_QUERIES_USER = (
 ANSWER_SYSTEM = (
     "You answer using the provided context only. "
     "When you use information from a context block, cite it with [N] where N is the block number (e.g. [1], [2]). "
-    "If the context is insufficient, say what is missing. Reply in {lang}."
+    "If the context is insufficient, say what is missing. Reply in {lang}. "
+    "Do not output <think> or chain-of-thought; give only the final answer with citations."
 )
 ANSWER_SYSTEM_WITH_TOOLS = (
     "You answer using the provided context. "
     "ALWAYS use the calculator tool for any numeric computation (arithmetic, sqrt, log, etc). "
     "Use execute_code for code that must run (e.g. list comprehensions, data transforms). "
-    "Cite context with [N] when you use it. Reply in {lang}."
+    "Cite context with [N] when you use it. Reply in {lang}. "
+    "Do not output <think> or chain-of-thought; give only the final answer with citations."
 )
 ANSWER_USER = (
     "{history}Question:\n{query}\n\nContext:\n{context}\n\n"
