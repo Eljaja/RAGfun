@@ -46,6 +46,11 @@ from agent_common import (
     quality_is_poor,
     sources_from_context,
 )
+# Answer stream: cap total time for LLM answer phase; floor so short llm_timeout does not cut too early
+ANSWER_STREAM_CAP_S = 120
+ANSWER_STREAM_MIN_S = 90
+ANSWER_STREAM_LLM_MULTIPLIER = 2
+
 # Prometheus metrics
 AGENT_REQS = Counter("agent_requests_total", "Agent requests", ["endpoint", "status"])
 AGENT_LAT = Histogram(
@@ -759,7 +764,10 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
     else:
         yield {"type": "trace", "kind": "tool", "name": "llm.answer", "payload": {"model": llm_model, "stream": True}}
         answer_parts: list[str] = []
-        answer_stream_deadline = time.monotonic() + min(120, max(llm_timeout * 2, 90))
+        answer_stream_deadline = time.monotonic() + min(
+            ANSWER_STREAM_CAP_S,
+            max(llm_timeout * ANSWER_STREAM_LLM_MULTIPLIER, ANSWER_STREAM_MIN_S),
+        )
         try:
             async for chunk in _llm_chat_stream(
                 client,

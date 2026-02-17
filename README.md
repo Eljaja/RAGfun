@@ -461,7 +461,7 @@ Services that scale horizontally:
 2. Check timeout settings: `DOCLING_TIMEOUT`
 3. Monitor vLLM service health: `curl http://localhost:8123/health`
 
-For rugfunsota use the same docker-compose (project name `rugfunsota`).
+To run this stack as rugfunsota, use the docker-compose files in this repo with project name `rugfunsota` (e.g. `docker compose -p rugfunsota up -d`).
 
 ## Status
 
