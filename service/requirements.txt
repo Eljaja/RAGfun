@@ -8,6 +8,7 @@ orjson==3.10.12
 python-json-logger==3.2.0
 prometheus-client==0.21.1
 tiktoken==0.8.0
+semchunk>=3.0.0
 
 opensearch-py==2.7.1
 qdrant-client==1.12.2

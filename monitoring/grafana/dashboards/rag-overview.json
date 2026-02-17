@@ -178,6 +178,46 @@
       "targets": [
         { "refId": "A", "expr": "storage_bytes_total / 1024 / 1024", "legendFormat": "MB" }
       ]
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Agent-search RPS",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 50 },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(agent_requests_total{job=\"agent-search\"}[1m])) by (endpoint, status)", "legendFormat": "{{endpoint}} {{status}}" }
+      ]
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Agent-search p95 latency (s)",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 50 },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.95, sum(rate(agent_request_duration_seconds_bucket{job=\"agent-search\"}[5m])) by (le, endpoint))", "legendFormat": "{{endpoint}}" }
+      ]
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Agent-search LLM calls rate",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 58 },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(agent_llm_calls_total{job=\"agent-search\"}[1m])) by (stage)", "legendFormat": "{{stage}}" }
+      ]
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Agent-search retry rate",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 58 },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(agent_retry_total{job=\"agent-search\"}[5m]))", "legendFormat": "retry" }
+      ]
     }
   ]
 }

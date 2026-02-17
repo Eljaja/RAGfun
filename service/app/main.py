@@ -12,11 +12,19 @@ from app.config import Settings, load_settings
 from app.clients.embeddings import EmbeddingsClient
 from app.clients.opensearch import OpenSearchClient
 from app.clients.qdrant import QdrantFacade
-from app.clients.rerank import RerankClient
+from app.clients.rerank import LocalReranker, Reranker, RerankClient
 from app.indexing_logic import delete as delete_logic
+from app.indexing_logic import delete_batch as delete_batch_logic
 from app.indexing_logic import upsert as upsert_logic
 from app.metrics import HTTP_INFLIGHT, HTTP_LAT, HTTP_REQS, HTTP_REQ_SIZE, HTTP_RESP_SIZE, RAG_PARTIAL, RAG_RERANK, REQS
-from app.models import IndexDeleteRequest, IndexExistsRequest, IndexExistsResponse, IndexUpsertRequest, SearchRequest
+from app.models import (
+    IndexDeleteBatchRequest,
+    IndexDeleteRequest,
+    IndexExistsRequest,
+    IndexExistsResponse,
+    IndexUpsertRequest,
+    SearchRequest,
+)
 from app.observability import TraceContextFilter, setup_json_logging, setup_otel
 from app.search_logic import search as search_logic
 
@@ -30,7 +38,7 @@ class AppState:
     os: OpenSearchClient | None = None
     qdrant: QdrantFacade | None = None
     embedder: EmbeddingsClient | None = None
-    reranker: RerankClient | None = None
+    reranker: Reranker | None = None
 
 
 state = AppState()
@@ -70,13 +78,30 @@ async def lifespan(app: FastAPI):
         timeout_s=state.settings.embedding_timeout_s,
     )
 
-    if state.settings.rerank_mode != "disabled" and state.settings.rerank_url is not None:
-        state.reranker = RerankClient(
-            url=str(state.settings.rerank_url),
-            model=state.settings.rerank_model,
-            api_key=state.settings.rerank_api_key.get_secret_value() if state.settings.rerank_api_key else None,
-            timeout_s=state.settings.rerank_timeout_s,
-        )
+    if state.settings.rerank_mode != "disabled":
+        if state.settings.rerank_provider == "local":
+            try:
+                model_id = state.settings.rerank_model or "cross-encoder/ms-marco-MiniLM-L-6-v2"
+                state.reranker = LocalReranker(
+                    model_id=model_id,
+                    device=state.settings.rerank_device,
+                    max_length=512,
+                    batch_size=32,
+                )
+                logger.info("reranker_provider_local", extra={"model": model_id, "device": state.settings.rerank_device})
+            except ImportError as e:
+                logger.warning("reranker_local_unavailable", extra={"error": str(e)})
+                state.reranker = None
+        else:
+            if state.settings.rerank_url is not None:
+                state.reranker = RerankClient(
+                    url=str(state.settings.rerank_url),
+                    model=state.settings.rerank_model,
+                    api_key=state.settings.rerank_api_key.get_secret_value() if state.settings.rerank_api_key else None,
+                    timeout_s=state.settings.rerank_timeout_s,
+                )
+            else:
+                state.reranker = None
     else:
         state.reranker = None
 
@@ -119,7 +144,7 @@ async def lifespan(app: FastAPI):
 
     # Rerank + embeddings are considered "available" if configured; actual call health is deferred.
     state.deps["rerank"] = {
-        "available": state.settings.rerank_mode == "disabled" or state.settings.rerank_url is not None,
+        "available": state.settings.rerank_mode == "disabled" or state.reranker is not None,
         "checked_at": now,
         "error": None,
     }
@@ -258,8 +283,10 @@ async def index_upsert(payload: IndexUpsertRequest):
                 os_client=state.os,
                 qdrant=state.qdrant,
                 embedder=state.embedder,
+                chunk_strategy=state.settings.chunk_strategy,
                 max_tokens=state.settings.chunk_max_tokens,
                 overlap_tokens=state.settings.chunk_overlap_tokens,
+                chunk_encoding=state.settings.chunk_encoding,
                 embedding_batch_size=state.settings.embedding_batch_size,
                 embedding_concurrency=state.settings.embedding_concurrency,
                 embedding_contextual_headers_enabled=state.settings.embedding_contextual_headers_enabled,
@@ -291,6 +318,19 @@ async def index_delete(payload: IndexDeleteRequest):
         return {"ok": False, "error": "config_error", "detail": state.config_error}
     r = await delete_logic(req=payload, os_client=state.os, qdrant=state.qdrant)
     REQS.labels(endpoint="/v1/index/delete", status="200" if r.ok else "207").inc()
+    return r
+
+
+@app.post("/v1/index/delete-batch")
+async def index_delete_batch(payload: IndexDeleteBatchRequest):
+    """
+    Delete chunks for multiple doc_ids in bulk. Much faster than N single deletes.
+    """
+    if state.config_error:
+        REQS.labels(endpoint="/v1/index/delete-batch", status="503").inc()
+        return {"ok": False, "error": "config_error", "detail": state.config_error}
+    r = await delete_batch_logic(req=payload, os_client=state.os, qdrant=state.qdrant)
+    REQS.labels(endpoint="/v1/index/delete-batch", status="200" if r.ok else "207").inc()
     return r
 
 
@@ -335,6 +375,7 @@ async def search(payload: SearchRequest):
         rerank_auto_min_query_tokens=state.settings.rerank_auto_min_query_tokens,
         rerank_auto_min_intersection=state.settings.rerank_auto_min_intersection,
         top_k_default=state.settings.default_top_k,
+        retrieval_candidates=state.settings.retrieval_candidates,
         bm25_top_k=state.settings.bm25_top_k,
         vector_top_k=state.settings.vector_top_k,
         rrf_k=state.settings.rrf_k,
@@ -345,6 +386,9 @@ async def search(payload: SearchRequest):
         redact_uri_mode=state.settings.redact_uri_mode,
         enable_page_deduplication=state.settings.enable_page_deduplication,
         enable_parent_page_retrieval=state.settings.enable_parent_page_retrieval,
+        adaptive_k_enabled=state.settings.adaptive_k_enabled,
+        adaptive_k_min=state.settings.adaptive_k_min,
+        adaptive_k_max=state.settings.adaptive_k_max,
     )
     REQS.labels(endpoint="/v1/search", status="200").inc()
     return r

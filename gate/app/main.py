@@ -59,6 +59,12 @@ HTTP_RESP_SIZE = Histogram(
 GATE_REFUSALS = Counter("gate_refusals_total", "Refusals (answer == 'I don't know')", ["endpoint"])
 GATE_DEGRADED = Counter("gate_degraded_total", "Degradation events", ["kind"])
 GATE_PARTIAL = Counter("gate_partial_total", "Partial responses", ["endpoint"])
+# Adaptive-k: number of chunks after cutoff (multi-query after_rrf only)
+GATE_ADAPTIVE_K_CHUNKS = Histogram(
+    "gate_adaptive_k_chunks",
+    "Number of chunks after adaptive-k cutoff (Gate, after_rrf)",
+    buckets=(1, 2, 3, 5, 8, 10, 15, 20, 25, 30, 50),
+)
 
 # Pre-create common label series so Grafana panels show 0 instead of "No data" right after startup.
 GATE_REFUSALS.labels(endpoint="/v1/chat").inc(0)
@@ -87,7 +93,7 @@ def _norm_query(q: str) -> str:
 
 
 def _strip_diacritics(s: str) -> str:
-    # Helps matching answers like "Улья́новск" vs "Ульяновск" (combining accents).
+    # Normalize combining accents for answer matching (e.g. Cyrillic with stress marks).
     s = unicodedata.normalize("NFKD", s or "")
     return "".join(ch for ch in s if not unicodedata.combining(ch))
 
@@ -332,6 +338,36 @@ def _rrf_merge_hits_by_chunk_id(
     return merged
 
 
+def _adaptive_k_cutoff(
+    hits: list[dict[str, Any]],
+    *,
+    score_key: str = "multi_rrf_score",
+    min_k: int = 3,
+    max_k: int = 24,
+    cap: int | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Apply adaptive-k: cut at steepest score drop. Uses metadata[score_key] or hit["score"].
+    """
+    if len(hits) <= 1:
+        return hits
+    scores = []
+    for h in hits:
+        s = (h.get("metadata") or {}).get(score_key)
+        if s is None:
+            s = h.get("score")
+        scores.append(float(s) if s is not None else 0.0)
+    gaps = [scores[i] - scores[i + 1] for i in range(len(scores) - 1)]
+    if not gaps:
+        return hits
+    best_i = max(range(len(gaps)), key=lambda i: gaps[i])
+    effective_k = best_i + 1
+    effective_k = max(min_k, min(max_k, effective_k))
+    if cap is not None:
+        effective_k = min(effective_k, cap)
+    return hits[:effective_k]
+
+
 async def _apply_bm25_anchor_pass(
     *,
     retrieval: RetrievalClient,
@@ -363,6 +399,7 @@ async def _apply_bm25_anchor_pass(
             mode="bm25",
             top_k=anchor_top_k,
             rerank=False,
+            use_adaptive_k=False,
             filters=filters,
             acl=payload.acl,
             include_sources=payload.include_sources,
@@ -591,12 +628,18 @@ async def chat(payload: ChatRequest):
 
     # Defaults (may be overridden by request payload)
     mode = payload.retrieval_mode or state.settings.retrieval_mode
-    top_k = payload.top_k or state.settings.top_k
     rerank = payload.rerank
     multi_query_enabled = bool(state.settings.multi_query_enabled)
     two_pass_enabled = bool(state.settings.two_pass_enabled)
     bm25_anchor_enabled = bool(state.settings.bm25_anchor_enabled)
     segment_stitching_enabled = bool(state.settings.segment_stitching_enabled)
+    use_adaptive_k = payload.use_adaptive_k if payload.use_adaptive_k is not None else bool(state.settings.adaptive_k_enabled)
+    adaptive_k_multi = (payload.adaptive_k_multi_query or getattr(state.settings, "adaptive_k_multi_query", "off") or "off").strip().lower()
+    if adaptive_k_multi not in ("off", "after_rrf"):
+        adaptive_k_multi = "off"
+
+    # top_k: request (e.g. from agent plan) overrides config. Agent passes plan's top_k here.
+    top_k = payload.top_k or state.settings.top_k
 
     filters = payload.filters.model_dump(exclude_none=True) if payload.filters else None
 
@@ -615,6 +658,7 @@ async def chat(payload: ChatRequest):
                     top_k=raw_top_k,
                     # IMPORTANT: keep rerank behavior for q0 (restores quality vs massive refusals).
                     rerank=rerank,
+                    use_adaptive_k=False,
                     filters=filters,
                     acl=payload.acl,
                     include_sources=payload.include_sources,
@@ -646,6 +690,7 @@ async def chat(payload: ChatRequest):
                         top_k=raw_top_k,
                         # Only q0 is reranked; expansions are for recall.
                         rerank=False if q != payload.query else rerank,
+                        use_adaptive_k=False,
                         filters=filters,
                         acl=payload.acl,
                         include_sources=payload.include_sources,
@@ -674,14 +719,24 @@ async def chat(payload: ChatRequest):
                         fused[cid] = fused.get(cid, 0.0) + (1.0 / (rrf_k + rank))
 
                 fused_hits = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)
-                merged_hits: list[dict[str, Any]] = []
+                merged_hits = []
                 for cid, sc in fused_hits[: raw_top_k]:
                     h = dict(hit_by_cid.get(cid) or {})
-                    # Preserve original retrieval score (esp. rerank score). Store fused score separately.
                     md = dict(h.get("metadata") or {})
                     md["multi_rrf_score"] = float(sc)
                     h["metadata"] = md
                     merged_hits.append(h)
+
+                # Adaptive-k on merged RRF list
+                if adaptive_k_multi == "after_rrf" and len(merged_hits) > 1:
+                    merged_hits = _adaptive_k_cutoff(
+                        merged_hits,
+                        score_key="multi_rrf_score",
+                        min_k=getattr(state.settings, "adaptive_k_min", 3),
+                        max_k=getattr(state.settings, "adaptive_k_max", 24),
+                        cap=max(1, int(top_k)),
+                    )
+                    GATE_ADAPTIVE_K_CHUNKS.observe(len(merged_hits))
 
                 retrieval_json = {
                     "ok": True,
@@ -689,8 +744,11 @@ async def chat(payload: ChatRequest):
                     "partial": any(bool(r.get("partial")) for r in rs if isinstance(r, dict)),
                     "degraded": sorted({d for r in rs if isinstance(r, dict) for d in (r.get("degraded") or [])}),
                     "hits": merged_hits,
-                    # keep a small debug payload (UI uses it), but don't blow up response size
-                    "multi_query": {"queries": queries, "raw_top_k": raw_top_k},
+                    "multi_query": {
+                        "queries": queries,
+                        "raw_top_k": raw_top_k,
+                        "adaptive_k_multi_query": adaptive_k_multi,
+                    },
                 }
             else:
                 retrieval_json = await state.retrieval.search(
@@ -698,6 +756,7 @@ async def chat(payload: ChatRequest):
                     mode=mode,
                     top_k=top_k,
                     rerank=rerank,
+                    use_adaptive_k=use_adaptive_k,
                     filters=filters,
                     acl=payload.acl,
                     include_sources=payload.include_sources,
@@ -743,6 +802,7 @@ async def chat(payload: ChatRequest):
                     mode="bm25",
                     top_k=20,
                     rerank=False,
+                    use_adaptive_k=False,
                     filters={**(filters or {}), "doc_ids": doc_ids},
                     acl=payload.acl,
                     include_sources=False,
@@ -806,6 +866,7 @@ async def chat(payload: ChatRequest):
                                     mode="bm25",
                                     top_k=20,
                                     rerank=False,
+                                    use_adaptive_k=False,
                                     filters={**(filters or {}), "doc_ids": [did]},
                                     acl=payload.acl,
                                     include_sources=False,
@@ -1617,10 +1678,12 @@ async def chat_stream(payload: ChatRequest):
 
     # Defaults (may be overridden by request payload)
     mode = payload.retrieval_mode or state.settings.retrieval_mode
+    # top_k: request (e.g. from agent plan) overrides config.
     top_k = payload.top_k or state.settings.top_k
     rerank = payload.rerank
     bm25_anchor_enabled = bool(state.settings.bm25_anchor_enabled)
     segment_stitching_enabled = bool(state.settings.segment_stitching_enabled)
+    use_adaptive_k = payload.use_adaptive_k if payload.use_adaptive_k is not None else bool(state.settings.adaptive_k_enabled)
 
     filters = payload.filters.model_dump(exclude_none=True) if payload.filters else None
 
@@ -1634,6 +1697,7 @@ async def chat_stream(payload: ChatRequest):
                         mode=mode,
                         top_k=top_k,
                         rerank=rerank,
+                        use_adaptive_k=use_adaptive_k,
                         filters=filters,
                         acl=payload.acl,
                         include_sources=payload.include_sources,

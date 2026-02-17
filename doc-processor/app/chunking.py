@@ -234,6 +234,133 @@ def _split_markdown_table_block(text: str, *, chunk_size: int, overlap: int) -> 
     return [c for c in chunks if c]
 
 
+# --- Semantic / section-based chunking (near-SOTA for docs, instructions, rules) ---
+
+# Markdown heading (## Title) or numbered section (1. 1.1 2. 2.1) at line start. RU/EN agnostic.
+_RE_HEADING = re.compile(r"^(#{1,6})\s+.+$")
+_RE_NUMBERED = re.compile(r"^(\d+(?:\.\d+)*\.)\s+\S")
 
 
+def _split_sections(text: str) -> list[tuple[str, str]]:
+    """
+    Split text into (heading_line, body) sections. Heading line may be empty for the first section.
+    Sections start at Markdown headings (# ## ###) or numbered lines (1. 1.1 2.).
+    Optimized for documentation, instructions, and rules (RU/EN).
+    """
+    lines = text.splitlines()
+    sections: list[tuple[str, str]] = []
+    current_heading = ""
+    current_body: list[str] = []
+
+    def flush() -> None:
+        nonlocal current_heading, current_body
+        body = "\n".join(current_body).strip()
+        if body or current_heading:
+            sections.append((current_heading, body))
+        current_heading = ""
+        current_body = []
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        is_heading = bool(_RE_HEADING.match(line)) or bool(_RE_NUMBERED.match(line))
+
+        if is_heading:
+            flush()
+            current_heading = line.rstrip()
+            current_body = []
+        else:
+            current_body.append(line)
+
+    flush()
+    return sections
+
+
+def chunk_text_semantic(text: str, *, chunk_size: int, overlap: int) -> list[str]:
+    """
+    Section-based chunking: split on headings/sections first, then fit within chunk_size.
+    Preserves code blocks and tables (no split inside them). Minimal overlap (only when
+    a single section exceeds chunk_size). Optimized for docs, instructions, rules (RU/EN).
+    Returns list of chunk strings, same contract as chunk_text_chars.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    if chunk_size <= 0:
+        return [text]
+    overlap = max(0, min(overlap, chunk_size - 1)) if chunk_size > 1 else 0
+
+    blocks = _split_markdown_blocks(text)
+    chunks: list[str] = []
+    cur_parts: list[str] = []
+    cur_len = 0
+
+    def flush() -> None:
+        nonlocal cur_parts, cur_len
+        if cur_parts:
+            chunks.append("\n\n".join(cur_parts).strip())
+        cur_parts = []
+        cur_len = 0
+
+    for b in blocks:
+        btxt = b.text.strip()
+        if not btxt:
+            continue
+
+        if b.kind in ("code", "table"):
+            if len(btxt) > chunk_size:
+                flush()
+                if b.kind == "table":
+                    chunks.extend(_split_markdown_table_block(btxt, chunk_size=chunk_size, overlap=overlap))
+                else:
+                    chunks.extend(_split_text_fallback(btxt, chunk_size=chunk_size, overlap=overlap))
+            else:
+                add_sep = 2 if cur_parts else 0
+                if cur_parts and cur_len + add_sep + len(btxt) > chunk_size:
+                    flush()
+                cur_parts.append(btxt)
+                cur_len += (2 if cur_len else 0) + len(btxt)
+            continue
+
+        # Text block: split by sections, then merge sections into chunks
+        sections = _split_sections(btxt)
+        for heading, body in sections:
+            if not body:
+                if heading:
+                    add_sep = 2 if cur_parts else 0
+                    if cur_parts and cur_len + add_sep + len(heading) > chunk_size:
+                        flush()
+                    cur_parts.append(heading)
+                    cur_len += add_sep + len(heading)
+                continue
+            section_text = (heading + "\n\n" + body).strip() if heading else body
+            section_len = len(section_text)
+
+            if section_len > chunk_size:
+                flush()
+                chunks.extend(_split_text_fallback(section_text, chunk_size=chunk_size, overlap=overlap))
+                continue
+
+            add_sep = 2 if cur_parts else 0
+            if cur_parts and cur_len + add_sep + section_len > chunk_size:
+                flush()
+            cur_parts.append(section_text)
+            cur_len += (add_sep if cur_len else 0) + section_len
+
+    flush()
+    return [c for c in chunks if c]
+
+
+def chunk_by_strategy(
+    text: str,
+    *,
+    strategy: str,
+    chunk_size: int,
+    overlap: int,
+) -> list[str]:
+    """
+    Single entry point for chunking. strategy: "fixed" (char-based, overlap) or "semantic" (section-based).
+    """
+    if strategy == "semantic":
+        return chunk_text_semantic(text, chunk_size=chunk_size, overlap=overlap)
+    return chunk_text_chars(text, chunk_size=chunk_size, overlap=overlap)
 

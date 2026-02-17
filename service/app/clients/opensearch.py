@@ -139,6 +139,22 @@ class OpenSearchClient:
         q = {"query": {"term": {doc_id_field: doc_id}}}
         return self.client.delete_by_query(index=self.index_alias, body=q, refresh=refresh, conflicts="proceed")
 
+    def delete_by_doc_ids(self, doc_ids: list[str], refresh: bool, *, batch_size: int = 1000) -> dict[str, Any]:
+        """
+        Delete all chunks matching any of the given doc_ids.
+        Batched to avoid query size limits (OpenSearch terms default max ~65k).
+        """
+        if not doc_ids:
+            return {"deleted": 0}
+        doc_id_field = self._resolve_doc_id_field()
+        total_deleted = 0
+        for i in range(0, len(doc_ids), batch_size):
+            batch = doc_ids[i : i + batch_size]
+            q = {"query": {"terms": {doc_id_field: batch}}}
+            r = self.client.delete_by_query(index=self.index_alias, body=q, refresh=refresh, conflicts="proceed")
+            total_deleted += int(r.get("deleted") or 0)
+        return {"deleted": total_deleted}
+
     def search(
         self,
         query: str,

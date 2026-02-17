@@ -23,6 +23,7 @@ class RetrievalClient:
         top_k: int,
         rerank: bool | None = None,
         max_chunks_per_doc: int | None = None,
+        use_adaptive_k: bool | None = None,
         filters: dict[str, Any] | None,
         acl: list[str],
         include_sources: bool,
@@ -34,6 +35,7 @@ class RetrievalClient:
             # Let gate override service-level rerank behavior (critical for multi-query/anchor passes).
             "rerank": rerank,
             "max_chunks_per_doc": max_chunks_per_doc,
+            "use_adaptive_k": use_adaptive_k,
             "include_sources": include_sources,
             "sources_level": "basic",
             "filters": filters,
@@ -289,7 +291,7 @@ class LLMClient:
             f"- request_hash: {h}\n"
             f"- question: {user[:500]}\n"
             "\n"
-            "Настрой `GATE_LLM_PROVIDER=openai_compat` и `GATE_LLM_API_KEY`, чтобы получать реальный ответ модели."
+            "Set GATE_LLM_PROVIDER=openai_compat and GATE_LLM_API_KEY for real model responses."
         )
 
     async def _mock_stream(self, messages: list[dict[str, str]]):
