@@ -175,7 +175,8 @@ services:
   # Stateless Hybrid Retrieval microservice (scale this one for multiple replicas)
   retrieval:
     build:
-      context: ./service
+      context: .
+      dockerfile: service/Dockerfile
     ports:
       - "${RUGFUNSOTA_RETRIEVAL_PORT:-8085}:8080"
     environment:
@@ -215,10 +216,11 @@ services:
       # Contextual Chunk Headers (CCH) for embeddings (opt-in; requires re-index/re-embed when enabled)
       - RAG_EMBEDDING_CONTEXTUAL_HEADERS_ENABLED=true
       - RAG_EMBEDDING_CONTEXTUAL_HEADERS_MAX_CHARS=400
-      # Chunking (mode=document): semantic (section-based) or token (tuned on BRIGHT all 12 splits: 1024/50 best)
-      - RAG_CHUNK_STRATEGY=semantic
-      - RAG_CHUNK_MAX_TOKENS=1024
+      # Chunking (mode=document): semchunk (default) or use docker-compose-semantic.yml for semantic
+      - RAG_CHUNK_STRATEGY=semchunk
+      - RAG_CHUNK_MAX_TOKENS=512
       - RAG_CHUNK_OVERLAP_TOKENS=50
+      - RAG_CHUNK_ENCODING=cl100k_base
       # Candidate pool (QUALITY): increase recall before fusion/rerank
       - RAG_DEFAULT_TOP_K=20
       - RAG_BM25_TOP_K=200
@@ -307,7 +309,7 @@ services:
     image: vllm/vllm-openai:latest
     command: ["--model", "ibm-granite/granite-docling-258M", "--port", "8123"]
     ports:
-      - "8123:8123"
+      - "8124:8123"
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
     environment:
@@ -398,7 +400,8 @@ services:
   # RAG LLM gate (calls retrieval + LLM)
   rag-gate:
     build:
-      context: ./gate
+      context: .
+      dockerfile: gate/Dockerfile
     ports:
       - "${RUGFUNSOTA_GATE_PORT:-8092}:8090"
     environment:
@@ -531,7 +534,7 @@ services:
     build:
       context: ./ui
     ports:
-      - "3300:80"
+      - "3301:80"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

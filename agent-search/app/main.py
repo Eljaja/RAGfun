@@ -8,11 +8,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import random
 import time
 import uuid
 from typing import Any, AsyncIterator
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -25,6 +29,7 @@ from agent_common import (
     ANSWER_SYSTEM_WITH_TOOLS,
     ANSWER_USER,
     AsyncGateClient,
+    strip_thinking,
     FACT_QUERIES_SYSTEM,
     FACT_QUERIES_USER,
     HYDE_SYSTEM,
@@ -41,6 +46,11 @@ from agent_common import (
     quality_is_poor,
     sources_from_context,
 )
+# Answer stream: cap total time for LLM answer phase; floor so short llm_timeout does not cut too early
+ANSWER_STREAM_CAP_S = 120
+ANSWER_STREAM_MIN_S = 90
+ANSWER_STREAM_LLM_MULTIPLIER = 2
+
 # Prometheus metrics
 AGENT_REQS = Counter("agent_requests_total", "Agent requests", ["endpoint", "status"])
 AGENT_LAT = Histogram(
@@ -261,9 +271,12 @@ async def _plan_retrieval(
         temperature=0.0,
         timeout_s=timeout_s,
     )
+    # Many models (e.g. reasoning) wrap JSON in <think>...</think>; strip it before parse
+    raw_clean = strip_thinking(raw or "").strip()
     try:
-        return json.loads(raw)
+        return json.loads(raw_clean)
     except Exception:
+        # Fallback if no valid JSON (e.g. model returned plain text)
         return {"retrieval_mode": "hybrid", "top_k": 10, "rerank": True, "use_hyde": False, "reason": "fallback"}
 
 
@@ -457,8 +470,44 @@ async def _detect_language(
 
 
 def _with_trace_id(event: dict[str, Any], trace_id: str) -> dict[str, Any]:
-    """Inject trace_id into event for OTEL/Jaeger correlation."""
     return {**event, "trace_id": trace_id}
+
+
+async def _gate_chat_once(
+    gate: "AsyncGateClient",
+    client: httpx.AsyncClient,
+    search_query: str,
+    *,
+    mode: str,
+    top_k: int,
+    rerank: bool,
+    use_adaptive_k: bool | None,
+    filters: dict | None,
+    include_sources: bool,
+    history: list | None,
+    timeout_s: float,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Returns (result, None) or (None, error_event)."""
+    try:
+        result = await asyncio.wait_for(
+            gate.chat(
+                client,
+                search_query,
+                history=history,
+                retrieval_mode=mode,
+                top_k=top_k,
+                rerank=rerank,
+                use_adaptive_k=use_adaptive_k,
+                filters=filters,
+                include_sources=include_sources,
+            ),
+            timeout=timeout_s,
+        )
+        return (result, None)
+    except asyncio.TimeoutError:
+        return (None, {"type": "error", "error": "Gate (retrieval) timeout. Check rag-gate and retrieval."})
+    except Exception as e:
+        return (None, {"type": "error", "error": f"Gate error: {e!s}"})
 
 
 async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncIterator[dict[str, Any]]:
@@ -489,11 +538,24 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
     gate = AsyncGateClient(gate_url, timeout_s=gate_timeout)
 
     hist = [m for m in payload.history] if payload.history else None
+    logger.info("agent yielding mood then plan tool")
     yield {"type": "trace", "kind": "mood", "content": random.choice(MEME_GRUMPS)}
     yield {"type": "trace", "kind": "tool", "name": "llm.plan", "payload": {"model": llm_model, "query": payload.query}}
     if _can_llm():
         AGENT_LLM_CALLS.labels(stage="plan").inc()
-        plan = await _plan_retrieval(client, llm_base, llm_model, llm_key, payload.query, timeout_s=llm_timeout, history=hist)
+        try:
+            logger.info("agent calling _plan_retrieval (LLM)")
+            plan = await asyncio.wait_for(
+                _plan_retrieval(client, llm_base, llm_model, llm_key, payload.query, timeout_s=llm_timeout, history=hist),
+                timeout=min(40, llm_timeout + 10),
+            )
+            logger.info("agent plan received mode=%s", plan.get("retrieval_mode"))
+        except asyncio.TimeoutError:
+            yield {"type": "error", "error": "LLM plan timeout. Check AGENT_LLM_BASE_URL and API availability."}
+            return
+        except Exception as e:
+            yield {"type": "error", "error": f"Plan error: {e!s}"}
+            return
     else:
         plan = {"retrieval_mode": "hybrid", "top_k": 10, "rerank": True, "use_hyde": False, "reason": "max_llm_calls"}
 
@@ -574,32 +636,30 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
             search_query = hyde.strip() or payload.query
             yield {"type": "trace", "kind": "tool", "name": "gate.chat", "payload": {"query": search_query, "retrieval_mode": mode, "top_k": top_k, "rerank": rerank}}
             AGENT_GATE_CALLS.inc()
-            primary = await gate.chat(
-                client,
-                search_query,
+            primary, err = await _gate_chat_once(
+                gate, client, search_query,
+                mode=mode, top_k=top_k, rerank=rerank, use_adaptive_k=use_adaptive_k,
+                filters=filters, include_sources=payload.include_sources,
                 history=[m for m in payload.history] if payload.history else None,
-                retrieval_mode=mode,
-                top_k=top_k,
-                rerank=rerank,
-                use_adaptive_k=use_adaptive_k,
-                filters=filters,
-                include_sources=payload.include_sources,
+                timeout_s=gate_timeout + 15,
             )
+            if err:
+                yield err
+                return
     else:
         search_query = payload.query
         yield {"type": "trace", "kind": "tool", "name": "gate.chat", "payload": {"query": search_query, "retrieval_mode": mode, "top_k": top_k, "rerank": rerank}}
         AGENT_GATE_CALLS.inc()
-        primary = await gate.chat(
-            client,
-            search_query,
+        primary, err = await _gate_chat_once(
+            gate, client, search_query,
+            mode=mode, top_k=top_k, rerank=rerank, use_adaptive_k=use_adaptive_k,
+            filters=filters, include_sources=payload.include_sources,
             history=[m for m in payload.history] if payload.history else None,
-            retrieval_mode=mode,
-            top_k=top_k,
-            rerank=rerank,
-            use_adaptive_k=use_adaptive_k,
-            filters=filters,
-            include_sources=payload.include_sources,
+            timeout_s=gate_timeout + 15,
         )
+        if err:
+            yield err
+            return
 
     min_hits = int(_env_get("AGENT_QUALITY_MIN_HITS", "3"))
     min_score = float(_env_get("AGENT_QUALITY_MIN_SCORE", "0.15"))
@@ -698,23 +758,35 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
             temperature=0.2,
             timeout_s=llm_timeout,
         )
+        full_answer = strip_thinking(full_answer)
         for ch in full_answer:
             yield {"type": "token", "content": ch}
     else:
         yield {"type": "trace", "kind": "tool", "name": "llm.answer", "payload": {"model": llm_model, "stream": True}}
         answer_parts: list[str] = []
-        async for chunk in _llm_chat_stream(
-            client,
-            llm_base,
-            llm_model,
-            llm_key,
-            [system, user],
-            temperature=0.2,
-            timeout_s=llm_timeout,
-        ):
-            answer_parts.append(chunk)
-            yield {"type": "token", "content": chunk}
-        full_answer = "".join(answer_parts)
+        answer_stream_deadline = time.monotonic() + min(
+            ANSWER_STREAM_CAP_S,
+            max(llm_timeout * ANSWER_STREAM_LLM_MULTIPLIER, ANSWER_STREAM_MIN_S),
+        )
+        try:
+            async for chunk in _llm_chat_stream(
+                client,
+                llm_base,
+                llm_model,
+                llm_key,
+                [system, user],
+                temperature=0.2,
+                timeout_s=llm_timeout,
+            ):
+                if time.monotonic() > answer_stream_deadline:
+                    break
+                answer_parts.append(chunk)
+                yield {"type": "token", "content": chunk}
+        except (asyncio.TimeoutError, httpx.TimeoutException):
+            pass
+        full_answer = strip_thinking("".join(answer_parts))
+        if not full_answer.strip():
+            full_answer = "[Answer generation timed out or produced no text. Try a shorter query or check the LLM endpoint.]"
     sources = sources_from_context(context_chunks) if context_chunks else (primary.get("sources") or [])
 
     if _can_llm():
@@ -957,10 +1029,26 @@ async def agent_stream(request: Request, payload: AgentRequest):
         stream_error: str | None = None
         try:
             yield f"data: {json.dumps(_with_trace_id({'type': 'init', 'trace_id': trace_id}, trace_id))}\n\n"
+            await asyncio.sleep(0)
+            yield f"data: {json.dumps(_with_trace_id({'type': 'trace', 'kind': 'thought', 'label': 'Start', 'content': 'Preparing plan...'}, trace_id))}\n\n"
+            await asyncio.sleep(0)
             async with httpx.AsyncClient() as client:
                 try:
-                    async for event in _run_agent(payload, client):
-                        if getattr(request, "is_disconnected", False):
+                    agent_it = _run_agent(payload, client)
+                    next_timeout_s = float(_env_get("AGENT_STREAM_NEXT_TIMEOUT_S", "65"))
+                    while True:
+                        try:
+                            event = await asyncio.wait_for(
+                                agent_it.__anext__(),
+                                timeout=min(next_timeout_s, max(5, deadline - asyncio.get_event_loop().time())),
+                            )
+                        except StopAsyncIteration:
+                            break
+                        except asyncio.TimeoutError:
+                            stream_error = "request_timeout"
+                            yield f"data: {json.dumps(_with_trace_id({'type': 'error', 'error': 'Timeout: no response from LLM/services. Check AGENT_LLM_BASE_URL and network.'}, trace_id))}\n\n"
+                            return
+                        if await request.is_disconnected():
                             stream_error = "client_disconnected"
                             return
                         if asyncio.get_event_loop().time() > deadline:
@@ -968,6 +1056,7 @@ async def agent_stream(request: Request, payload: AgentRequest):
                             yield f"data: {json.dumps(_with_trace_id({'type': 'error', 'error': 'request_timeout'}, trace_id))}\n\n"
                             return
                         yield f"data: {json.dumps(_with_trace_id(event, trace_id))}\n\n"
+                        await asyncio.sleep(0)  # flush chunk to client
                 except asyncio.CancelledError:
                     stream_error = "client_disconnected"
                     raise
@@ -976,9 +1065,19 @@ async def agent_stream(request: Request, payload: AgentRequest):
                     yield f"data: {json.dumps(_with_trace_id({'type': 'error', 'error': 'request_timeout'}, trace_id))}\n\n"
                 except Exception as exc:
                     stream_error = str(exc)
+                    logger.exception("agent stream error")
                     yield f"data: {json.dumps(_with_trace_id({'type': 'error', 'error': str(exc)}, trace_id))}\n\n"
         except asyncio.CancelledError:
             stream_error = "client_disconnected"
+        except Exception as exc:
+            # Catch-all: ensure stream doesn't silently close (UI would spin forever)
+            stream_error = str(exc)
+            logger.exception("agent stream fatal error")
+            try:
+                yield f"data: {json.dumps(_with_trace_id({'type': 'error', 'error': str(exc)}, trace_id))}\n\n"
+            except Exception:
+                # If we can't write to the client (already disconnected), just exit.
+                pass
         finally:
             AGENT_LAT.labels(endpoint="/v1/agent/stream").observe(time.perf_counter() - t0)
             AGENT_REQS.labels(endpoint="/v1/agent/stream", status="ok" if not stream_error else "error").inc()

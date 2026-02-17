@@ -9,7 +9,7 @@ This repository implements a full-featured RAG system with:
 - **Hybrid Retrieval**: Combines BM25 (sparse) and dense vector search with Reciprocal Rank Fusion (RRF)
 - **VLM-Powered Document Processing**: Uses Vision-Language Models (Granite-Docling) for accurate document-to-text extraction
 - **Stateless Microservices**: Horizontally scalable services with clear separation of concerns
-- **Agent-Search & Deep-Research**: LLM-driven retrieval (plan, HyDE, fact queries, retry) and iterative research (LangGraph)
+- **Agent-Search**: LLM-driven retrieval (plan, HyDE, fact queries, retry)
 - **Advanced Features**: Multi-query expansion, two-pass retrieval, reranking, segment stitching, auto-tuning
 - **Full Observability**: Prometheus metrics, Grafana dashboards, structured logging
 - **Async Processing**: RabbitMQ-based ingestion pipeline with retry/DLQ
@@ -52,23 +52,24 @@ The default `docker-compose.yml` includes the Infinity embeddings service (BAAI/
    ```bash
    docker compose up -d --build
    ```
-   With agent-search and deep-research (profile `agent-search`):
+   With agent-search and/or deep-research:
    ```bash
    docker compose --profile agent-search up -d --build
+   docker compose --profile deep-research up -d --build   # optional: iterative research reports
    ```
 
 4. **Wait for services to be ready** (typically 2-3 minutes):
    ```bash
    # Check service health
-   curl http://localhost:8090/v1/readyz  # Gate API
+   curl http://localhost:8092/v1/readyz  # Gate API
    curl http://localhost:8080/v1/readyz  # Retrieval service
    curl http://localhost:9200/_cluster/health  # OpenSearch
    curl http://localhost:6333/health  # Qdrant
    ```
 
 5. **Access the UI:**
-   - **Web UI**: http://localhost:3300
-   - **Gateway API**: http://localhost:8090
+   - **Web UI**: http://localhost:3301
+   - **Gateway API**: http://localhost:8092
    - **Grafana Dashboards**: http://localhost:3000 (admin/admin)
    - **Prometheus**: http://localhost:9090
    - **RabbitMQ Management**: http://localhost:15672 (guest/guest)
@@ -78,16 +79,16 @@ The default `docker-compose.yml` includes the Infinity embeddings service (BAAI/
 Upload a document and query it:
 
 ```bash
-# Upload a document
-curl -X POST http://localhost:8090/v1/documents/upload \
+# Upload a document (Gate on 8092 in this setup)
+curl -X POST http://localhost:8092/v1/documents/upload \
   -F "file=@/path/to/your/document.pdf" \
   -F "filename=test.pdf"
 
 # Wait for ingestion to complete (check status)
-curl http://localhost:8090/v1/documents/{doc_id}/status
+curl http://localhost:8092/v1/documents/{doc_id}/status
 
 # Query the document
-curl -X POST http://localhost:8090/v1/chat \
+curl -X POST http://localhost:8092/v1/chat \
   -H "Content-Type: application/json" \
   -d '{"query": "What is this document about?", "stream": false}'
 ```
@@ -99,13 +100,13 @@ curl -X POST http://localhost:8090/v1/chat \
 The system consists of **8 microservices** organized into application, ML, and infrastructure layers:
 
 #### Application Services
-- **rag-gate** (`:8090`, rugfunsota: `:8092`) - FastAPI gateway; orchestrates uploads, chat, and streaming responses
-- **retrieval** (`:8080`, rugfunsota: `:8085`) - Hybrid search engine (BM25 + vectors); stateless and horizontally scalable
+- **rag-gate** (`:8092`) - FastAPI gateway; orchestrates uploads, chat, and streaming responses (internal port `:8090`)
+- **retrieval** (`:8085`) - Hybrid search engine (BM25 + vectors); stateless and horizontally scalable (internal port `:8080`)
 - **document-storage** (`:8081`) - Stores document bytes (S3-compatible) and metadata (Postgres)
 - **doc-processor** (`:8082`) - Async worker for document extraction, chunking, and indexing
 - **agent-search** (`:8093`, profile `agent-search`) - LLM-driven search: plan, HyDE, fact queries, retry
-- **deep-research** (`:8094`, profile `agent-search`) - Iterative research (LangGraph). Async Gate client, parallel fact/alt-mode calls, cancellation on disconnect.
-- **ui** (`:3300`) - Nginx-served SPA with SSE streaming support
+- **deep-research** (`:8094`, profile `deep-research`) - LangGraph-based iterative research: plan → scope → research loop → streaming report
+- **ui** (`:3301`) - Nginx-served SPA with SSE streaming support
 
 #### ML/Embedding Services
 - **infinity** (`:7997`) - BAAI/bge-m3 multilingual embeddings (1024-dim, 100+ languages)
@@ -149,18 +150,17 @@ The system consists of **8 microservices** organized into application, ML, and i
 - **Auto-Tuning**: Optional LLM-based parameter optimization via router
 - **Full Observability**: Prometheus metrics, Grafana dashboards, structured logs
 
-### Agent & Deep Research
+### Agent-Search
 
-Two LLM-driven services extend RAG with intelligent query planning and iterative research (profile `agent-search`):
+LLM-driven search (profile `agent-search`): plan → Gate.chat → quality check → fact queries → answer, with optional web search.
 
 | Service | Port | Description |
 |---------|------|-------------|
-| **agent-search** | 8093 | Plan → Gate.chat → quality check → fact queries → answer (with optional web search) |
-| **deep-research** | 8094 | LangGraph: plan → scope → research loop → streaming report. Async Gate, parallel calls, cancellation on disconnect. |
+| **agent-search** | 8093 | Plan → Gate.chat → quality check → fact queries → answer (optional web search, citation [1][2]) |
 
-**Features:** Web search (Serper/Tavily), citation [1][2], per-request limits (`max_llm_calls`, `max_fact_queries`), feature flags (`use_hyde`, `use_fact_queries`, `use_retry`), mode presets (`minimal`/`conservative`/`aggressive`), Prometheus metrics. Deep-research uses async Gate client and parallelizes fact queries and alt-mode retrieval.
+**Features:** Web search (Serper/Tavily), per-request limits (`max_llm_calls`, `max_fact_queries`), feature flags (`use_hyde`, `use_fact_queries`, `use_retry`), mode presets (`minimal`/`conservative`/`aggressive`), Prometheus metrics.
 
-See **[docs/AGENT_SEARCH_AND_DEEP_RESEARCH.md](./docs/AGENT_SEARCH_AND_DEEP_RESEARCH.md)** for API reference, parameters, and configuration.
+See **[docs/AGENT_SEARCH.md](./docs/AGENT_SEARCH.md)** for API reference and configuration.
 
 ## Current Direction
 
@@ -169,7 +169,7 @@ See **[docs/AGENT_SEARCH_AND_DEEP_RESEARCH.md](./docs/AGENT_SEARCH_AND_DEEP_RESE
 - SOTA: semantic chunking, contextual headers, local reranker
 - Multi-query, two-pass retrieval, reranking
 - Observability: Prometheus, Grafana, structured logging
-- BRIGHT chunk tuning: `scripts/bright_tune_chunking.py` (full benchmark: `--splits all --eval-splits all --docs-from-gold 100000`). Defaults 1024/50 from full BRIGHT.
+- BRIGHT chunk tuning: `scripts/bright_tune_chunking.py` (full benchmark: `--splits all --eval-splits all --docs-from-gold 100000`). Default chunking: **semchunk** 512/50 in `docker-compose.yml`; for **semantic** 512/50 use `docker-compose-semantic.yml` override.
 - Exploring GraphRAG, T²-RAGBench and custom benchmarks
 
 ## Planned Work
@@ -209,7 +209,7 @@ python -m app.main
 - Update `service/app/fusion.py` (RRF fusion and reranking)
 
 **Changing chunking:**
-- Retrieval (mode=document): `service/app/chunking.py` — strategies `semantic` (section-based) or `token` (paragraph + sliding window). Params: `RAG_CHUNK_STRATEGY`, `RAG_CHUNK_MAX_TOKENS`, `RAG_CHUNK_OVERLAP_TOKENS` (tuned on BRIGHT: 1024/50).
+- Retrieval (mode=document): `service/app/chunking.py` — strategies `semchunk` (default, 512/50) or `semantic` (section-based). Default: `docker-compose.yml` uses semchunk; for semantic 512/50 run with `-f docker-compose-semantic.yml`. Params: `RAG_CHUNK_STRATEGY`, `RAG_CHUNK_MAX_TOKENS`, `RAG_CHUNK_OVERLAP_TOKENS`.
 - Doc-processor: `doc-processor/app/chunking.py` when using pre-chunked input.
 
 **Adding API endpoints:**
@@ -238,7 +238,7 @@ python scripts/bright_tune_chunking.py --retrieval-url http://localhost:8085 --b
 python scripts/bright_tune_chunking.py --retrieval-url http://localhost:8085 --splits all --eval-splits all --docs-from-gold 100000 --configs "256:0,512:0,512:50,1024:50"
 ```
 
-Results: `results/bright_chunk_tune_summary.json` and table in stdout. Default chunk params (1024 tokens, 50 overlap) were tuned on full BRIGHT.
+Results: `results/bright_chunk_tune_summary.json` and table in stdout. Default in this repo: semchunk 512/50; use `docker-compose-semantic.yml` for semantic 512/50.
 
 **BEIR eval** (direct / full pipeline):
 ```bash
@@ -338,26 +338,19 @@ Content-Type: application/json
 }
 ```
 
-### Agent-Search & Deep-Research
-
-See **[docs/AGENT_SEARCH_AND_DEEP_RESEARCH.md](./docs/AGENT_SEARCH_AND_DEEP_RESEARCH.md)** for full API reference, request parameters, and configuration.
-
 ### Verifying Agent Services
 
 ```bash
 # 1. Start services (if not already running)
 docker compose --profile agent-search up -d
 
-# 2. Full verification: retrieval, gate, agent-search, deep-research
+# 2. Full verification: retrieval, gate, agent-search
 python scripts/verify_agent_queries.py
 
-# 3. Async concurrency test (parallel deep-research + agent, cancellation)
-python scripts/test_async_concurrent.py
-
-# 4. Smoke test (retrieval)
+# 3. Smoke test (retrieval)
 python scripts/smoke_test.py
 
-# 5. Pipeline e2e (upload → chat → delete)
+# 4. Pipeline e2e (upload → chat → delete)
 docker build -t rugfunsota-pipeline-tests -f pipeline-tests/Dockerfile pipeline-tests/
 docker run --rm --network rugfunsota_rag-network \
   -e GATE_BASE_URL=http://rag-gate:8090 \
@@ -387,10 +380,10 @@ VECTOR_WEIGHT=0.5
 ENABLE_RERANK=true
 RERANK_TOP_K=20
 
-# Chunking (retrieval service: RAG_CHUNK_* in docker-compose / .env)
-# Tuned on BRIGHT (all 12 splits): 1024/50 best. Strategy: semantic (section-based) or token (paragraph + sliding window).
-RAG_CHUNK_STRATEGY=semantic
-RAG_CHUNK_MAX_TOKENS=1024
+# Chunking (retrieval: RAG_CHUNK_* in docker-compose.yml; default semchunk 512/50)
+# For semantic 512/50: docker compose -f docker-compose.yml -f docker-compose-semantic.yml up
+RAG_CHUNK_STRATEGY=semchunk
+RAG_CHUNK_MAX_TOKENS=512
 RAG_CHUNK_OVERLAP_TOKENS=50
 
 # Advanced Features
@@ -405,11 +398,6 @@ AGENT_REQUEST_TIMEOUT_S=120
 AGENT_QUALITY_MIN_HITS=3
 AGENT_QUALITY_MIN_SCORE=0.15
 AGENT_ALWAYS_FACT_QUERIES=false
-
-# Deep-Research (port 8094)
-DEEP_MAX_ITERATIONS=6
-DEEP_EARLY_STOP_MIN_GAIN=2
-DEEP_RESEARCH_BATCH=5
 
 # Worker Configuration
 WORKER_CONCURRENCY=1
@@ -433,8 +421,7 @@ Services that scale horizontally:
 
 ## Documentation
 
-- **[RUN_RUGFUNSOTA.md](./RUN_RUGFUNSOTA.md)** — Rugfunsota stack setup
-- **[docs/AGENT_SEARCH_AND_DEEP_RESEARCH.md](./docs/AGENT_SEARCH_AND_DEEP_RESEARCH.md)** — Agent-search and deep-research API
+- **[docs/AGENT_SEARCH.md](./docs/AGENT_SEARCH.md)** — Agent-search API
 - **[docs/ENDPOINTS_EXAMPLES.md](./docs/ENDPOINTS_EXAMPLES.md)** — Retrieval API examples
 - **[docs/gate/GATE_API.md](./docs/gate/GATE_API.md)** — Gate API
 
@@ -476,7 +463,7 @@ Services that scale horizontally:
 2. Check timeout settings: `DOCLING_TIMEOUT`
 3. Monitor vLLM service health: `curl http://localhost:8123/health`
 
-For rugfunsota see [RUN_RUGFUNSOTA.md](./RUN_RUGFUNSOTA.md).
+To run this stack as rugfunsota, use the docker-compose files in this repo with project name `rugfunsota` (e.g. `docker compose -p rugfunsota up -d`).
 
 ## Status
 

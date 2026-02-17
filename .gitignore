@@ -213,4 +213,10 @@ data/
 eval/
 out/
 pipeline-tests/
+results/
 scripts/
+tmp_upload/
+
+# Local docs (chunking comparison, tuning guides)
+docs/BRIGHT_CHUNKING_COMPARISON.md
+docs/USER_GUIDE_TUNING_AND_FEATURES.md

@@ -124,6 +124,7 @@ async def upsert(
     chunk_strategy: str,
     max_tokens: int,
     overlap_tokens: int,
+    chunk_encoding: str = "cl100k_base",
     embedding_batch_size: int = 32,
     embedding_concurrency: int = 1,
     embedding_contextual_headers_enabled: bool = False,
@@ -138,6 +139,7 @@ async def upsert(
             strategy=chunk_strategy,
             max_tokens=max_tokens,
             overlap_tokens=overlap_tokens,
+            encoding=chunk_encoding,
         ):
             chs.append(
                 ChunkMeta(

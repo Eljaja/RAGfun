@@ -27,9 +27,12 @@ class ChatRequest(BaseModel):
 
     # pass-through to retrieval
     retrieval_mode: Literal["bm25", "vector", "hybrid"] | None = None
+    # When set (e.g. from agent plan), Gate uses this; otherwise GATE_TOP_K.
     top_k: int | None = None
     rerank: bool | None = None
     use_adaptive_k: bool | None = None  # cut at steepest score drop
+    # Multi-query only: off | after_rrf (overrides GATE_ADAPTIVE_K_MULTI_QUERY)
+    adaptive_k_multi_query: str | None = None
     filters: GateFilters | None = None
     acl: list[str] = Field(default_factory=list)
 

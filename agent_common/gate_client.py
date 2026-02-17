@@ -1,4 +1,4 @@
-"""Unified Gate client for agent-search (async) and deep-research (sync)."""
+"""Gate client for agent-search (async)."""
 
 from __future__ import annotations
 
@@ -117,59 +117,3 @@ class AsyncGateClient:
                 "sources": [],
                 "retrieval": {"ok": False, "partial": True, "degraded": ["gate_error"]},
             }
-
-
-class SyncGateClient:
-    """Sync HTTP client for rag-gate /v1/chat (for deep-research running in thread)."""
-
-    def __init__(
-        self,
-        base_url: str,
-        *,
-        timeout_s: float = 60.0,
-        retry_attempts: int = 2,
-    ) -> None:
-        self._base_url = base_url.rstrip("/")
-        self._timeout_s = timeout_s
-        self._retry_attempts = retry_attempts
-
-    def chat(
-        self,
-        query: str,
-        *,
-        history: list[dict[str, str]] | None = None,
-        retrieval_mode: str = "hybrid",
-        top_k: int = 8,
-        rerank: bool = True,
-        use_adaptive_k: bool | None = None,
-        filters: dict[str, Any] | None = None,
-        include_sources: bool = True,
-    ) -> dict[str, Any]:
-        """Call gate /v1/chat and return normalized response."""
-        url = f"{self._base_url}/v1/chat"
-        payload: dict[str, Any] = {
-            "query": query,
-            "history": history or [],
-            "retrieval_mode": retrieval_mode,
-            "top_k": int(top_k),
-            "rerank": bool(rerank),
-            "include_sources": bool(include_sources),
-        }
-        if use_adaptive_k is not None:
-            payload["use_adaptive_k"] = use_adaptive_k
-        if filters:
-            payload["filters"] = filters
-
-        @retry(
-            stop=stop_after_attempt(self._retry_attempts),
-            wait=wait_exponential(multiplier=1, min=1, max=5),
-            reraise=True,
-        )
-        def _call() -> dict[str, Any]:
-            with httpx.Client(timeout=self._timeout_s) as client:
-                resp = client.post(url, json=payload)
-                resp.raise_for_status()
-                return resp.json()
-
-        data = _call()
-        return _normalize_gate_response(data, retrieval_mode)

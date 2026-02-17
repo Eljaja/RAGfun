@@ -8,12 +8,13 @@ from typing import Any
 from opentelemetry import trace
 from qdrant_client.http import models as qm
 
+from agent_common.retrieval import adaptive_k_cutoff
 from app.clients.embeddings import EmbeddingsClient
 from app.clients.opensearch import OpenSearchClient
 from app.clients.qdrant import QdrantFacade
 from app.clients.rerank import Reranker
 from app.fusion import hybrid_fusion, rrf_fusion
-from app.metrics import CAND, DEP_DEGRADED, ERRS, LAT, RAG_PAGE_DEDUP_SAVED, RAG_PARENT_PAGES, RAG_PARTIAL, RAG_RERANK
+from app.metrics import CAND, DEP_DEGRADED, ERRS, LAT, RAG_ADAPTIVE_K_CHUNKS, RAG_PAGE_DEDUP_SAVED, RAG_PARENT_PAGES, RAG_PARTIAL, RAG_RERANK
 from app.models import SearchFilters, SearchHit, SearchRequest, SearchResponse, SourceObj
 from app.utils import redact_uri
 
@@ -495,17 +496,15 @@ async def search(
     # Final truncate (after rerank and grouping/dedup improvements).
     use_adaptive = req.use_adaptive_k if req.use_adaptive_k is not None else adaptive_k_enabled
     if use_adaptive and len(out) > 1:
-        # Adaptive-k: cut at steepest score drop. k = argmax(s_i - s_{i+1}) + 1
-        scores = [h.score for h in out]
-        gaps = [scores[i] - scores[i + 1] for i in range(len(scores) - 1)]
-        if gaps:
-            best_i = max(range(len(gaps)), key=lambda i: gaps[i])
-            effective_k = best_i + 1
-            effective_k = max(adaptive_k_min, min(adaptive_k_max, effective_k))
-            if len(out) > effective_k:
-                out = out[:effective_k]
-            logger.debug("rag_adaptive_k", extra={"computed_k": best_i + 1, "effective_k": effective_k})
-    elif len(out) > top_k:
+        out = adaptive_k_cutoff(
+            out,
+            get_score=lambda h: h.score,
+            min_k=adaptive_k_min,
+            max_k=adaptive_k_max,
+        )
+        RAG_ADAPTIVE_K_CHUNKS.observe(len(out))
+        logger.debug("rag_adaptive_k", extra={"effective_k": len(out)})
+    if len(out) > top_k:
         out = out[:top_k]
 
     with tracer.start_as_current_span("assemble_response"):
