@@ -13,6 +13,12 @@ scrape_configs:
     static_configs:
       - targets: ["rag-gate:8090"]
 
+  # Agent-search (profile agent-search). Metrics: agent_requests_total, agent_request_duration_seconds, etc.
+  - job_name: agent-search
+    metrics_path: /v1/metrics
+    static_configs:
+      - targets: ["agent-search:8091"]
+
   - job_name: document-storage
     metrics_path: /v1/metrics
     static_configs:

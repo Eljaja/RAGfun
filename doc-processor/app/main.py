@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
-from app.chunking import chunk_text_chars
+from app.chunking import chunk_by_strategy
 from app.clients import RetrievalClient, StorageClient, VLMClient
 from app.config import Settings, load_settings
 from app.logging_setup import setup_json_logging
@@ -248,8 +248,9 @@ async def process(req: ProcessRequest):
     chunks: list[ChunkMeta] = []
     global_idx = 0
     for pi, page_text in enumerate(pages_text):
-        for part in chunk_text_chars(
+        for part in chunk_by_strategy(
             page_text,
+            strategy=state.settings.chunk_strategy,
             chunk_size=state.settings.chunk_size_chars,
             overlap=state.settings.chunk_overlap_chars,
         ):

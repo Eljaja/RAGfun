@@ -29,7 +29,8 @@ class Settings(BaseSettings):
     max_pages: int = 25
     max_image_side_px: int = 1600
 
-    # Chunking (character-based, with overlap)
+    # Chunking: strategy "semantic" (section-based, minimal overlap) or "fixed" (char-based with overlap)
+    chunk_strategy: str = "semantic"  # semantic|fixed
     chunk_size_chars: int = 4000
     chunk_overlap_chars: int = 300
 
@@ -47,6 +48,7 @@ class Settings(BaseSettings):
             "limits": {
                 "max_pages": self.max_pages,
                 "max_image_side_px": self.max_image_side_px,
+                "chunk_strategy": self.chunk_strategy,
                 "chunk_size_chars": self.chunk_size_chars,
                 "chunk_overlap_chars": self.chunk_overlap_chars,
             },
@@ -54,6 +56,9 @@ class Settings(BaseSettings):
 
 
 def load_settings() -> Settings:
-    return Settings()
+    s = Settings()
+    if s.chunk_strategy not in ("semantic", "fixed"):
+        raise ValueError("PROCESSOR_CHUNK_STRATEGY must be 'semantic' or 'fixed'")
+    return s
 
 

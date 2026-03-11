@@ -57,4 +57,11 @@ RAG_PARENT_PAGES = Histogram(
     buckets=(0, 1, 2, 3, 5, 10, 20, 50),
 )
 
+# Adaptive-k: number of chunks chosen after cutoff (steepest score drop)
+RAG_ADAPTIVE_K_CHUNKS = Histogram(
+    "rag_adaptive_k_chunks",
+    "Number of chunks after adaptive-k cutoff (retrieval)",
+    buckets=(1, 2, 3, 5, 8, 10, 15, 20, 25, 30, 50),
+)
+
 

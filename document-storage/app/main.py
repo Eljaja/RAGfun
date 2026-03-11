@@ -680,6 +680,13 @@ async def search_documents(req: DocumentSearchRequest):
         REQS.labels(endpoint="/v1/documents/search", status="500").inc()
         ERRS.labels(stage="search", kind="exception").inc()
         return DocumentSearchResponse(ok=False, error=str(e))
+        REQS.labels(endpoint="/v1/documents/stats", status="200").inc()
+        return stats
+    except Exception as e:
+        logger.error("documents_stats_error", extra={"error": str(e)})
+        REQS.labels(endpoint="/v1/documents/stats", status="500").inc()
+        ERRS.labels(stage="stats", kind="exception").inc()
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/v1/collections")

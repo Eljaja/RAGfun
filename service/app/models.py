@@ -88,6 +88,19 @@ class IndexDeleteResponse(BaseModel):
     errors: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class IndexDeleteBatchRequest(BaseModel):
+    doc_ids: list[str]
+    refresh: bool = False
+    batch_size: int = 500  # max doc_ids per internal batch
+
+
+class IndexDeleteBatchResponse(BaseModel):
+    ok: bool
+    deleted: int = 0
+    partial: bool = False
+    errors: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class SearchFilters(BaseModel):
     source: str | None = None
     tags: list[str] | None = None
@@ -114,6 +127,9 @@ class SearchRequest(BaseModel):
     max_chunks_per_doc: int | None = None
 
     rerank: bool | None = None  # override config
+
+    # Adaptive-k: cut at steepest score drop. None = use service config.
+    use_adaptive_k: bool | None = None
 
 
 class SourceObj(BaseModel):
@@ -147,10 +163,7 @@ class SearchResponse(BaseModel):
 
 class IndexExistsRequest(BaseModel):
     doc_ids: list[str] = Field(default_factory=list)
-
-
 class IndexExistsResponse(BaseModel):
     ok: bool = True
     indexed_doc_ids: list[str] = Field(default_factory=list)
     counts: dict[str, int] = Field(default_factory=dict)
-

@@ -5,13 +5,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY requirements.txt /app/requirements.txt
+COPY gate/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY app /app/app
+COPY agent_common /app/agent_common
+COPY gate/app /app/app
+ENV PYTHONPATH=/app
 
 EXPOSE 8090
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8090"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8090", "--workers", "5"]
 
 

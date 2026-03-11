@@ -33,6 +33,7 @@ class OpenSearchClient:
         self.index_alias = index_alias
         self.index_prefix = index_prefix
         self.client = _build_os_client(url, username, password)
+        self._doc_id_field: str | None = None
 
     def ping(self) -> bool:
         return bool(self.client.ping())
@@ -91,6 +92,30 @@ class OpenSearchClient:
         self.client.indices.put_alias(index=index_name, name=self.index_alias)
         return index_name
 
+    def _resolve_doc_id_field(self) -> str:
+        """
+        Prefer keyword field for aggregations/terms queries.
+        Falls back to doc_id if mapping is missing/unexpected.
+        """
+        if self._doc_id_field:
+            return self._doc_id_field
+        try:
+            mapping = self.client.indices.get_mapping(index=self.index_alias)
+            # alias points to a concrete index; grab first mapping
+            index_name = next(iter(mapping.keys()))
+            props = ((mapping.get(index_name) or {}).get("mappings") or {}).get("properties") or {}
+            doc_id_def = props.get("doc_id") or {}
+            keyword_def = (doc_id_def.get("fields") or {}).get("keyword")
+            if keyword_def is not None:
+                self._doc_id_field = "doc_id.keyword"
+            elif doc_id_def.get("type") == "keyword":
+                self._doc_id_field = "doc_id"
+            else:
+                self._doc_id_field = "doc_id"
+        except Exception:
+            self._doc_id_field = "doc_id"
+        return self._doc_id_field
+
     def bulk_upsert(self, docs: list[dict[str, Any]], refresh: bool) -> dict[str, Any]:
         ops: list[dict[str, Any]] = []
         for d in docs:
@@ -110,8 +135,25 @@ class OpenSearchClient:
         self.client.delete(index=self.index_alias, id=chunk_id, refresh=refresh, ignore=[404])
 
     def delete_by_doc_id(self, doc_id: str, refresh: bool) -> dict[str, Any]:
-        q = {"query": {"term": {"doc_id": doc_id}}}
+        doc_id_field = self._resolve_doc_id_field()
+        q = {"query": {"term": {doc_id_field: doc_id}}}
         return self.client.delete_by_query(index=self.index_alias, body=q, refresh=refresh, conflicts="proceed")
+
+    def delete_by_doc_ids(self, doc_ids: list[str], refresh: bool, *, batch_size: int = 1000) -> dict[str, Any]:
+        """
+        Delete all chunks matching any of the given doc_ids.
+        Batched to avoid query size limits (OpenSearch terms default max ~65k).
+        """
+        if not doc_ids:
+            return {"deleted": 0}
+        doc_id_field = self._resolve_doc_id_field()
+        total_deleted = 0
+        for i in range(0, len(doc_ids), batch_size):
+            batch = doc_ids[i : i + batch_size]
+            q = {"query": {"terms": {doc_id_field: batch}}}
+            r = self.client.delete_by_query(index=self.index_alias, body=q, refresh=refresh, conflicts="proceed")
+            total_deleted += int(r.get("deleted") or 0)
+        return {"deleted": total_deleted}
 
     def search(
         self,
@@ -146,10 +188,11 @@ class OpenSearchClient:
         """
         if not doc_ids:
             return {}
+        doc_id_field = self._resolve_doc_id_field()
         body = {
             "size": 0,
-            "query": {"terms": {"doc_id": doc_ids}},
-            "aggs": {"docs": {"terms": {"field": "doc_id", "size": len(doc_ids)}}},
+            "query": {"terms": {doc_id_field: doc_ids}},
+            "aggs": {"docs": {"terms": {"field": doc_id_field, "size": len(doc_ids)}}},
         }
         r = self.client.search(index=self.index_alias, body=body)
         buckets = (((r.get("aggregations") or {}).get("docs") or {}).get("buckets")) or []
@@ -163,11 +206,12 @@ class OpenSearchClient:
 
     def get_chunks_by_page(self, doc_id: str, page: int) -> list[dict[str, Any]]:
         """Get all chunks for a specific (doc_id, page)."""
+        doc_id_field = self._resolve_doc_id_field()
         query = {
             "query": {
                 "bool": {
                     "must": [
-                        {"term": {"doc_id": doc_id}},
+                        {"term": {doc_id_field: doc_id}},
                         {"term": {"locator.page": page}},
                     ]
                 }
@@ -184,5 +228,4 @@ class OpenSearchClient:
             return chunks
         except Exception:
             return []
-
 

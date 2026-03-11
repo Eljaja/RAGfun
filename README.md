@@ -9,8 +9,8 @@ This repository implements a full-featured RAG system with:
 - **Hybrid Retrieval**: Combines BM25 (sparse) and dense vector search with Reciprocal Rank Fusion (RRF)
 - **VLM-Powered Document Processing**: Uses Vision-Language Models (Granite-Docling) for accurate document-to-text extraction
 - **Stateless Microservices**: Horizontally scalable services with clear separation of concerns
+- **Agent-Search**: LLM-driven retrieval (plan, HyDE, fact queries, retry)
 - **Advanced Features**: Multi-query expansion, two-pass retrieval, reranking, segment stitching, auto-tuning
-- **Agentic Search**: Multi-turn research-style queries with streaming responses
 - **Full Observability**: Prometheus metrics, Grafana dashboards, structured logging
 - **Async Processing**: RabbitMQ-based ingestion pipeline with retry/DLQ
 
@@ -52,19 +52,23 @@ The default `docker-compose.yml` includes the Infinity embeddings service (BAAI/
    ```bash
    docker compose up -d --build
    ```
+   With agent-search (profile `agent-search`):
+   ```bash
+   docker compose --profile agent-search up -d --build
+   ```
 
 4. **Wait for services to be ready** (typically 2-3 minutes):
    ```bash
    # Check service health
-   curl http://localhost:8090/v1/readyz  # Gate API
+   curl http://localhost:8092/v1/readyz  # Gate API
    curl http://localhost:8080/v1/readyz  # Retrieval service
    curl http://localhost:9200/_cluster/health  # OpenSearch
    curl http://localhost:6333/health  # Qdrant
    ```
 
 5. **Access the UI:**
-   - **Web UI**: http://localhost:3300
-   - **Gateway API**: http://localhost:8090
+   - **Web UI**: http://localhost:3301
+   - **Gateway API**: http://localhost:8092
    - **Grafana Dashboards**: http://localhost:3000 (admin/admin)
    - **Prometheus**: http://localhost:9090
    - **RabbitMQ Management**: http://localhost:15672 (guest/guest)
@@ -74,16 +78,16 @@ The default `docker-compose.yml` includes the Infinity embeddings service (BAAI/
 Upload a document and query it:
 
 ```bash
-# Upload a document
-curl -X POST http://localhost:8090/v1/documents/upload \
+# Upload a document (Gate on 8092 in this setup)
+curl -X POST http://localhost:8092/v1/documents/upload \
   -F "file=@/path/to/your/document.pdf" \
   -F "filename=test.pdf"
 
 # Wait for ingestion to complete (check status)
-curl http://localhost:8090/v1/documents/{doc_id}/status
+curl http://localhost:8092/v1/documents/{doc_id}/status
 
 # Query the document
-curl -X POST http://localhost:8090/v1/chat \
+curl -X POST http://localhost:8092/v1/chat \
   -H "Content-Type: application/json" \
   -d '{"query": "What is this document about?", "stream": false}'
 ```
@@ -95,12 +99,12 @@ curl -X POST http://localhost:8090/v1/chat \
 The system consists of **8 microservices** organized into application, ML, and infrastructure layers:
 
 #### Application Services
-- **rag-gate** (`:8090`) - FastAPI gateway; orchestrates uploads, chat, and streaming responses
-- **retrieval** (`:8080`) - Hybrid search engine (BM25 + vectors); stateless and horizontally scalable
+- **rag-gate** (`:8092`) - FastAPI gateway; orchestrates uploads, chat, and streaming responses (internal port `:8090`)
+- **retrieval** (`:8085`) - Hybrid search engine (BM25 + vectors); stateless and horizontally scalable (internal port `:8080`)
 - **document-storage** (`:8081`) - Stores document bytes (S3-compatible) and metadata (Postgres)
 - **doc-processor** (`:8082`) - Async worker for document extraction, chunking, and indexing
-- **agent-search** (`:8091`) - Agentic multi-turn research queries with execution traces
-- **ui** (`:3300`) - Nginx-served SPA with SSE streaming support
+- **agent-search** (`:8093`, profile `agent-search`) - LLM-driven search: plan, HyDE, fact queries, retry
+- **ui** (`:3301`) - Nginx-served SPA with SSE streaming support
 
 #### ML/Embedding Services
 - **infinity** (`:7997`) - BAAI/bge-m3 multilingual embeddings (1024-dim, 100+ languages)
@@ -141,19 +145,30 @@ The system consists of **8 microservices** organized into application, ML, and i
 - **VLM Extraction**: High-accuracy document-to-text via Vision-Language Models
 - **Async Ingestion**: RabbitMQ-based pipeline with retry and dead-letter queue
 - **Streaming Chat**: Server-Sent Events (SSE) for real-time responses
-- **Agentic Search**: Multi-turn research queries with execution trace display
 - **Auto-Tuning**: Optional LLM-based parameter optimization via router
 - **Full Observability**: Prometheus metrics, Grafana dashboards, structured logs
 
+### Agent-Search
+
+LLM-driven search (profile `agent-search`): plan → Gate.chat → quality check → fact queries → answer, with optional web search.
+
+| Service | Port | Description |
+|---------|------|-------------|
+| **agent-search** | 8093 | Plan → Gate.chat → quality check → fact queries → answer (optional web search, citation [1][2]) |
+
+**Features:** Web search (Serper/Tavily), per-request limits (`max_llm_calls`, `max_fact_queries`), feature flags (`use_hyde`, `use_fact_queries`, `use_retry`), mode presets (`minimal`/`conservative`/`aggressive`), Prometheus metrics.
+
+See **[docs/AGENT_SEARCH.md](./docs/AGENT_SEARCH.md)** for API reference and configuration.
+
 ## Current Direction
 
-- ✅ Hybrid retrieval (BM25 + vectors) with RRF fusion
-- ✅ VLM-based document extraction (Granite-Docling)
-- ✅ Agentic search with streaming and traces
-- ✅ Advanced retrieval features (multi-query, two-pass, reranking)
-- ✅ Full observability stack (Prometheus, Grafana, structured logging)
-- 🔄 Exploring GraphRAG approaches and continuous knowledge graph updates
-- 🔄 Benchmarking with BRIGHT, T²-RAGBench, and custom datasets
+- Hybrid retrieval (BM25 + vectors) with RRF fusion
+- VLM-based document extraction (Granite-Docling)
+- SOTA: semantic chunking, contextual headers, local reranker
+- Multi-query, two-pass retrieval, reranking
+- Observability: Prometheus, Grafana, structured logging
+- BRIGHT chunk tuning: `scripts/bright_tune_chunking.py` (full benchmark: `--splits all --eval-splits all --docs-from-gold 100000`). Default chunking: **semchunk** 512/50 in `docker-compose.yml`; for **semantic** 512/50 use `docker-compose-semantic.yml` override.
+- Exploring GraphRAG, T²-RAGBench and custom benchmarks
 
 ## Planned Work
 
@@ -192,10 +207,11 @@ python -m app.main
 - Update `service/app/fusion.py` (RRF fusion and reranking)
 
 **Changing chunking:**
-- Update `service/app/chunking.py` or `doc-processor/app/chunker.py`
+- Retrieval (mode=document): `service/app/chunking.py` — strategies `semchunk` (default, 512/50) or `semantic` (section-based). Default: `docker-compose.yml` uses semchunk; for semantic 512/50 run with `-f docker-compose-semantic.yml`. Params: `RAG_CHUNK_STRATEGY`, `RAG_CHUNK_MAX_TOKENS`, `RAG_CHUNK_OVERLAP_TOKENS`.
+- Doc-processor: `doc-processor/app/chunking.py` when using pre-chunked input.
 
 **Adding API endpoints:**
-- Update `gate/app/router.py` for new routes
+- Update `gate/app/main.py` for new routes
 - Modify respective service `main.py` files
 
 **Modifying embeddings:**
@@ -203,21 +219,29 @@ python -m app.main
 
 ### Testing
 
-**Run E2E tests:**
+**BRIGHT benchmark** (index + retrieval-only eval; chunk tuning):
+
+Index documents and run eval (single domain, e.g. biology):
 ```bash
-cd pipeline-tests
-pytest tests/
+python scripts/index_bright.py --retrieval-url http://localhost:8085 --splits biology --docs-from-gold 500 --project-id bright
+python scripts/bright_eval.py --retrieval-url http://localhost:8085 --bright-split biology --project-id bright --out results/bright_eval.jsonl
 ```
 
-**Run BRIGHT benchmark:**
+Tune chunking parameters on BRIGHT (multiple configs, optional eval on all 12 domains):
 ```bash
-cd pipeline-tests/bench
-python bright_eval.py --config config.yaml
+# Single domain (fast)
+python scripts/bright_tune_chunking.py --retrieval-url http://localhost:8085 --bright-split biology --docs-from-gold 500
+
+# Full benchmark: all 12 splits, all 1384 queries (use docs-from-gold so gold docs are in index)
+python scripts/bright_tune_chunking.py --retrieval-url http://localhost:8085 --splits all --eval-splits all --docs-from-gold 100000 --configs "256:0,512:0,512:50,1024:50"
 ```
 
-**Evaluate on custom dataset:**
+Results: `results/bright_chunk_tune_summary.json` and table in stdout. Default in this repo: semchunk 512/50; use `docker-compose-semantic.yml` for semantic 512/50.
+
+**BEIR eval** (direct / full pipeline):
 ```bash
-./run_dataset_evals.sh
+python eval/run_rag_baseline.py --gate-url http://localhost:8092 --dataset data/beir/fiqa/queries.jsonl --format beir --output results.json
+python eval/run_rag_ir_metrics.py --results results.json --qrels data/beir/fiqa/qrels_test.tsv --output metrics.json
 ```
 
 ### Monitoring & Debugging
@@ -312,20 +336,28 @@ Content-Type: application/json
 }
 ```
 
-### Agent Search
+### Verifying Agent Services
 
-**Agentic Search:**
 ```bash
-POST /agent/search
-Content-Type: application/json
+# 1. Start services (if not already running)
+docker compose --profile agent-search up -d
 
-{
-  "query": "Research the benefits of hybrid retrieval",
-  "stream": true
-}
+# 2. Full verification: retrieval, gate, agent-search
+python scripts/verify_agent_queries.py
 
-Response: SSE with execution traces
+# 3. Smoke test (retrieval)
+python scripts/smoke_test.py
+
+# 4. Pipeline e2e (upload → chat → delete)
+docker build -t rugfunsota-pipeline-tests -f pipeline-tests/Dockerfile pipeline-tests/
+docker run --rm --network rugfunsota_rag-network \
+  -e GATE_BASE_URL=http://rag-gate:8090 \
+  -e RETRIEVAL_BASE_URL=http://retrieval:8080 \
+  -e STORAGE_BASE_URL=http://document-storage:8081 \
+  rugfunsota-pipeline-tests:latest
 ```
+
+**Note:** Prometheus and Grafana must be in the same compose project as agent-search (rugfunsota) for metrics scrape to work.
 
 ## Configuration
 
@@ -346,15 +378,24 @@ VECTOR_WEIGHT=0.5
 ENABLE_RERANK=true
 RERANK_TOP_K=20
 
-# Chunking
-CHUNK_TOKEN_SIZE=512
-CHUNK_OVERLAP=50
+# Chunking (retrieval: RAG_CHUNK_* in docker-compose.yml; default semchunk 512/50)
+# For semantic 512/50: docker compose -f docker-compose.yml -f docker-compose-semantic.yml up
+RAG_CHUNK_STRATEGY=semchunk
+RAG_CHUNK_MAX_TOKENS=512
+RAG_CHUNK_OVERLAP_TOKENS=50
 
 # Advanced Features
 ENABLE_MULTI_QUERY=false
 ENABLE_TWO_PASS=false
 ENABLE_SEGMENT_STITCHING=true
 ENABLE_ROUTER=false
+
+# Agent-Search (port 8093)
+AGENT_MAX_LLM_CALLS=12
+AGENT_REQUEST_TIMEOUT_S=120
+AGENT_QUALITY_MIN_HITS=3
+AGENT_QUALITY_MIN_SCORE=0.15
+AGENT_ALWAYS_FACT_QUERIES=false
 
 # Worker Configuration
 WORKER_CONCURRENCY=1
@@ -378,11 +419,9 @@ Services that scale horizontally:
 
 ## Documentation
 
-- **[AGENTS.md](./AGENTS.md)** - Comprehensive guide for developers and AI agents
-- **[docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)** - System architecture deep dive
-- **[docs/DATAFLOW.md](./docs/DATAFLOW.md)** - API flows with Mermaid diagrams
-- **[docs/TESTING_AND_BENCHMARKS.md](./docs/TESTING_AND_BENCHMARKS.md)** - Testing and benchmark guides
-- **[docs/PLANNED_ARCHITECTURE.md](./docs/PLANNED_ARCHITECTURE.md)** - Future improvements
+- **[docs/AGENT_SEARCH.md](./docs/AGENT_SEARCH.md)** — Agent-search API
+- **[docs/ENDPOINTS_EXAMPLES.md](./docs/ENDPOINTS_EXAMPLES.md)** — Retrieval API examples
+- **[docs/gate/GATE_API.md](./docs/gate/GATE_API.md)** — Gate API
 
 ## Technology Stack
 
@@ -422,18 +461,17 @@ Services that scale horizontally:
 2. Check timeout settings: `DOCLING_TIMEOUT`
 3. Monitor vLLM service health: `curl http://localhost:8123/health`
 
-For detailed troubleshooting, see [AGENTS.md - Debug Checklist](./AGENTS.md#debug-checklist).
+To run this stack as rugfunsota, use the docker-compose files in this repo with project name `rugfunsota` (e.g. `docker compose -p rugfunsota up -d`).
 
 ## Status
 
 **Current Status:** Active Development
 
-- ✅ Core hybrid retrieval pipeline functional
-- ✅ VLM-based document processing working
-- ✅ Agentic search implemented
-- ✅ Full monitoring stack deployed
-- 🔄 Exploring GraphRAG integration
-- 🔄 Expanding benchmark coverage
+- Core hybrid retrieval pipeline functional
+- VLM-based document processing working
+- SOTA: semantic chunking, CCH, local reranker
+- Full monitoring stack deployed
+- Exploring GraphRAG integration and benchmark coverage
 
 **Stability:** Experimental - expect breaking changes as new approaches are tested.
 

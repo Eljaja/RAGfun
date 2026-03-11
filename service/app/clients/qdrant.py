@@ -88,6 +88,18 @@ class QdrantFacade:
         flt = qm.Filter(must=[qm.FieldCondition(key="doc_id", match=qm.MatchValue(value=doc_id))])
         self.client.delete(collection_name=self.collection, points_selector=qm.FilterSelector(filter=flt), wait=True)
 
+    def delete_by_doc_ids(self, doc_ids: list[str], *, batch_size: int = 1000) -> None:
+        """
+        Delete all points matching any of the given doc_ids.
+        Batched to avoid filter size limits.
+        """
+        if not doc_ids:
+            return
+        for i in range(0, len(doc_ids), batch_size):
+            batch = doc_ids[i : i + batch_size]
+            flt = qm.Filter(must=[qm.FieldCondition(key="doc_id", match=qm.MatchAny(any=batch))])
+            self.client.delete(collection_name=self.collection, points_selector=qm.FilterSelector(filter=flt), wait=True)
+
     def search(self, vector: list[float], flt: qm.Filter | None, limit: int) -> list[qm.ScoredPoint]:
         return self.client.search(
             collection_name=self.collection,

@@ -58,6 +58,13 @@ class Settings(BaseSettings):
     bm25_anchor_top_k: int = 30
     bm25_anchor_rrf_k: int = 60
 
+    # Adaptive-k: cut at steepest score drop (optional)
+    adaptive_k_enabled: bool = False
+    # Multi-query: when to apply adaptive-k. off | after_rrf
+    adaptive_k_multi_query: str = "off"
+    adaptive_k_min: int = 3
+    adaptive_k_max: int = 24
+
     # Context packing (segment stitching)
     segment_stitching_enabled: bool = False
     segment_stitching_max_chunks: int = 4
