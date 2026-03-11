@@ -1,0 +1,14 @@
+[project]
+name = "retrieval"
+version = "0.1.0"
+description = "Retrieval microservice — hybrid vector + BM25 search with reranking"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.128.0",
+    "httpx[http2]>=0.28.1",
+    "opensearch-py[async]>=3.1.0",
+    "pydantic-settings>=2.12.0",
+    "qdrant-client>=1.16.2",
+    "uvicorn>=0.40.0",
+]
