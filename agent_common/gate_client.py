@@ -77,6 +77,7 @@ class AsyncGateClient:
         use_adaptive_k: bool | None = None,
         filters: dict[str, Any] | None = None,
         include_sources: bool = True,
+        headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Call gate /v1/chat and return normalized response with hits, context, sources."""
         url = f"{self._base_url}/v1/chat"
@@ -99,7 +100,7 @@ class AsyncGateClient:
             reraise=True,
         )
         async def _call() -> dict[str, Any]:
-            resp = await client.post(url, json=payload, timeout=self._timeout_s)
+            resp = await client.post(url, json=payload, timeout=self._timeout_s, headers=headers)
             resp.raise_for_status()
             return resp.json()
 

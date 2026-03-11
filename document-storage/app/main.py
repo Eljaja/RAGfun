@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import logging
 import time
@@ -11,6 +12,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, Response, Uploa
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import StreamingResponse, JSONResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from pydantic import BaseModel, Field
 
 from app.config import Settings, load_settings
 from app.database import DatabaseClient
@@ -46,6 +48,55 @@ class AppState:
 
 
 state = AppState()
+
+
+def _admin_secret_ok(request: Request) -> bool:
+    """Check admin secret header against STORAGE_ODS_ADMIN_SECRET (if set)."""
+    s = getattr(state, "settings", None)
+    if s is None or s.ods_admin_secret is None:
+        return False
+    provided = (request.headers.get("X-ODS-ADMIN-SECRET") or "").strip()
+    if not provided:
+        return False
+    try:
+        expected = s.ods_admin_secret.get_secret_value()
+    except Exception:
+        expected = ""
+    return bool(expected) and provided == expected
+
+
+def _ods_salt_value() -> str | None:
+    s = getattr(state, "settings", None)
+    if s is None or s.ods_api_key_salt is None:
+        return None
+    try:
+        v = s.ods_api_key_salt.get_secret_value()
+    except Exception:
+        return None
+    v = (v or "").strip()
+    return v or None
+
+
+class TenantCreateRequest(BaseModel):
+    tenant_id: str = Field(..., description="Tenant identifier")
+    name: str | None = Field(default=None, description="Optional display name")
+    label: str | None = Field(default=None, description="Optional API key label")
+
+
+class TenantCreateResponse(BaseModel):
+    ok: bool = True
+    tenant_id: str
+    api_key: str
+    api_key_id: int
+
+
+class IssueApiKeyRequest(BaseModel):
+    label: str | None = Field(default=None, description="Optional API key label")
+
+
+class ResolveResponse(BaseModel):
+    ok: bool = True
+    tenant_id: str
 
 
 @asynccontextmanager
@@ -209,6 +260,78 @@ async def version():
     return {"service": {"name": state.settings.service_name}, "config": state.settings.safe_summary()}
 
 
+@app.post("/v1/tenants", response_model=TenantCreateResponse)
+async def create_tenant(payload: TenantCreateRequest, request: Request, response: Response):
+    """Admin-only: create tenant + issue first API key (plaintext returned once)."""
+    if state.config_error:
+        response.status_code = 503
+        return {"ok": False, "error": "config_error", "detail": state.config_error}
+    if not state.db:
+        response.status_code = 503
+        return {"ok": False, "error": "db_unavailable"}
+    if not _admin_secret_ok(request):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    salt = _ods_salt_value()
+    try:
+        out = await _run_sync(
+            state.db.create_tenant_with_key,
+            tenant_id=payload.tenant_id,
+            name=payload.name,
+            salt=salt,
+            label=payload.label,
+        )
+        return {
+            "ok": True,
+            "tenant_id": out["tenant_id"],
+            "api_key": out["api_key"],
+            "api_key_id": out["api_key_id"],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/v1/tenants/{tenant_id}/api-keys")
+async def issue_api_key(tenant_id: str, payload: IssueApiKeyRequest, request: Request, response: Response):
+    """Admin-only: issue new API key for tenant (plaintext returned once)."""
+    if state.config_error:
+        response.status_code = 503
+        return {"ok": False, "error": "config_error", "detail": state.config_error}
+    if not state.db:
+        response.status_code = 503
+        return {"ok": False, "error": "db_unavailable"}
+    if not _admin_secret_ok(request):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    salt = _ods_salt_value()
+    try:
+        out = await _run_sync(state.db.issue_api_key, tenant_id=tenant_id, salt=salt, label=payload.label)
+        return {"ok": True, **out}
+    except ValueError as e:
+        if str(e) == "tenant_not_found":
+            raise HTTPException(status_code=404, detail="tenant_not_found")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/v1/auth/resolve", response_model=ResolveResponse)
+async def resolve_tenant(request: Request, response: Response):
+    """Resolve tenant_id by API key. Used by Gate to enforce tenant isolation."""
+    if state.config_error:
+        response.status_code = 503
+        return {"ok": False, "error": "config_error", "detail": state.config_error}
+    if not state.db:
+        response.status_code = 503
+        return {"ok": False, "error": "db_unavailable"}
+    api_key = (request.headers.get("X-ODS-API-KEY") or "").strip()
+    if not api_key:
+        raise HTTPException(status_code=401, detail="missing_api_key")
+    salt = _ods_salt_value()
+    tenant_id = await _run_sync(state.db.resolve_tenant_by_api_key, api_key=api_key, salt=salt)
+    if not tenant_id:
+        raise HTTPException(status_code=401, detail="invalid_api_key")
+    return {"ok": True, "tenant_id": tenant_id}
+
+
 @app.get("/v1/metrics")
 async def metrics():
     # Refresh "capacity" gauges from DB on scrape (cheap enough for small dev DB)
@@ -286,9 +409,11 @@ async def store_document(
             **metadata_dict,
         }
 
-        # Store file
+        # Store file (backend expects file-like with .read(); we have bytes from await file.read())
         with LAT.labels(stage="store_file").time():
-            storage_id = await _run_sync(state.storage.store, doc_id, content, content_type)
+            storage_id, _stored_size, _content_hash = await _run_sync(
+                state.storage.store, doc_id, io.BytesIO(content), content_type
+            )
 
         # Deduplication (exact, bytes-level): storage_id is deterministic (sha256-based) for both local and s3 backends.
         duplicate_of: str | None = None

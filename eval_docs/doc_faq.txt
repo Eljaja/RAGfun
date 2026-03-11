@@ -1,0 +1,1 @@
+FAQ. Q: Как включить tenant auth? A: GATE_REQUIRE_TENANT_AUTH=true. Q: Какой ключ передавать? A: X-ODS-API-KEY. Q: Где создаётся тенант? A: POST /v1/tenants с X-ODS-ADMIN-SECRET. Q: Чем agent-search отличается от deep-research? A: Agent — один проход с plan/HyDE/fact_queries; Deep — итеративный research loop с несколькими циклами. Q: Какой порт у UI? A: 3301.

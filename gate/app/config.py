@@ -73,6 +73,12 @@ class Settings(BaseSettings):
     # HTTP / UI
     cors_allow_origins: str = "*"  # for dev, can be narrowed
 
+    # ODS tenant enforcement (\"full ODS\")
+    # When enabled, Gate requires X-ODS-API-KEY (or Authorization: Bearer ...) and resolves tenant_id via document-storage.
+    require_tenant_auth: bool = False
+    api_key_header: str = "X-ODS-API-KEY"
+    tenant_cache_ttl_s: float = 300.0
+
     def safe_summary(self) -> dict:
         return {
             "service": {"name": self.service_name, "environment": self.environment},
@@ -105,6 +111,11 @@ class Settings(BaseSettings):
                 "timeout_s": self.doc_processor_timeout_s,
             },
             "queue": {"rabbit_url_set": bool(self.rabbit_url), "rabbit_queue": self.rabbit_queue},
+            "ods": {
+                "require_tenant_auth": bool(self.require_tenant_auth),
+                "api_key_header": self.api_key_header,
+                "tenant_cache_ttl_s": self.tenant_cache_ttl_s,
+            },
         }
 
 

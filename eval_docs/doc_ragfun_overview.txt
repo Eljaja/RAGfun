@@ -1,0 +1,1 @@
+RAGfun — платформа для RAG (Retrieval-Augmented Generation). Она объединяет загрузку документов, векторизацию и чат с изоляцией по тенантам (ODS). Поддерживает hybrid retrieval (BM25 + vector), rerank, streaming ответов. Сервисы: Gate, document-storage, retrieval (Qdrant + OpenSearch), doc-processor, agent-search, deep-research.

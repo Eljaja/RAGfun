@@ -32,6 +32,13 @@ class Settings(BaseSettings):
     max_file_size_mb: int = 100
     allowed_content_types: str = "text/plain,text/markdown,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
+    # ODS admin + tenant API keys (optional; used for \"full ODS\" tenant enforcement in Gate)
+    # When admin_secret is set, the admin endpoints (/v1/tenants, /v1/tenants/{id}/api-keys) require it.
+    ods_admin_secret: SecretStr | None = None
+    # Salt is used to hash API keys before storing them in Postgres (sha256(salt + key)).
+    # If empty/unset, hashing still works but key rotation becomes riskier; strongly prefer setting.
+    ods_api_key_salt: SecretStr | None = None
+
     def safe_summary(self) -> dict:
         """Configuration summary without secrets."""
         return {
@@ -54,6 +61,10 @@ class Settings(BaseSettings):
             "limits": {
                 "max_file_size_mb": self.max_file_size_mb,
                 "allowed_content_types": self.allowed_content_types.split(","),
+            },
+            "ods": {
+                "admin_secret_set": self.ods_admin_secret is not None,
+                "api_key_salt_set": self.ods_api_key_salt is not None,
             },
         }
 

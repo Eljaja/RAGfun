@@ -1,5 +1,5 @@
 """
-Web search client for agent-search.
+Web search client for agent-search and deep-research.
 
 Supports Serper (Google Search API) and Tavily. Set WEB_SEARCH_PROVIDER=serper|tavily
 and the corresponding API key. When unset or empty key, web search is disabled.
