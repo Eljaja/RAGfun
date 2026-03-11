@@ -1,13 +1,21 @@
-"""Main FastAPI application for RAG Gate."""
+from __future__ import annotations
 
+import asyncio
+import logging
+import re
+import time
+import uuid
+import unicodedata
 from contextlib import AsyncExitStack, asynccontextmanager
 
-from fastapi import FastAPI
+import httpx
+import json
+from collections import Counter as CollCounter
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
-from agent_common.retrieval import adaptive_k_cutoff
 from app.clients import DocProcessorClient, DocumentStorageClient, LLMClient, RetrievalClient
 from app.config import Settings, load_settings
 from app.html_text import html_to_text
@@ -15,8 +23,8 @@ from app.logging_setup import setup_json_logging
 from app.models import ChatRequest, ChatResponse, ContextChunk, Source
 from app.queue import RabbitPublisher
 from app.rag import build_context_blocks, build_messages
+from app.router import build_router_messages, parse_router_decision
 from rapidfuzz import fuzz
-from typing import Any
 
 logger = logging.getLogger("gate")
 
@@ -52,12 +60,6 @@ HTTP_RESP_SIZE = Histogram(
 GATE_REFUSALS = Counter("gate_refusals_total", "Refusals (answer == 'I don't know')", ["endpoint"])
 GATE_DEGRADED = Counter("gate_degraded_total", "Degradation events", ["kind"])
 GATE_PARTIAL = Counter("gate_partial_total", "Partial responses", ["endpoint"])
-# Adaptive-k: number of chunks after cutoff (multi-query after_rrf only)
-GATE_ADAPTIVE_K_CHUNKS = Histogram(
-    "gate_adaptive_k_chunks",
-    "Number of chunks after adaptive-k cutoff (Gate, after_rrf)",
-    buckets=(1, 2, 3, 5, 8, 10, 15, 20, 25, 30, 50),
-)
 
 # Pre-create common label series so Grafana panels show 0 instead of "No data" right after startup.
 GATE_REFUSALS.labels(endpoint="/v1/chat").inc(0)
@@ -86,7 +88,7 @@ def _norm_query(q: str) -> str:
 
 
 def _strip_diacritics(s: str) -> str:
-    # Normalize combining accents for answer matching (e.g. Cyrillic with stress marks).
+    # Helps matching answers like "Улья́новск" vs "Ульяновск" (combining accents).
     s = unicodedata.normalize("NFKD", s or "")
     return "".join(ch for ch in s if not unicodedata.combining(ch))
 
@@ -124,6 +126,54 @@ def _answer_is_in_context(*, answer: str, context_text: str) -> bool:
     n_ans = _norm_text_for_contains(ans)
     n_ctx = _norm_text_for_contains(ctx)
     return bool(n_ans and n_ctx and n_ans in n_ctx)
+
+
+async def _enforce_extractive_or_refuse(
+    *,
+    llm: LLMClient,
+    messages: list[dict[str, str]],
+    answer: str,
+    context_text: str,
+) -> str:
+    """
+    Best-effort anti-hallucination for factoid QA when include_sources=False:
+    if the produced short answer is not present in sources, do one rewrite attempt
+    forcing a verbatim span. If it still fails, refuse.
+    """
+    ans = (answer or "").strip()
+    if not ans:
+        return ans
+    ctx = (context_text or "").strip()
+    if not ctx:
+        return ans
+
+    # Apply only to short answers (entity/one-liner). Lists are hard to substring-match reliably.
+    ans_toks = _TOKEN_RE.findall(ans)
+    if len(ans_toks) > 6:
+        return ans
+    if "," in ans or "\n" in ans:
+        return ans
+
+    n_ans = _norm_text_for_contains(ans)
+    n_ctx = _norm_text_for_contains(ctx)
+    if n_ans and n_ans in n_ctx:
+        return ans
+
+    rewrite_prompt = (
+        "Your previous answer is NOT a verbatim span from the provided Sources.\n"
+        "Rewrite your answer STRICTLY as follows:\n"
+        "- Output ONLY the exact answer phrase copied verbatim from Sources (no extra words).\n"
+        "- Do NOT add citations like [1].\n"
+        "- If the exact answer phrase is not explicitly present in Sources, reply exactly with \"I don't know\" (English) OR \"Не знаю.\" (Russian), matching the user's language.\n"
+    )
+    retry_messages = list(messages) + [{"role": "user", "content": rewrite_prompt}]
+    rewritten = (await llm.chat(messages=retry_messages)).strip()
+    if rewritten == "I don't know":
+        return rewritten
+    n_rew = _norm_text_for_contains(rewritten)
+    if n_rew and n_rew in n_ctx:
+        return rewritten
+    return "I don't know"
 
 
 def _dedupe_queries(qs: list[str], *, threshold: int = 92) -> list[str]:
@@ -331,11 +381,6 @@ def _rrf_merge_hits_by_chunk_id(
     return merged
 
 
-def _get_hit_score(h: dict[str, Any], score_key: str = "multi_rrf_score") -> float:
-    s = (h.get("metadata") or {}).get(score_key) or h.get("score")
-    return float(s) if s is not None else 0.0
-
-
 async def _apply_bm25_anchor_pass(
     *,
     retrieval: RetrievalClient,
@@ -367,7 +412,6 @@ async def _apply_bm25_anchor_pass(
             mode="bm25",
             top_k=anchor_top_k,
             rerank=False,
-            use_adaptive_k=False,
             filters=filters,
             acl=payload.acl,
             include_sources=payload.include_sources,
@@ -403,39 +447,26 @@ def _extract_hint_terms_from_hits(hits: list[dict[str, Any]], *, max_terms: int)
     Best-effort: extract a few 'anchor' terms from top hits to build a follow-up query.
     Keep it conservative to avoid query drift.
     """
-    # Gather raw candidate terms from the first few hits
-    raw_candidates = [
-        term
-        for h in hits[:8]
-        for term in (
-            _YEAR_RE.findall(str(h.get("text") or ""))
-            + [t for t in _TOKEN_RE.findall(str(h.get("text") or "")) if len(t) >= 4][:20]
-        )
-    ]
-
-    # Normalise, strip empties, dedupe exact matches and keep the longest ones
-    candidates = sorted(
-        {c.strip() for c in raw_candidates if c and c.strip()},
-        key=lambda s: (-len(s), s),
-    )[: max_terms * 3]
-
-    # Helper to decide fuzzy similarity
-    def _is_similar(a: str, b: str) -> bool:
-        return fuzz.token_set_ratio(_norm_query(a), _norm_query(b)) >= 92
-
-    # Build a list of distinct terms in a functional style (no mutation, no break)
-    from functools import reduce
-
-    def _reducer(acc: list[str], cand: str) -> list[str]:
-        norm = _norm_query(cand)
-        if not norm:
-            return acc
-        if any(_is_similar(cand, u) for u in acc):
-            return acc
-        # Return a new list with the candidate added
-        return acc + [cand]
-
-    uniq = reduce(_reducer, candidates, [])[:max_terms]
+    cand: list[str] = []
+    for h in hits[:8]:
+        t = str(h.get("text") or "")
+        # Pull years and capitalized-ish tokens (in practice, proper nouns in English pages)
+        cand.extend(_YEAR_RE.findall(t))
+        cand.extend([x for x in _TOKEN_RE.findall(t) if len(x) >= 4][:20])
+    # Normalize and prefer longer distinct terms; dedupe with fuzzy matching
+    cand = [c.strip() for c in cand if c and c.strip()]
+    cand = sorted(set(cand), key=lambda s: (-len(s), s))[: max_terms * 3]
+    # Keep only a few, fuzzy-deduped
+    uniq: list[str] = []
+    for x in cand:
+        nx = _norm_query(x)
+        if not nx:
+            continue
+        if any(fuzz.token_set_ratio(nx, _norm_query(u)) >= 92 for u in uniq):
+            continue
+        uniq.append(x)
+        if len(uniq) >= max_terms:
+            break
     return uniq
 
 
@@ -448,20 +479,35 @@ def _unique_doc_count(hits: list[dict[str, Any]]) -> int:
     return len(s)
 
 
-def _inc_count(d: dict[str, int], key: str, *, n: int = 1) -> None:
-    if not key:
-        key = "unknown"
-    try:
-        d[key] = int(d.get(key) or 0) + int(n)
-    except Exception:
-        d[key] = int(n)
+async def _enforce_citations_or_refuse(
+    *,
+    llm: LLMClient,
+    messages: list[dict[str, str]],
+    answer: str,
+    refs: list[int],
+) -> str:
+    """
+    If sources exist and the model returned an answer without citations, do one strict rewrite attempt.
+    If it still fails, refuse (to avoid "fake grounding" by auto-adding citations).
+    """
+    if not refs:
+        return answer
+    if _has_inline_citations(answer):
+        return answer
 
-
-def _ingestion_state_from_doc(doc: dict[str, Any]) -> str:
-    ing = (doc or {}).get("extra") or {}
-    ing = ing.get("ingestion") if isinstance(ing, dict) else None
-    state = (ing or {}).get("state")
-    return str(state).strip().lower() if state else "unknown"
+    suffix = "".join([f"[{r}]" for r in refs])
+    rewrite_prompt = (
+        "Rewrite your answer to comply STRICTLY with citations.\n"
+        f"- Every factual claim MUST include inline citations like {suffix}\n"
+        "- If you cannot answer using the provided sources, reply exactly: \"I don't know\" (no citations).\n"
+        "- Do NOT add any facts, numbers, commands, or code that are not explicitly present in the sources.\n"
+        "- Do NOT use generic advice or filler.\n"
+    )
+    retry_messages = list(messages) + [{"role": "user", "content": rewrite_prompt}]
+    rewritten = await llm.chat(messages=retry_messages)
+    if _has_inline_citations(rewritten) or rewritten.strip() == "I don't know":
+        return rewritten
+    return "I don't know"
 
 
 class AppState:
@@ -469,6 +515,7 @@ class AppState:
     config_error: str | None = None
     retrieval: RetrievalClient | None = None
     llm: LLMClient | None = None
+    router_llm: LLMClient | None = None
     storage: DocumentStorageClient | None = None
     doc_processor: DocProcessorClient | None = None
     publisher: RabbitPublisher | None = None
@@ -478,40 +525,54 @@ state = AppState()
 
 
 @asynccontextmanager
-async def combined_lifespan(app: FastAPI):
-    """Combine multiple lifespan contexts."""
-    async with AsyncExitStack() as stack:
-        # Enter all context managers
-        await stack.enter_async_context(rag_lifespan(app))
-        await stack.enter_async_context(presign_lifespan(app))
+async def lifespan(app: FastAPI):
+    try:
+        state.settings = load_settings()
+    except Exception as e:
+        state.config_error = str(e)
+        setup_json_logging("INFO")
+        logger.error("config_error", extra={"extra": {"error": state.config_error}})
         yield
-        # All will be properly cleaned up even if errors occur
+        return
+
+    setup_json_logging(state.settings.log_level)
+    state.retrieval = RetrievalClient(base_url=str(state.settings.retrieval_url), timeout_s=state.settings.retrieval_timeout_s)
+    state.llm = LLMClient(
+        provider=state.settings.llm_provider,
+        base_url=str(state.settings.llm_base_url) if state.settings.llm_base_url else None,
+        api_key=state.settings.llm_api_key.get_secret_value() if state.settings.llm_api_key else None,
+        model=state.settings.llm_model,
+        timeout_s=state.settings.llm_timeout_s,
+    )
+    if state.settings.router_enabled:
+        state.router_llm = LLMClient(
+            provider=state.settings.router_llm_provider,
+            base_url=str(state.settings.router_llm_base_url) if state.settings.router_llm_base_url else None,
+            api_key=state.settings.router_llm_api_key.get_secret_value() if state.settings.router_llm_api_key else None,
+            model=state.settings.router_llm_model,
+            timeout_s=state.settings.router_llm_timeout_s,
+        )
+    if state.settings.storage_url:
+        state.storage = DocumentStorageClient(base_url=str(state.settings.storage_url), timeout_s=state.settings.storage_timeout_s)
+    if state.settings.doc_processor_url:
+        state.doc_processor = DocProcessorClient(
+            base_url=str(state.settings.doc_processor_url),
+            timeout_s=state.settings.doc_processor_timeout_s,
+        )
+    if state.settings.rabbit_url:
+        state.publisher = RabbitPublisher(url=str(state.settings.rabbit_url), queue_name=state.settings.rabbit_queue)
+        try:
+            await state.publisher.start()
+        except Exception as e:
+            # Degrade gracefully, but keep the publisher object:
+            # it can reconnect lazily on the first publish attempt.
+            logger.error("rabbit_publisher_init_failed", extra={"extra": {"error": str(e)}})
+    yield
+    if state.publisher:
+        await state.publisher.close()
 
 
-# Create FastAPI app
-app = FastAPI(title="RAG Gate", version="0.1.0", lifespan=combined_lifespan)
 
-# Register exception handlers
-register_exception_handlers(app)
-
-# Include routers
-app.include_router(health_router)
-app.include_router(chat_router)
-app.include_router(documents_router)
-app.include_router(public_router)
-app.include_router(protected_router)
-
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # configured in runtime after settings load; kept permissive for dev
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Add metrics middleware
-app.middleware("http")(http_metrics_middleware)
 
 @app.middleware("http")
 async def http_metrics(request: Request, call_next):
@@ -593,20 +654,80 @@ async def chat(payload: ChatRequest):
     assert state.retrieval is not None
     assert state.llm is not None
 
-    # Defaults (may be overridden by request payload)
+    # Defaults (may be overridden by request payload and/or router)
     mode = payload.retrieval_mode or state.settings.retrieval_mode
+    top_k = payload.top_k or state.settings.top_k
     rerank = payload.rerank
     multi_query_enabled = bool(state.settings.multi_query_enabled)
     two_pass_enabled = bool(state.settings.two_pass_enabled)
     bm25_anchor_enabled = bool(state.settings.bm25_anchor_enabled)
     segment_stitching_enabled = bool(state.settings.segment_stitching_enabled)
-    use_adaptive_k = payload.use_adaptive_k if payload.use_adaptive_k is not None else bool(state.settings.adaptive_k_enabled)
-    adaptive_k_multi = (payload.adaptive_k_multi_query or getattr(state.settings, "adaptive_k_multi_query", "off") or "off").strip().lower()
-    if adaptive_k_multi not in ("off", "after_rrf"):
-        adaptive_k_multi = "off"
 
-    # top_k: request (e.g. from agent plan) overrides config. Agent passes plan's top_k here.
-    top_k = payload.top_k or state.settings.top_k
+    # Optional query router: pick per-request retrieval knobs.
+    router_decision = None
+    if state.settings.router_enabled and state.router_llm is not None:
+        try:
+            with LAT.labels("router").time():
+                router_text = await state.router_llm.chat(
+                    messages=build_router_messages(query=payload.query),
+                    temperature=float(state.settings.router_llm_temperature),
+                    max_tokens=int(state.settings.router_llm_max_tokens),
+                )
+            router_decision = parse_router_decision(router_text)
+        except Exception as e:
+            logger.warning("router_failed", extra={"extra": {"error": str(e)}})
+            router_decision = None
+
+    if router_decision is not None:
+        try:
+            allow_override = bool(getattr(state.settings, "router_override_request_params", False))
+            # Only override mode/top_k/rerank if the caller didn't explicitly provide them.
+            if (allow_override or payload.retrieval_mode is None) and router_decision.retrieval_mode:
+                mode = router_decision.retrieval_mode
+            if (allow_override or payload.top_k is None) and (router_decision.top_k is not None):
+                top_k = max(1, min(40, int(router_decision.top_k)))
+            if (allow_override or payload.rerank is None) and (router_decision.rerank is not None):
+                rerank = bool(router_decision.rerank)
+
+            if router_decision.use_multi_query is not None:
+                multi_query_enabled = bool(router_decision.use_multi_query)
+            if router_decision.use_two_pass is not None:
+                two_pass_enabled = bool(router_decision.use_two_pass)
+            if router_decision.use_bm25_anchor is not None:
+                bm25_anchor_enabled = bool(router_decision.use_bm25_anchor)
+            if router_decision.use_segment_stitching is not None:
+                segment_stitching_enabled = bool(router_decision.use_segment_stitching)
+        except Exception:
+            # Never fail the request due to router parsing/apply issues.
+            router_decision = None
+
+    if router_decision is not None:
+        logger.info(
+            "router_decision",
+            extra={
+                "extra": {
+                    "dry_run": bool(state.settings.router_dry_run),
+                    "override_request_params": bool(getattr(state.settings, "router_override_request_params", False)),
+                    "mode": mode,
+                    "top_k": top_k,
+                    "rerank": rerank,
+                    "multi_query_enabled": multi_query_enabled,
+                    "two_pass_enabled": two_pass_enabled,
+                    "bm25_anchor_enabled": bm25_anchor_enabled,
+                    "segment_stitching_enabled": segment_stitching_enabled,
+                    "reason": getattr(router_decision, "reason", None),
+                }
+            },
+        )
+        # If dry-run, revert to settings-based behavior.
+        if state.settings.router_dry_run:
+            mode = payload.retrieval_mode or state.settings.retrieval_mode
+            top_k = payload.top_k or state.settings.top_k
+            rerank = payload.rerank
+            multi_query_enabled = bool(state.settings.multi_query_enabled)
+            two_pass_enabled = bool(state.settings.two_pass_enabled)
+            bm25_anchor_enabled = bool(state.settings.bm25_anchor_enabled)
+            segment_stitching_enabled = bool(state.settings.segment_stitching_enabled)
 
     filters = payload.filters.model_dump(exclude_none=True) if payload.filters else None
 
@@ -625,7 +746,6 @@ async def chat(payload: ChatRequest):
                     top_k=raw_top_k,
                     # IMPORTANT: keep rerank behavior for q0 (restores quality vs massive refusals).
                     rerank=rerank,
-                    use_adaptive_k=False,
                     filters=filters,
                     acl=payload.acl,
                     include_sources=payload.include_sources,
@@ -657,7 +777,6 @@ async def chat(payload: ChatRequest):
                         top_k=raw_top_k,
                         # Only q0 is reranked; expansions are for recall.
                         rerank=False if q != payload.query else rerank,
-                        use_adaptive_k=False,
                         filters=filters,
                         acl=payload.acl,
                         include_sources=payload.include_sources,
@@ -686,24 +805,14 @@ async def chat(payload: ChatRequest):
                         fused[cid] = fused.get(cid, 0.0) + (1.0 / (rrf_k + rank))
 
                 fused_hits = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)
-                merged_hits = []
+                merged_hits: list[dict[str, Any]] = []
                 for cid, sc in fused_hits[: raw_top_k]:
                     h = dict(hit_by_cid.get(cid) or {})
+                    # Preserve original retrieval score (esp. rerank score). Store fused score separately.
                     md = dict(h.get("metadata") or {})
                     md["multi_rrf_score"] = float(sc)
                     h["metadata"] = md
                     merged_hits.append(h)
-
-                # Adaptive-k on merged RRF list
-                if adaptive_k_multi == "after_rrf" and len(merged_hits) > 1:
-                    merged_hits = adaptive_k_cutoff(
-                        merged_hits,
-                        get_score=lambda h: _get_hit_score(h, "multi_rrf_score"),
-                        min_k=getattr(state.settings, "adaptive_k_min", 3),
-                        max_k=getattr(state.settings, "adaptive_k_max", 24),
-                        cap=max(1, int(top_k)),
-                    )
-                    GATE_ADAPTIVE_K_CHUNKS.observe(len(merged_hits))
 
                 retrieval_json = {
                     "ok": True,
@@ -711,11 +820,8 @@ async def chat(payload: ChatRequest):
                     "partial": any(bool(r.get("partial")) for r in rs if isinstance(r, dict)),
                     "degraded": sorted({d for r in rs if isinstance(r, dict) for d in (r.get("degraded") or [])}),
                     "hits": merged_hits,
-                    "multi_query": {
-                        "queries": queries,
-                        "raw_top_k": raw_top_k,
-                        "adaptive_k_multi_query": adaptive_k_multi,
-                    },
+                    # keep a small debug payload (UI uses it), but don't blow up response size
+                    "multi_query": {"queries": queries, "raw_top_k": raw_top_k},
                 }
             else:
                 retrieval_json = await state.retrieval.search(
@@ -723,7 +829,6 @@ async def chat(payload: ChatRequest):
                     mode=mode,
                     top_k=top_k,
                     rerank=rerank,
-                    use_adaptive_k=use_adaptive_k,
                     filters=filters,
                     acl=payload.acl,
                     include_sources=payload.include_sources,
@@ -769,7 +874,6 @@ async def chat(payload: ChatRequest):
                     mode="bm25",
                     top_k=20,
                     rerank=False,
-                    use_adaptive_k=False,
                     filters={**(filters or {}), "doc_ids": doc_ids},
                     acl=payload.acl,
                     include_sources=False,
@@ -809,9 +913,13 @@ async def chat(payload: ChatRequest):
 
     with LAT.labels("llm").time():
         answer = await state.llm.chat(messages=messages)
-        if not payload.include_sources:
+        if payload.include_sources:
+            refs = [int(s.get("ref")) for s in (sources or []) if s.get("ref") is not None]
+            answer = await _enforce_citations_or_refuse(llm=state.llm, messages=messages, answer=answer, refs=refs)
+        else:
             # ru_eval runs with include_sources=False. For short factoid answers:
-            # If the answer doesn't appear in the provided context, expand within top docs and retry once.
+            # 1) If the answer doesn't appear in the provided context, expand within top docs and retry once.
+            # 2) Enforce "verbatim span from sources" (or refuse) to avoid entity hallucinations.
             if _is_factoid_like_question(payload.query):
                 if not _answer_is_in_context(answer=answer, context_text=context_text):
                     # Expand inside the top doc(s) to fetch a more relevant chunk from the same page.
@@ -833,7 +941,6 @@ async def chat(payload: ChatRequest):
                                     mode="bm25",
                                     top_k=20,
                                     rerank=False,
-                                    use_adaptive_k=False,
                                     filters={**(filters or {}), "doc_ids": [did]},
                                     acl=payload.acl,
                                     include_sources=False,
@@ -882,6 +989,13 @@ async def chat(payload: ChatRequest):
                                 sources = sources2
                                 messages = messages2
                                 answer = answer2
+
+                answer = await _enforce_extractive_or_refuse(
+                    llm=state.llm,
+                    messages=messages,
+                    answer=answer,
+                    context_text=context_text,
+                )
 
     ref_by_key = {(str(s.get("doc_id")), s.get("uri")): s.get("ref") for s in (sources or [])}
 
@@ -1252,106 +1366,6 @@ async def list_documents(
         return {"ok": False, "error": str(e), "documents": [], "total": 0}
 
 
-@app.get("/v1/documents/stats")
-async def documents_stats(
-    source: str | None = None,
-    tags: str | None = None,
-    lang: str | None = None,
-    collections: str | None = None,  # comma-separated project_ids ("collections")
-    page_size: int = 500,
-    max_docs: int = 200_000,
-    include_indexed: bool = True,
-    max_indexed_docs: int = 50_000,
-):
-    """
-    Aggregate document stats server-side to avoid loading all docs in the UI.
-    """
-    if state.config_error:
-        REQS.labels(endpoint="/v1/documents/stats", status="503").inc()
-        return {"ok": False, "error": "config_error", "detail": state.config_error}
-    if not state.storage:
-        REQS.labels(endpoint="/v1/documents/stats", status="503").inc()
-        return {"ok": False, "error": "storage_unavailable"}
-
-    tags_list = [t.strip() for t in (tags or "").split(",") if t.strip()] if tags else None
-    collection_ids = [c.strip() for c in (collections or "").split(",") if c.strip()] if collections else None
-    page_size = max(1, min(int(page_size), 2000))
-    max_docs = max(1, min(int(max_docs), 1_000_000))
-    max_indexed_docs = max(1, min(int(max_indexed_docs), 1_000_000))
-
-    try:
-        stats = await state.storage.documents_stats(
-            source=source,
-            tags=tags_list,
-            lang=lang,
-            project_ids=collection_ids,
-        )
-    except Exception as e:
-        REQS.labels(endpoint="/v1/documents/stats", status="500").inc()
-        logger.error("documents_stats_error", extra={"extra": {"error": str(e)}})
-        return {"ok": False, "error": str(e)}
-
-    if not isinstance(stats, dict) or not stats.get("ok"):
-        REQS.labels(endpoint="/v1/documents/stats", status="500").inc()
-        return {"ok": False, "error": "storage_stats_failed"}
-
-    stats.setdefault("indexed", 0)
-    stats.setdefault("not_indexed", 0)
-
-    indexed_available = bool(state.retrieval)
-    total_docs = int(stats.get("total") or 0)
-    if include_indexed and indexed_available:
-        if total_docs > max_indexed_docs:
-            indexed_available = False
-            stats["indexed_skipped"] = True
-        else:
-            offset = 0
-            indexed = 0
-            not_indexed = 0
-            while offset < total_docs and offset < max_docs:
-                result = await state.storage.search_documents(
-                    source=source,
-                    tags=tags_list,
-                    lang=lang,
-                    project_ids=collection_ids,
-                    limit=page_size,
-                    offset=offset,
-                )
-                docs = list(result.get("documents") or [])
-                if not docs:
-                    break
-                doc_ids = [str(d.get("doc_id")) for d in docs if d.get("doc_id")]
-                indexed_set: set[str] = set()
-                if doc_ids:
-                    try:
-                        exists = await state.retrieval.index_exists(doc_ids=doc_ids)
-                        indexed_set = set(str(x) for x in (exists.get("indexed_doc_ids") or []))
-                    except Exception:
-                        indexed_set = set()
-                        indexed_available = False
-                        break
-
-                for doc_id in doc_ids:
-                    if doc_id in indexed_set:
-                        indexed += 1
-                    else:
-                        not_indexed += 1
-
-                offset += len(docs)
-                if len(docs) < page_size:
-                    break
-
-            if indexed_available:
-                stats["indexed"] = indexed
-                stats["not_indexed"] = not_indexed
-            elif total_docs > max_indexed_docs:
-                stats["indexed_skipped"] = True
-
-    stats["indexed_available"] = indexed_available
-    REQS.labels(endpoint="/v1/documents/stats", status="200").inc()
-    return stats
-
-
 @app.get("/v1/collections")
 async def collections(tenant_id: str | None = None, limit: int = 1000):
     """Proxy: list distinct collections (project_id) from document-storage."""
@@ -1643,14 +1657,50 @@ async def chat_stream(payload: ChatRequest):
     assert state.retrieval is not None
     assert state.llm is not None
 
-    # Defaults (may be overridden by request payload)
+    # Defaults (may be overridden by request payload and/or router)
     mode = payload.retrieval_mode or state.settings.retrieval_mode
-    # top_k: request (e.g. from agent plan) overrides config.
     top_k = payload.top_k or state.settings.top_k
     rerank = payload.rerank
     bm25_anchor_enabled = bool(state.settings.bm25_anchor_enabled)
     segment_stitching_enabled = bool(state.settings.segment_stitching_enabled)
-    use_adaptive_k = payload.use_adaptive_k if payload.use_adaptive_k is not None else bool(state.settings.adaptive_k_enabled)
+
+    # Optional query router: pick per-request retrieval knobs.
+    router_decision = None
+    if state.settings.router_enabled and state.router_llm is not None:
+        try:
+            with LAT.labels("router").time():
+                router_text = await state.router_llm.chat(
+                    messages=build_router_messages(query=payload.query),
+                    temperature=float(state.settings.router_llm_temperature),
+                    max_tokens=int(state.settings.router_llm_max_tokens),
+                )
+            router_decision = parse_router_decision(router_text)
+        except Exception as e:
+            logger.warning("router_failed", extra={"extra": {"error": str(e)}})
+            router_decision = None
+
+    if router_decision is not None:
+        try:
+            allow_override = bool(getattr(state.settings, "router_override_request_params", False))
+            if (allow_override or payload.retrieval_mode is None) and router_decision.retrieval_mode:
+                mode = router_decision.retrieval_mode
+            if (allow_override or payload.top_k is None) and (router_decision.top_k is not None):
+                top_k = max(1, min(40, int(router_decision.top_k)))
+            if (allow_override or payload.rerank is None) and (router_decision.rerank is not None):
+                rerank = bool(router_decision.rerank)
+            if router_decision.use_bm25_anchor is not None:
+                bm25_anchor_enabled = bool(router_decision.use_bm25_anchor)
+            if router_decision.use_segment_stitching is not None:
+                segment_stitching_enabled = bool(router_decision.use_segment_stitching)
+        except Exception:
+            router_decision = None
+
+    if router_decision is not None and state.settings.router_dry_run:
+        mode = payload.retrieval_mode or state.settings.retrieval_mode
+        top_k = payload.top_k or state.settings.top_k
+        rerank = payload.rerank
+        bm25_anchor_enabled = bool(state.settings.bm25_anchor_enabled)
+        segment_stitching_enabled = bool(state.settings.segment_stitching_enabled)
 
     filters = payload.filters.model_dump(exclude_none=True) if payload.filters else None
 
@@ -1664,7 +1714,6 @@ async def chat_stream(payload: ChatRequest):
                         mode=mode,
                         top_k=top_k,
                         rerank=rerank,
-                        use_adaptive_k=use_adaptive_k,
                         filters=filters,
                         acl=payload.acl,
                         include_sources=payload.include_sources,
@@ -1754,7 +1803,11 @@ async def chat_stream(payload: ChatRequest):
 
             # Send final answer and metadata
             full_answer = "".join(answer_parts)
-            # Streaming: keep the model answer as-is (no forced refusals).
+            if payload.include_sources:
+                refs = [int(s.get("ref")) for s in (sources or []) if s.get("ref") is not None]
+                # Streaming: cannot easily re-run the full generation. Enforce strictness by refusing if citations are missing.
+                if refs and not _has_inline_citations(full_answer):
+                    full_answer = "I don't know"
             yield f"data: {json.dumps({'type': 'done', 'answer': full_answer, 'mode': mode, 'degraded': list(degraded), 'partial': partial, 'sources': sources if payload.include_sources else [], 'context': [c.model_dump() for c in ctx]})}\n\n"
 
             REQS.labels(endpoint="/v1/chat/stream", status="200").inc()
@@ -1764,3 +1817,30 @@ async def chat_stream(payload: ChatRequest):
             REQS.labels(endpoint="/v1/chat/stream", status="500").inc()
 
     return StreamingResponse(generate_stream(), media_type="text/event-stream")
+
+
+
+# from object_interaction.presign_main import public_router  # noqa: E402
+
+
+# @asynccontextmanager
+# async def combined_lifespan(app: FastAPI):
+#     async with AsyncExitStack() as stack:
+#         # Enter all context managers
+#         await stack.enter_async_context(lifespan())
+#         await stack.enter_async_context(lifespan2())
+#         # ... add more as needed
+        
+#         yield
+#         # All will be properly cleaned up even if errors occur
+
+app = FastAPI(title="RAG Gate", version="0.1.0", lifespan=lifespan)
+# app.add_route(public_router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # configured in runtime after settings load; kept permissive for dev
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)

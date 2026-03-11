@@ -1,0 +1,76 @@
+from __future__ import annotations
+
+import logging
+from contextlib import asynccontextmanager
+
+import uvicorn
+from fastapi import FastAPI, HTTPException
+
+from config import Settings
+from store import QdrantStore, BM25Store
+from embedder import Embedder
+from reranker import Reranker
+from retriever import HybridRetriever
+from models import RetrieveRequest, RetrieveResponse
+
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    settings = Settings()
+
+    logging.basicConfig(level=settings.log_level)
+    logger.info("Starting retrieval service on port %d", settings.port)
+
+    qdrant = QdrantStore(settings.qdrant_url)
+    bm25 = BM25Store(settings.opensearch_url)
+    embedder = Embedder(
+        settings.embedder_url,
+        settings.embedder_model,
+        timeout=settings.embedder_timeout,
+    )
+    reranker = Reranker(settings.reranker_url, settings.reranker_model)
+
+    app.state.retriever = HybridRetriever(qdrant, bm25, embedder, reranker)
+    app.state.settings = settings
+
+    yield
+
+    await embedder.close()
+    await reranker.close()
+    await bm25.close()
+    await qdrant.close()
+
+
+app = FastAPI(lifespan=lifespan, title="Retrieval Service")
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.post("/retrieve", response_model=RetrieveResponse)
+async def retrieve(body: RetrieveRequest):
+    retriever: HybridRetriever = app.state.retriever
+
+    try:
+        chunks = await retriever.search(
+            query=body.query,
+            collection=body.project_id,
+            top_k=body.top_k,
+            strategy=body.strategy,
+            rerank=body.rerank,
+            rerank_top_n=body.rerank_top_n,
+        )
+    except Exception:
+        logger.exception("Retrieval failed for project %s", body.project_id)
+        raise HTTPException(status_code=502, detail="Retrieval backend error")
+
+    return RetrieveResponse(chunks=chunks, strategy=body.strategy, query=body.query)
+
+
+if __name__ == "__main__":
+    settings = Settings()
+    uvicorn.run(app=app, port=settings.port, host="localhost")

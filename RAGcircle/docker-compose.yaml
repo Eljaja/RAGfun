@@ -1,0 +1,199 @@
+services:
+
+  # ── Storage ──────────────────────────────────────────────
+
+  rustfs:
+    image: rustfs/rustfs:1.0.0-alpha.78
+    command: /data
+    user: "0:0"
+    ports:
+      - "127.0.0.1:9004:9000"
+      - "127.0.0.1:9005:9001"
+    environment:
+      RUSTFS_ACCESS_KEY: rustfs
+      RUSTFS_SECRET_KEY: password
+      RUSTFS_REGION: eu-central
+      # MQTT notifications → RabbitMQ
+      RUSTFS_NOTIFY_MQTT_ENABLE_primary: "on"
+      RUSTFS_NOTIFY_MQTT_BROKER_primary: "tcp://rabbitmqq:1883"
+      RUSTFS_NOTIFY_MQTT_TOPIC_primary: "rustfs/events"
+      RUSTFS_NOTIFY_MQTT_QOS_primary: "1"
+      RUSTFS_NOTIFY_MQTT_USERNAME_primary: "admin"
+      RUSTFS_NOTIFY_MQTT_PASSWORD_primary: "admin"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - rustfs-net
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "127.0.0.1:5438:5432"
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pass
+      POSTGRES_DB: db
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Messaging ────────────────────────────────────────────
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmqq
+    ports:
+      - "127.0.0.1:5676:5672"   # AMQP
+      - "127.0.0.1:15676:15672"            # Management UI
+      - "127.0.0.1:1883:1883"              # MQTT (used by RustFS)
+      - "127.0.0.1:15675:15675"            # Web MQTT
+    command: >
+      bash -lc "rabbitmq-plugins enable --offline rabbitmq_mqtt rabbitmq_web_mqtt &&
+                exec rabbitmq-server"
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin
+    networks:
+      - rustfs-net
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Search ───────────────────────────────────────────────
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "127.0.0.1:8903:6333"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    restart: unless-stopped
+
+  opensearch:
+    image: opensearchproject/opensearch:2
+    ports:
+      - "127.0.0.1:8905:9200"
+    environment:
+      - discovery.type=single-node
+      - plugins.security.disabled=true
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=5a5d5sSS!!13423g!d23s!g2
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    restart: unless-stopped
+
+  # ── Applications ─────────────────────────────────────────
+
+  gate:
+    build:
+      context: ./gate_v2
+    env_file:
+      - ./gate_v2/.env
+    network_mode: host
+    profiles: [apps]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rustfs:
+        condition: service_started
+    restart: unless-stopped
+
+  doc-processor:
+    build:
+      context: ./doc_processor_v2
+    env_file:
+      - ./doc_processor_v2/.env
+    network_mode: host
+    profiles: [apps]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      rustfs:
+        condition: service_started
+    restart: unless-stopped
+
+  retrieval:
+    build:
+      context: ./retrieval_v2
+    env_file:
+      - ./retrieval_v2/.env
+    network_mode: host
+    profiles: [apps]
+    restart: unless-stopped
+
+  generator:
+    build:
+      context: ./generator_v2
+    env_file:
+      - ./generator_v2/.env
+    network_mode: host
+    profiles: [apps]
+    depends_on:
+      - retrieval
+    restart: unless-stopped
+
+  # ── Reverse Proxy ───────────────────────────────────────
+  nginx-gate:
+    image: nginx:alpine
+    network_mode: host
+    profiles: [apps]
+    depends_on:
+      - gate
+    restart: unless-stopped
+    command:
+      - sh
+      - -c
+      - |
+        cat > /etc/nginx/conf.d/default.conf <<'EOF'
+        server {
+            listen 8916;
+            location / {
+                proxy_pass http://localhost:8912;
+                proxy_set_header Host $$host;
+                proxy_set_header X-Real-IP $$remote_addr;
+                proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $$scheme;
+            }
+        }
+        EOF
+        nginx -g 'daemon off;'
+
+  # ── ML ───────────────────────────────────────────────────
+
+  infinity:
+    image: michaelf34/infinity:latest
+    command: v2 --model-id ${EMBEDDING_MODEL:-intfloat/multilingual-e5-base}
+    ports:
+      - "127.0.0.1:8902:7997"
+    environment:
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU_ID:-1}"]
+              capabilities: [gpu]
+    volumes:
+      - infinity-cache:/app/.cache
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  infinity-cache:
+  qdrant-data:
+  opensearch-data:
+
+networks:
+  rustfs-net:
