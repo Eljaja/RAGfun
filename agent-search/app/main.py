@@ -473,6 +473,17 @@ def _with_trace_id(event: dict[str, Any], trace_id: str) -> dict[str, Any]:
     return {**event, "trace_id": trace_id}
 
 
+def _forward_auth_headers(request: Request) -> dict[str, str] | None:
+    """Forward ODS auth headers to Gate (X-ODS-API-KEY preferred)."""
+    k = (request.headers.get("X-ODS-API-KEY") or "").strip()
+    if k:
+        return {"X-ODS-API-KEY": k}
+    a = (request.headers.get("authorization") or request.headers.get("Authorization") or "").strip()
+    if a:
+        return {"Authorization": a}
+    return None
+
+
 async def _gate_chat_once(
     gate: "AsyncGateClient",
     client: httpx.AsyncClient,
@@ -486,6 +497,7 @@ async def _gate_chat_once(
     include_sources: bool,
     history: list | None,
     timeout_s: float,
+    headers: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Returns (result, None) or (None, error_event)."""
     try:
@@ -500,6 +512,7 @@ async def _gate_chat_once(
                 use_adaptive_k=use_adaptive_k,
                 filters=filters,
                 include_sources=include_sources,
+                headers=headers,
             ),
             timeout=timeout_s,
         )
@@ -510,7 +523,7 @@ async def _gate_chat_once(
         return (None, {"type": "error", "error": f"Gate error: {e!s}"})
 
 
-async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncIterator[dict[str, Any]]:
+async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient, *, gate_headers: dict[str, str] | None = None) -> AsyncIterator[dict[str, Any]]:
     # Apply mode preset (conservative/aggressive/minimal) — explicit payload fields override
     preset = AGENT_MODE_PRESETS.get((payload.mode or "").lower()) if payload.mode else {}
     max_llm_calls = payload.max_llm_calls if payload.max_llm_calls is not None else preset.get("max_llm_calls")
@@ -611,7 +624,18 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
                 search_queries = [payload.query]
             yield {"type": "trace", "kind": "tool", "name": "llm.hyde", "payload": {"model": llm_model, "query": payload.query, "lang": answer_lang, "num": len(search_queries)}}
             gate_tasks = [
-                gate.chat(client, q, history=[m for m in payload.history] if payload.history else None, retrieval_mode=mode, top_k=top_k, rerank=rerank, use_adaptive_k=use_adaptive_k, filters=filters, include_sources=payload.include_sources)
+                gate.chat(
+                    client,
+                    q,
+                    history=[m for m in payload.history] if payload.history else None,
+                    retrieval_mode=mode,
+                    top_k=top_k,
+                    rerank=rerank,
+                    use_adaptive_k=use_adaptive_k,
+                    filters=filters,
+                    include_sources=payload.include_sources,
+                    headers=gate_headers,
+                )
                 for q in search_queries
             ]
             hyde_responses = await asyncio.gather(*gate_tasks)
@@ -637,11 +661,18 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
             yield {"type": "trace", "kind": "tool", "name": "gate.chat", "payload": {"query": search_query, "retrieval_mode": mode, "top_k": top_k, "rerank": rerank}}
             AGENT_GATE_CALLS.inc()
             primary, err = await _gate_chat_once(
-                gate, client, search_query,
-                mode=mode, top_k=top_k, rerank=rerank, use_adaptive_k=use_adaptive_k,
-                filters=filters, include_sources=payload.include_sources,
+                gate,
+                client,
+                search_query,
+                mode=mode,
+                top_k=top_k,
+                rerank=rerank,
+                use_adaptive_k=use_adaptive_k,
+                filters=filters,
+                include_sources=payload.include_sources,
                 history=[m for m in payload.history] if payload.history else None,
                 timeout_s=gate_timeout + 15,
+                headers=gate_headers,
             )
             if err:
                 yield err
@@ -651,11 +682,18 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
         yield {"type": "trace", "kind": "tool", "name": "gate.chat", "payload": {"query": search_query, "retrieval_mode": mode, "top_k": top_k, "rerank": rerank}}
         AGENT_GATE_CALLS.inc()
         primary, err = await _gate_chat_once(
-            gate, client, search_query,
-            mode=mode, top_k=top_k, rerank=rerank, use_adaptive_k=use_adaptive_k,
-            filters=filters, include_sources=payload.include_sources,
+            gate,
+            client,
+            search_query,
+            mode=mode,
+            top_k=top_k,
+            rerank=rerank,
+            use_adaptive_k=use_adaptive_k,
+            filters=filters,
+            include_sources=payload.include_sources,
             history=[m for m in payload.history] if payload.history else None,
             timeout_s=gate_timeout + 15,
+            headers=gate_headers,
         )
         if err:
             yield err
@@ -851,7 +889,18 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
         for q in queries:
             yield {"type": "trace", "kind": "tool", "name": "gate.chat", "payload": {"query": q, "retrieval_mode": retry_mode, "top_k": retry_top_k, "rerank": retry_rerank}}
         retry_tasks = [
-            gate.chat(client, q, history=hist, retrieval_mode=retry_mode, top_k=retry_top_k, rerank=retry_rerank, use_adaptive_k=use_adaptive_k, filters=filters, include_sources=payload.include_sources)
+            gate.chat(
+                client,
+                q,
+                history=hist,
+                retrieval_mode=retry_mode,
+                top_k=retry_top_k,
+                rerank=retry_rerank,
+                use_adaptive_k=use_adaptive_k,
+                filters=filters,
+                include_sources=payload.include_sources,
+                headers=gate_headers,
+            )
             for q in queries
         ]
         retry_responses = await asyncio.gather(*retry_tasks)
@@ -874,7 +923,18 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
                 yield {"type": "trace", "kind": "action", "content": f"Fact query: {fq}"}
                 yield {"type": "trace", "kind": "tool", "name": "gate.chat", "payload": {"query": fq, "retrieval_mode": retry_mode, "top_k": max(4, retry_top_k // 2), "rerank": retry_rerank}}
             fact_retry_tasks = [
-                gate.chat(client, fq, history=hist, retrieval_mode=retry_mode, top_k=max(4, retry_top_k // 2), rerank=retry_rerank, use_adaptive_k=use_adaptive_k, filters=filters, include_sources=payload.include_sources)
+                gate.chat(
+                    client,
+                    fq,
+                    history=hist,
+                    retrieval_mode=retry_mode,
+                    top_k=max(4, retry_top_k // 2),
+                    rerank=retry_rerank,
+                    use_adaptive_k=use_adaptive_k,
+                    filters=filters,
+                    include_sources=payload.include_sources,
+                    headers=gate_headers,
+                )
                 for fq in fact_qs
             ]
             fact_retry_responses = await asyncio.gather(*fact_retry_tasks)
@@ -964,7 +1024,7 @@ async def metrics():
 
 
 @app.post("/v1/agent", tags=["agent"])
-async def agent_non_streaming(payload: AgentRequest):
+async def agent_non_streaming(payload: AgentRequest, request: Request):
     """Non-streaming: collect events and return full response as JSON. Use mode=minimal|conservative|aggressive for presets."""
     t0 = time.perf_counter()
     trace_id = uuid.uuid4().hex
@@ -980,7 +1040,8 @@ async def agent_non_streaming(payload: AgentRequest):
     async def _collect() -> None:
         nonlocal answer, sources, context, mode, partial, degraded, error
         async with httpx.AsyncClient() as client:
-            async for event in _run_agent(payload, client):
+            gate_headers = _forward_auth_headers(request)
+            async for event in _run_agent(payload, client, gate_headers=gate_headers):
                 if event.get("type") == "retrieval":
                     context = list(event.get("context") or [])
                 elif event.get("type") == "token":
@@ -1034,7 +1095,8 @@ async def agent_stream(request: Request, payload: AgentRequest):
             await asyncio.sleep(0)
             async with httpx.AsyncClient() as client:
                 try:
-                    agent_it = _run_agent(payload, client)
+                    gate_headers = _forward_auth_headers(request)
+                    agent_it = _run_agent(payload, client, gate_headers=gate_headers)
                     next_timeout_s = float(_env_get("AGENT_STREAM_NEXT_TIMEOUT_S", "65"))
                     while True:
                         try:

@@ -79,6 +79,77 @@ def _has_inline_citations(text: str) -> bool:
     return bool(text) and bool(_CIT_RE.search(text))
 
 
+def _strip_thinking_text(text: str) -> str:
+    """Remove <think>...</think> blocks from LLM output (user should only see final answer)."""
+    if not text or not text.strip():
+        return text
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+
+
+class _ThinkStripper:
+    """
+    Streaming-safe removal of <think>...</think> blocks.
+
+    Handles tags that can be split across chunks by keeping a small buffer.
+    """
+
+    _OPEN = "<think>"
+    _CLOSE = "</think>"
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._in_think = False
+
+    def feed(self, chunk: str) -> str:
+        if not chunk:
+            return ""
+        self._buf += chunk
+        out_parts: list[str] = []
+
+        # Process buffer until no more complete transitions can be made.
+        while True:
+            low = self._buf.lower()
+            if not self._in_think:
+                idx = low.find(self._OPEN)
+                if idx == -1:
+                    # Keep a small tail to handle "<think>" crossing chunk boundary.
+                    keep = len(self._OPEN) - 1
+                    if len(self._buf) <= keep:
+                        return "".join(out_parts)
+                    out_parts.append(self._buf[:-keep])
+                    self._buf = self._buf[-keep:]
+                    return "".join(out_parts)
+                # Emit visible text before "<think>" and drop the tag.
+                if idx > 0:
+                    out_parts.append(self._buf[:idx])
+                self._buf = self._buf[idx + len(self._OPEN) :]
+                self._in_think = True
+                continue
+            else:
+                idx = low.find(self._CLOSE)
+                if idx == -1:
+                    # Keep a small tail to handle "</think>" crossing boundary; drop the rest (thinking).
+                    keep = len(self._CLOSE) - 1
+                    if len(self._buf) <= keep:
+                        return "".join(out_parts)
+                    self._buf = self._buf[-keep:]
+                    return "".join(out_parts)
+                # Drop everything up to and including the closing tag.
+                self._buf = self._buf[idx + len(self._CLOSE) :]
+                self._in_think = False
+                continue
+
+    def finalize(self) -> str:
+        """Return any remaining visible tail (if not inside <think>)."""
+        if self._in_think:
+            return ""
+        if not self._buf:
+            return ""
+        tail = self._buf
+        self._buf = ""
+        return tail
+
+
 _WS_RE = re.compile(r"\s+")
 _QUOTED_RE = re.compile(r"\"([^\"]+)\"|'([^']+)'")
 _YEAR_RE = re.compile(r"\b(18\d{2}|19\d{2}|20\d{2})\b")
@@ -467,9 +538,58 @@ class AppState:
     storage: DocumentStorageClient | None = None
     doc_processor: DocProcessorClient | None = None
     publisher: RabbitPublisher | None = None
+    # ODS tenant auth cache: api_key -> (tenant_id, expires_at)
+    tenant_cache: dict[str, tuple[str, float]] | None = None
 
 
 state = AppState()
+
+
+def _extract_api_key_from_request(*, request: Request, header_name: str) -> str | None:
+    """Extract API key from header (default X-ODS-API-KEY) or Authorization: Bearer."""
+    v = (request.headers.get(header_name) or "").strip()
+    if v:
+        return v
+    auth = (request.headers.get("authorization") or request.headers.get("Authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        tok = auth.split(" ", 1)[1].strip()
+        return tok or None
+    return None
+
+
+async def _require_tenant_id(request: Request) -> str | None:
+    """
+    Resolve tenant_id for this request when GATE_REQUIRE_TENANT_AUTH=true.
+    Returns tenant_id, or None when auth is disabled.
+    """
+    if state.settings is None:
+        return None
+    if not bool(getattr(state.settings, "require_tenant_auth", False)):
+        return None
+    # Need storage to resolve keys.
+    if not state.storage:
+        raise HTTPException(status_code=503, detail="tenant_auth_unavailable (storage_url not configured)")
+
+    header_name = str(getattr(state.settings, "api_key_header", "X-ODS-API-KEY") or "X-ODS-API-KEY")
+    api_key = _extract_api_key_from_request(request=request, header_name=header_name)
+    if not api_key:
+        raise HTTPException(status_code=401, detail="missing_api_key")
+
+    ttl_s = float(getattr(state.settings, "tenant_cache_ttl_s", 300.0) or 300.0)
+    now = time.time()
+    if state.tenant_cache is None:
+        state.tenant_cache = {}
+    cached = state.tenant_cache.get(api_key)
+    if cached:
+        tid, exp = cached
+        if exp > now and tid:
+            return tid
+
+    tid = await state.storage.resolve_tenant(api_key=api_key)
+    if not tid:
+        raise HTTPException(status_code=401, detail="invalid_api_key")
+    state.tenant_cache[api_key] = (tid, now + max(5.0, ttl_s))
+    return tid
 
 
 @asynccontextmanager
@@ -484,6 +604,7 @@ async def lifespan(app: FastAPI):
         return
 
     setup_json_logging(state.settings.log_level)
+    state.tenant_cache = {}
     state.retrieval = RetrievalClient(base_url=str(state.settings.retrieval_url), timeout_s=state.settings.retrieval_timeout_s)
     state.llm = LLMClient(
         provider=state.settings.llm_provider,
@@ -593,7 +714,7 @@ async def metrics():
 
 
 @app.post("/v1/chat", response_model=ChatResponse)
-async def chat(payload: ChatRequest):
+async def chat(payload: ChatRequest, request: Request):
     if state.config_error:
         REQS.labels(endpoint="/v1/chat", status="503").inc()
         return ChatResponse(ok=False, answer=f"config_error: {state.config_error}", used_mode="none")
@@ -618,6 +739,11 @@ async def chat(payload: ChatRequest):
     top_k = payload.top_k or state.settings.top_k
 
     filters = payload.filters.model_dump(exclude_none=True) if payload.filters else None
+    # Full ODS: enforce tenant_id from API key (never trust client-provided tenant_id).
+    tenant_id = await _require_tenant_id(request)
+    if tenant_id:
+        filters = dict(filters or {})
+        filters["tenant_id"] = tenant_id
 
     try:
         with LAT.labels("retrieval").time():
@@ -892,6 +1018,9 @@ async def chat(payload: ChatRequest):
                                 messages = messages2
                                 answer = answer2
 
+    # Never expose model chain-of-thought / <think> blocks to the user.
+    answer = _strip_thinking_text(answer)
+
     ref_by_key = {(str(s.get("doc_id")), s.get("uri")): s.get("ref") for s in (sources or [])}
 
     ctx = []
@@ -938,6 +1067,7 @@ async def chat(payload: ChatRequest):
 
 @app.post("/v1/documents/upload")
 async def upload_document(
+    request: Request,
     response: Response,
     file: UploadFile = File(...),
     doc_id: str = Form(...),
@@ -963,6 +1093,10 @@ async def upload_document(
         REQS.labels(endpoint="/v1/documents/upload", status="503").inc()
         logger.error("upload_retrieval_unavailable")
         return {"ok": False, "error": "retrieval_unavailable", "detail": "Retrieval service is not available"}
+
+    enforced_tenant_id = await _require_tenant_id(request)
+    if enforced_tenant_id:
+        tenant_id = enforced_tenant_id
 
     tags_list = [t.strip() for t in (tags or "").split(",") if t.strip()]
     acl_list = [a.strip() for a in (acl or "").split(",") if a.strip()]
@@ -1362,7 +1496,7 @@ async def documents_stats(
 
 
 @app.get("/v1/collections")
-async def collections(tenant_id: str | None = None, limit: int = 1000):
+async def collections(request: Request, tenant_id: str | None = None, limit: int = 1000):
     """Proxy: list distinct collections (project_id) from document-storage."""
     if state.config_error:
         REQS.labels(endpoint="/v1/collections", status="503").inc()
@@ -1371,6 +1505,9 @@ async def collections(tenant_id: str | None = None, limit: int = 1000):
         REQS.labels(endpoint="/v1/collections", status="503").inc()
         return {"ok": False, "error": "storage_unavailable", "collections": []}
     try:
+        enforced_tenant_id = await _require_tenant_id(request)
+        if enforced_tenant_id:
+            tenant_id = enforced_tenant_id
         r = await state.storage.list_collections(tenant_id=tenant_id, limit=limit)
         REQS.labels(endpoint="/v1/collections", status="200").inc()
         return r
@@ -1640,7 +1777,7 @@ async def get_document_status(doc_id: str):
 
 
 @app.post("/v1/chat/stream")
-async def chat_stream(payload: ChatRequest):
+async def chat_stream(payload: ChatRequest, request: Request):
     """Streaming chat endpoint using SSE."""
     if state.config_error:
         REQS.labels(endpoint="/v1/chat/stream", status="503").inc()
@@ -1662,6 +1799,10 @@ async def chat_stream(payload: ChatRequest):
     use_adaptive_k = payload.use_adaptive_k if payload.use_adaptive_k is not None else bool(state.settings.adaptive_k_enabled)
 
     filters = payload.filters.model_dump(exclude_none=True) if payload.filters else None
+    tenant_id = await _require_tenant_id(request)
+    if tenant_id:
+        filters = dict(filters or {})
+        filters["tenant_id"] = tenant_id
 
     async def generate_stream():
         try:
@@ -1744,6 +1885,7 @@ async def chat_stream(payload: ChatRequest):
 
             # Step 2: Stream LLM response
             answer_parts = []
+            think_stripper = _ThinkStripper()
             async for line in state.llm.chat_stream(messages=messages):
                 # Parse OpenAI-compatible SSE format
                 if line.startswith("data: "):
@@ -1756,14 +1898,20 @@ async def chat_stream(payload: ChatRequest):
                             delta = data["choices"][0].get("delta", {})
                             content = delta.get("content", "")
                             if content:
-                                answer_parts.append(content)
-                                yield f"data: {json.dumps({'type': 'token', 'content': content})}\n\n"
+                                safe = think_stripper.feed(content)
+                                if safe:
+                                    answer_parts.append(safe)
+                                    yield f"data: {json.dumps({'type': 'token', 'content': safe})}\n\n"
                     except json.JSONDecodeError:
                         continue
 
             # Send final answer and metadata
-            full_answer = "".join(answer_parts)
-            # Streaming: keep the model answer as-is (no forced refusals).
+            tail = think_stripper.finalize()
+            if tail:
+                answer_parts.append(tail)
+                yield f"data: {json.dumps({'type': 'token', 'content': tail})}\n\n"
+            full_answer = _strip_thinking_text("".join(answer_parts))
+            # Streaming: keep the model answer (but never the chain-of-thought).
             yield f"data: {json.dumps({'type': 'done', 'answer': full_answer, 'mode': mode, 'degraded': list(degraded), 'partial': partial, 'sources': sources if payload.include_sources else [], 'context': [c.model_dump() for c in ctx]})}\n\n"
 
             REQS.labels(endpoint="/v1/chat/stream", status="200").inc()

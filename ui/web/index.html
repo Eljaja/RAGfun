@@ -815,6 +815,30 @@
         from { opacity: 0; transform: translateY(4px); }
         to { opacity: 1; transform: translateY(0); }
       }
+
+      .header-controls {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+
+      .header-controls label {
+        margin: 0;
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--text-secondary);
+      }
+
+      .header-controls input[type="password"] {
+        width: 260px;
+        max-width: 40vw;
+        padding: 10px 12px;
+        border-radius: 14px;
+        border: 1px solid var(--border-color);
+        background: rgba(255, 255, 255, 0.92);
+        color: var(--text-primary);
+        outline: none;
+      }
     </style>
   </head>
   <body>
@@ -828,6 +852,10 @@
           <button class="tab active" id="tab_btn_chat" data-tab="chat" type="button">Chat</button>
           <button class="tab" id="tab_btn_files" data-tab="files" type="button">Files</button>
         </nav>
+        <div class="header-controls" aria-label="ODS access">
+          <label for="ods_api_key">ODS API key</label>
+          <input id="ods_api_key" type="password" placeholder="Paste tenant API key (X-ODS-API-KEY)" autocomplete="off" />
+        </div>
       </header>
 
       <main class="app-main">
@@ -836,12 +864,15 @@
           <div class="card" style="height: calc(100vh - 36px - 58px);">
             <div class="chat-shell">
               <div class="chat-header">
-                <details class="chat-collections">
-                  <summary>Collections</summary>
+                <details class="chat-collections" open>
+                  <summary id="collections_summary">Collections</summary>
                   <div style="margin-top: 10px;">
-                    <label for="chat_collections" class="chat-header-label">Collections (optional)</label>
+                    <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px;">
+                      <label for="chat_collections" class="chat-header-label" style="margin: 0;">Collections (optional)</label>
+                      <button id="refresh_collections" type="button" class="btn-secondary" style="font-size: 12px;">Refresh</button>
+                    </div>
                     <select id="chat_collections" multiple class="chat-collections-select" style="height: 100px;"></select>
-                    <div class="hint" style="margin-top: 8px;">If empty, search across all data</div>
+                    <div id="collections_hint" class="hint" style="margin-top: 8px;">Paste ODS API key in the header above to load your collections</div>
                   </div>
                 </details>
               </div>

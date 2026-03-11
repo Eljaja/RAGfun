@@ -211,6 +211,21 @@ class DocumentStorageClient:
             r.raise_for_status()
             return r.json()
 
+    async def resolve_tenant(self, *, api_key: str) -> str | None:
+        """Resolve tenant_id by ODS API key via document-storage (/v1/auth/resolve)."""
+        api_key = (api_key or "").strip()
+        if not api_key:
+            return None
+        headers = {"X-ODS-API-KEY": api_key}
+        async with httpx.AsyncClient(timeout=min(self._timeout_s, 10.0)) as client:
+            r = await client.post(f"{self._base_url}/v1/auth/resolve", headers=headers)
+            if r.status_code in (401, 403, 404):
+                return None
+            r.raise_for_status()
+            data = r.json() or {}
+            tid = (data.get("tenant_id") or "").strip()
+            return tid or None
+
 
 class DocProcessorClient:
     def __init__(self, *, base_url: str, timeout_s: float) -> None:

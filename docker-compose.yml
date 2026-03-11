@@ -293,6 +293,9 @@ services:
       - STORAGE_DB_POOL_MAX=${STORAGE_DB_POOL_MAX:-${POSTGRES_MAX_CONNECTIONS:-1000}}
       - STORAGE_MAX_FILE_SIZE_MB=100
       - STORAGE_ALLOWED_CONTENT_TYPES=text/plain,text/markdown,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/html,application/xhtml+xml,text/xml,application/xml
+      # ODS tenants + API keys (admin-only endpoints use X-ODS-ADMIN-SECRET)
+      - STORAGE_ODS_ADMIN_SECRET=${STORAGE_ODS_ADMIN_SECRET:-admin_secret_test}
+      - STORAGE_ODS_API_KEY_SALT=${STORAGE_ODS_API_KEY_SALT:-salt_test_123}
     volumes:
       - document-storage-data:/data/documents
     depends_on:
@@ -450,6 +453,10 @@ services:
       - GATE_LLM_MODEL=${GATE_LLM_MODEL:-openai/gpt-oss-120bt}
       - GATE_LLM_API_KEY=${GATE_LLM_API_KEY:-}
       - GATE_LLM_TIMEOUT_S=60
+      # ODS tenant enforcement (\"full ODS\")
+      - GATE_REQUIRE_TENANT_AUTH=${GATE_REQUIRE_TENANT_AUTH:-true}
+      - GATE_API_KEY_HEADER=${GATE_API_KEY_HEADER:-X-ODS-API-KEY}
+      - GATE_TENANT_CACHE_TTL_S=${GATE_TENANT_CACHE_TTL_S:-300}
       # CORS / UI
       - GATE_CORS_ALLOW_ORIGINS=*
     depends_on:

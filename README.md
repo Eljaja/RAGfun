@@ -10,6 +10,7 @@ This repository implements a full-featured RAG system with:
 - **VLM-Powered Document Processing**: Uses Vision-Language Models (Granite-Docling) for accurate document-to-text extraction
 - **Stateless Microservices**: Horizontally scalable services with clear separation of concerns
 - **Agent-Search**: LLM-driven retrieval (plan, HyDE, fact queries, retry)
+- **Full ODS Tenant Isolation**: API key based tenant enforcement in Gate, agent-search, deep-research, and UI
 - **Advanced Features**: Multi-query expansion, two-pass retrieval, reranking, segment stitching, auto-tuning
 - **Full Observability**: Prometheus metrics, Grafana dashboards, structured logging
 - **Async Processing**: RabbitMQ-based ingestion pipeline with retry/DLQ
@@ -44,8 +45,14 @@ The default `docker-compose.yml` includes the Infinity embeddings service (BAAI/
 2. **Configure environment:**
    ```bash
    cp env.example .env
-   # Edit .env to add your LLM API key and endpoint
+   # Edit .env to add your LLM API key and ODS settings
    nano .env  # or use your preferred editor
+   ```
+   Minimum ODS settings for this branch:
+   ```bash
+   GATE_REQUIRE_TENANT_AUTH=true
+   STORAGE_ODS_ADMIN_SECRET=change_me
+   STORAGE_ODS_API_KEY_SALT=change_me_salt
    ```
 
 3. **Start all services:**
@@ -76,19 +83,30 @@ The default `docker-compose.yml` includes the Infinity embeddings service (BAAI/
 
 ### Quick Test
 
-Upload a document and query it:
+Create a tenant API key, upload a document, and query it:
 
 ```bash
-# Upload a document (Gate on 8092 in this setup)
+# 1) Create tenant + first API key (document-storage)
+curl -X POST http://localhost:8081/v1/tenants \
+  -H "Content-Type: application/json" \
+  -H "X-ODS-ADMIN-SECRET: change_me" \
+  -d '{"tenant_id":"demo","name":"Demo tenant","label":"local-dev"}'
+
+# Save "api_key" from response
+ODS_KEY="<paste_api_key_here>"
+
+# 2) Upload a document (Gate on 8092 in this setup)
 curl -X POST http://localhost:8092/v1/documents/upload \
+  -H "X-ODS-API-KEY: ${ODS_KEY}" \
   -F "file=@/path/to/your/document.pdf" \
   -F "filename=test.pdf"
 
 # Wait for ingestion to complete (check status)
 curl http://localhost:8092/v1/documents/{doc_id}/status
 
-# Query the document
+# 3) Query the document
 curl -X POST http://localhost:8092/v1/chat \
+  -H "X-ODS-API-KEY: ${ODS_KEY}" \
   -H "Content-Type: application/json" \
   -d '{"query": "What is this document about?", "stream": false}'
 ```
@@ -107,6 +125,14 @@ The system consists of **8 microservices** organized into application, ML, and i
 - **agent-search** (`:8093`, profile `agent-search`) - LLM-driven search: plan, HyDE, fact queries, retry
 - **deep-research** (`:8094`, profile `deep-research`) - LangGraph-based iterative research: plan → scope → research loop → streaming report
 - **ui** (`:3301`) - Nginx-served SPA with SSE streaming support
+
+### Full ODS (Tenant Isolation)
+
+- Gate enforces tenant auth when `GATE_REQUIRE_TENANT_AUTH=true`
+- Client sends `X-ODS-API-KEY` (or `Authorization: Bearer ...`)
+- Gate resolves `tenant_id` via `document-storage /v1/auth/resolve`
+- Any client-provided `tenant_id` is overridden by the resolved tenant
+- UI forwards API key to chat, documents, collections, agent-search, and deep-research
 
 #### ML/Embedding Services
 - **infinity** (`:7997`) - BAAI/bge-m3 multilingual embeddings (1024-dim, 100+ languages)
@@ -297,6 +323,11 @@ Response: {
 DELETE /v1/documents/{doc_id}
 ```
 
+**List Collections (tenant-scoped in full ODS mode):**
+```bash
+GET /v1/collections
+```
+
 ### Chat & Search
 
 **Chat (Synchronous):**
@@ -324,6 +355,11 @@ Content-Type: application/json
 Response: Server-Sent Events (SSE)
 ```
 
+In full ODS mode, pass header:
+```bash
+X-ODS-API-KEY: <tenant_api_key>
+```
+
 **Hybrid Search:**
 ```bash
 POST /v1/search
@@ -336,6 +372,14 @@ Content-Type: application/json
   "vector_weight": 0.5,
   "enable_rerank": true
 }
+```
+
+### ODS Admin/Resolve (document-storage)
+
+```bash
+POST /v1/tenants
+POST /v1/tenants/{tenant_id}/api-keys
+POST /v1/auth/resolve
 ```
 
 ### Verifying Agent Services
@@ -399,6 +443,13 @@ AGENT_QUALITY_MIN_HITS=3
 AGENT_QUALITY_MIN_SCORE=0.15
 AGENT_ALWAYS_FACT_QUERIES=false
 
+# Full ODS tenant auth
+GATE_REQUIRE_TENANT_AUTH=true
+GATE_API_KEY_HEADER=X-ODS-API-KEY
+GATE_TENANT_CACHE_TTL_S=300
+STORAGE_ODS_ADMIN_SECRET=change_me
+STORAGE_ODS_API_KEY_SALT=change_me_salt
+
 # Worker Configuration
 WORKER_CONCURRENCY=1
 DOCLING_TIMEOUT=300
@@ -422,6 +473,7 @@ Services that scale horizontally:
 ## Documentation
 
 - **[docs/AGENT_SEARCH.md](./docs/AGENT_SEARCH.md)** — Agent-search API
+- **[docs/DEEP_RESEARCH_SETUP_AND_ODS_GAPS.md](./docs/DEEP_RESEARCH_SETUP_AND_ODS_GAPS.md)** — Deep-research and ODS integration notes
 - **[docs/ENDPOINTS_EXAMPLES.md](./docs/ENDPOINTS_EXAMPLES.md)** — Retrieval API examples
 - **[docs/gate/GATE_API.md](./docs/gate/GATE_API.md)** — Gate API
 

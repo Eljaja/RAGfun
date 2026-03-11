@@ -4,6 +4,8 @@ import json
 import logging
 from datetime import datetime
 from typing import Any
+import hashlib
+import secrets
 
 import psycopg2
 from psycopg2.extras import Json, RealDictCursor
@@ -75,6 +77,25 @@ class DatabaseClient:
                     CREATE INDEX IF NOT EXISTS idx_doc_project ON document_metadata(project_id);
                     CREATE INDEX IF NOT EXISTS idx_doc_stored_at ON document_metadata(stored_at);
                     CREATE INDEX IF NOT EXISTS idx_doc_tags ON document_metadata USING GIN(tags);
+
+                    -- ODS tenants + API keys (for tenant isolation via API key).
+                    CREATE TABLE IF NOT EXISTS ods_tenants (
+                        tenant_id VARCHAR(255) PRIMARY KEY,
+                        name VARCHAR(255),
+                        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                    );
+
+                    CREATE TABLE IF NOT EXISTS ods_tenant_api_keys (
+                        id BIGSERIAL PRIMARY KEY,
+                        tenant_id VARCHAR(255) NOT NULL REFERENCES ods_tenants(tenant_id) ON DELETE CASCADE,
+                        key_hash VARCHAR(128) NOT NULL UNIQUE,
+                        label VARCHAR(255),
+                        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                        revoked_at TIMESTAMP WITH TIME ZONE
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_ods_api_keys_tenant ON ods_tenant_api_keys(tenant_id);
+                    CREATE INDEX IF NOT EXISTS idx_ods_api_keys_hash ON ods_tenant_api_keys(key_hash);
                     """)
                     cur.execute("SELECT pg_advisory_unlock(hashtext('document_storage_schema'))")
                     conn.commit()
@@ -91,6 +112,111 @@ class DatabaseClient:
         except Exception as e:
             logger.error("database_schema_error", extra={"error": str(e)})
             raise
+        finally:
+            self.pool.putconn(conn)
+
+    @staticmethod
+    def _hash_api_key(*, api_key: str, salt: str | None) -> str:
+        s = (salt or "").encode("utf-8")
+        k = (api_key or "").encode("utf-8")
+        return hashlib.sha256(s + k).hexdigest()
+
+    def create_tenant_with_key(self, *, tenant_id: str, name: str | None, salt: str | None, label: str | None = None) -> dict[str, Any]:
+        """Create tenant (idempotent) and issue a new API key (returns plaintext key once)."""
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        api_key_plain = secrets.token_urlsafe(32)
+        key_hash = self._hash_api_key(api_key=api_key_plain, salt=salt)
+
+        conn = self.pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO ods_tenants (tenant_id, name)
+                    VALUES (%(tenant_id)s, %(name)s)
+                    ON CONFLICT (tenant_id) DO UPDATE SET
+                        name = COALESCE(EXCLUDED.name, ods_tenants.name)
+                    """,
+                    {"tenant_id": tenant_id, "name": name},
+                )
+                cur.execute(
+                    """
+                    INSERT INTO ods_tenant_api_keys (tenant_id, key_hash, label)
+                    VALUES (%(tenant_id)s, %(key_hash)s, %(label)s)
+                    RETURNING id, tenant_id, created_at
+                    """,
+                    {"tenant_id": tenant_id, "key_hash": key_hash, "label": label},
+                )
+                row = cur.fetchone() or {}
+                conn.commit()
+                return {
+                    "tenant_id": str(row.get("tenant_id") or tenant_id),
+                    "api_key": api_key_plain,
+                    "api_key_id": int(row.get("id") or 0),
+                    "created_at": row.get("created_at"),
+                }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self.pool.putconn(conn)
+
+    def issue_api_key(self, *, tenant_id: str, salt: str | None, label: str | None = None) -> dict[str, Any]:
+        """Issue a new API key for existing tenant (returns plaintext key once)."""
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        api_key_plain = secrets.token_urlsafe(32)
+        key_hash = self._hash_api_key(api_key=api_key_plain, salt=salt)
+        conn = self.pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT tenant_id FROM ods_tenants WHERE tenant_id = %s", (tenant_id,))
+                if not cur.fetchone():
+                    raise ValueError("tenant_not_found")
+                cur.execute(
+                    """
+                    INSERT INTO ods_tenant_api_keys (tenant_id, key_hash, label)
+                    VALUES (%(tenant_id)s, %(key_hash)s, %(label)s)
+                    RETURNING id, created_at
+                    """,
+                    {"tenant_id": tenant_id, "key_hash": key_hash, "label": label},
+                )
+                row = cur.fetchone() or {}
+                conn.commit()
+                return {
+                    "tenant_id": tenant_id,
+                    "api_key": api_key_plain,
+                    "api_key_id": int(row.get("id") or 0),
+                    "created_at": row.get("created_at"),
+                }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self.pool.putconn(conn)
+
+    def resolve_tenant_by_api_key(self, *, api_key: str, salt: str | None) -> str | None:
+        """Resolve tenant_id by API key (returns None if unknown/revoked)."""
+        if not (api_key or "").strip():
+            return None
+        key_hash = self._hash_api_key(api_key=api_key.strip(), salt=salt)
+        conn = self.pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT tenant_id
+                    FROM ods_tenant_api_keys
+                    WHERE key_hash = %s AND revoked_at IS NULL
+                    LIMIT 1
+                    """,
+                    (key_hash,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+                return str(row.get("tenant_id"))
         finally:
             self.pool.putconn(conn)
 

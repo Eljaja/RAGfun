@@ -32,6 +32,15 @@ FACT_QUERIES_USER = (
     "Query: {query}"
 )
 
+# Deep-research prompts (query-only, no history)
+DEEP_HYDE = "Query: {query}\nReturn a 3-5 sentence hypothetical passage in {lang}."
+DEEP_FACT_QUERIES = (
+    'Extract 2-3 fact-oriented sub-queries from the user request. Return JSON only: {{"fact_queries": ["q1", "q2"]}}.\nQuery: {query}'
+)
+DEEP_KEYWORD_QUERIES = (
+    'Extract 3-6 short keyword phrases. Return JSON only: {{"keywords": ["k1", "k2"]}}.\nQuery: {query}'
+)
+
 # Keyword queries
 KEYWORD_QUERIES_SYSTEM = "Extract short keyword queries from the user request."
 KEYWORD_QUERIES_USER = (

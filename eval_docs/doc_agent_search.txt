@@ -1,0 +1,1 @@
+Agent-search: LLM-driven retrieval. Flow: plan (выбор retrieval_mode, top_k, rerank, hyde) → HyDE (гипотетический документ для улучшения поиска) → gate.chat → quality check → fact_queries при слабом поиске → answer → assess → retry при неполном ответе. Поддерживает инструменты: calculator, execute_code. Использует PLAN_SYSTEM, HYDE_SYSTEM, FACT_QUERIES_SYSTEM из agent_common.

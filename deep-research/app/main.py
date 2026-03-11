@@ -34,6 +34,7 @@ from agent_common import (
     merge_hits,
     quality_is_poor,
     sources_from_context,
+    strip_thinking,
 )
 from agent_common.web_search import web_search_async
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
@@ -148,6 +149,17 @@ class EventEmitter:
 
 
 SENTINEL = object()
+
+
+def _forward_auth_headers(request: Request) -> dict[str, str] | None:
+    """Forward ODS auth headers to Gate (X-ODS-API-KEY preferred)."""
+    k = (request.headers.get("X-ODS-API-KEY") or "").strip()
+    if k:
+        return {"X-ODS-API-KEY": k}
+    a = (request.headers.get("authorization") or request.headers.get("Authorization") or "").strip()
+    if a:
+        return {"Authorization": a}
+    return None
 
 
 def _env_get(key: str, default: str) -> str:
@@ -652,6 +664,7 @@ def _build_graph(
         rerank = bool(state.get("rerank") if state.get("rerank") is not None else True)
         use_hyde = bool(state.get("use_hyde") if state.get("use_hyde") is not None else False)
         filters = state.get("filters")
+        gate_headers = state.get("gate_headers")
         include_sources = state.get("include_sources", True)
 
         for q in batch:
@@ -693,6 +706,7 @@ def _build_graph(
                 rerank=rerank,
                 filters=filters,
                 include_sources=include_sources,
+                headers=gate_headers,
             )
 
             responses = [primary]
@@ -738,6 +752,7 @@ def _build_graph(
                             rerank=rerank,
                             filters=filters,
                             include_sources=include_sources,
+                            headers=gate_headers,
                         )
                         for fq in fact_qs
                     ]
@@ -766,6 +781,7 @@ def _build_graph(
                         rerank=rerank,
                         filters=filters,
                         include_sources=include_sources,
+                        headers=gate_headers,
                     )
                     responses.append(alt)
                     degraded.update(alt.get("degraded") or [])
@@ -791,6 +807,7 @@ def _build_graph(
                             rerank=rerank,
                             filters=filters,
                             include_sources=include_sources,
+                            headers=gate_headers,
                         )
                         for alt_mode in alt_modes
                     ]
@@ -826,6 +843,7 @@ def _build_graph(
                                 rerank=rerank,
                                 filters=filters,
                                 include_sources=include_sources,
+                                headers=gate_headers,
                             )
                             for kw in keyword_qs
                         ]
@@ -1054,6 +1072,8 @@ def _build_graph(
 async def _run_graph_async(
     payload: DeepResearchRequest,
     event_queue: asyncio.Queue[object],
+    *,
+    gate_headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     emitter = EventEmitter(event_queue)
     template = os.environ.get("DEEP_RESEARCH_TEMPLATE", DEFAULT_REPORT_TEMPLATE)
@@ -1110,6 +1130,7 @@ async def _run_graph_async(
         "max_iterations": max_iterations,
         "report": "",
         "filters": filters,
+        "gate_headers": gate_headers,
         "include_sources": payload.include_sources,
         "retrieval_mode": retrieval_mode,
         "top_k": top_k,
@@ -1175,7 +1196,8 @@ async def deep_research_stream(request: Request, payload: DeepResearchRequest) -
     async def event_stream() -> AsyncIterator[str]:
         event_queue: asyncio.Queue[object] = asyncio.Queue()
         logger.info("stream.open")
-        task = asyncio.create_task(_run_graph_async(payload, event_queue))
+        gate_headers = _forward_auth_headers(request)
+        task = asyncio.create_task(_run_graph_async(payload, event_queue, gate_headers=gate_headers))
 
         while True:
             try:
@@ -1202,7 +1224,7 @@ async def deep_research_stream(request: Request, payload: DeepResearchRequest) -
             yield f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
             return
 
-        report = state.get("report") or ""
+        report = strip_thinking(state.get("report") or "")
         yield f"data: {json.dumps({'type': 'progress', 'stage': 'done', 'iteration': state.get('iteration', 0), 'max_iterations': state.get('max_iterations', 0), 'percent': 1.0, 'message': 'Done'})}\n\n"
 
         done_event = {
