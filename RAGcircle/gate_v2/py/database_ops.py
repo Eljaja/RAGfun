@@ -120,6 +120,53 @@ class ProjectDB:
 
             return Project.from_row(row)
 
+    async def ensure_project(
+        self,
+        *,
+        project_id: str,
+        user_id: str,
+        name: str,
+        description: Optional[str] = None,
+        embedding_model: str = "intfloat/multilingual-e5-base",
+        chunk_size: int = 512,
+        chunk_overlap: int = 64,
+        language: str = "ru",
+        llm_model: str = "gemma-3-12b",
+    ) -> Project:
+        """Ensure a project with an explicit ID exists and is active."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO projects (
+                    project_id, user_id, name, description,
+                    embedding_model, chunk_size, chunk_overlap, language, llm_model, status
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'active')
+                ON CONFLICT (project_id) DO UPDATE SET
+                    user_id = EXCLUDED.user_id,
+                    name = EXCLUDED.name,
+                    description = EXCLUDED.description,
+                    embedding_model = EXCLUDED.embedding_model,
+                    chunk_size = EXCLUDED.chunk_size,
+                    chunk_overlap = EXCLUDED.chunk_overlap,
+                    language = EXCLUDED.language,
+                    llm_model = EXCLUDED.llm_model,
+                    status = 'active',
+                    updated_at = NOW()
+                RETURNING *
+                """,
+                project_id,
+                user_id,
+                name,
+                description,
+                embedding_model,
+                chunk_size,
+                chunk_overlap,
+                language,
+                llm_model,
+            )
+            return Project.from_row(row)
+
     async def get(self, project_id: str) -> Optional[Project]:
         """Get a project by ID. Returns None if not found."""
         async with self.pool.acquire() as conn:

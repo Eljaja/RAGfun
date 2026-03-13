@@ -51,8 +51,8 @@ class AppConfig(BaseSettings):
 
     # ── Embedding ────────────────────────────────────────────────────────
     embedder_url: str = "http://localhost:8902"
-    embedder_model: str = "sentence-transformers/e5-base-v2"
-    embedder_dim: int = 768
+    embedder_model: str = "BAAI/bge-m3"
+    embedder_dim: int = 1024
     embed_batch_size: int = 32
 
     # ── Stores ───────────────────────────────────────────────────────────
@@ -62,7 +62,7 @@ class AppConfig(BaseSettings):
     opensearch_index: str = "documents"
 
     db_addr: str = Field(
-        default="postgresql://user:pass@localhost:5438/db",
+        default="postgresql://user:pass@localhost:5439/db",
         validation_alias=AliasChoices("db_addr", "postgre_url"),
     )
 

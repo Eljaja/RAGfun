@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+echo "[1/2] Stopping ingestion stack (ragcircle-ingest)..."
+docker compose -p ragcircle-ingest -f RAGcircle/docker-compose.yaml --profile apps down \
+  --remove-orphans \
+  --timeout 30
+
+echo "[2/2] Stopping retrieval/chat/ui stack (ragfun-unified)..."
+docker compose -p ragfun-unified down \
+  --remove-orphans \
+  --timeout 30
+
+echo "Done."

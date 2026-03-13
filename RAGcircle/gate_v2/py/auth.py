@@ -16,11 +16,6 @@ from settings import load_settings
 
 T = TypeVar('T')
 
-s = load_settings()
-AUTH_SERVER = s.auth_server   
-ADMIN_SECRET_TOKEN = s.admin_secret_token 
-
-
 @dataclass
 class UserCreds:
     user_id: str
@@ -196,6 +191,14 @@ async def authenticated(
     _: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
 ) -> UserCreds:
     """FastAPI dependency: validates token, returns user creds (cached)"""
+    settings = load_settings()
+
+    # Compatibility mode: short-circuit auth to a single fixed user identity.
+    if settings.stub_auth_enabled:
+        return UserCreds(
+            user_id=settings.stub_user_id,
+            limits={"max_projects": 1},
+        )
     
     # 1. Parse & validate token (functional)
     auth_header = request.headers.get("authorization")
@@ -211,11 +214,13 @@ async def authenticated(
     
     # 2. Build the fetcher closure (captures token + client)
     async def fetch_from_auth() -> Result[UserCreds, str]:
+        if not settings.auth_server or not settings.admin_secret_token:
+            return Failure("auth_config_missing")
         async with httpx.AsyncClient(timeout=30) as http_client:
             fetch = call_endpoint(
-                url=f"{AUTH_SERVER}/verify-token?token={token}",
+                url=f"{settings.auth_server}/verify-token?token={token}",
                 method="GET", 
-                headers = {"X-Cudo-Admin": f"Bearer {ADMIN_SECRET_TOKEN}"},
+                headers = {"X-Cudo-Admin": f"Bearer {settings.admin_secret_token}"},
             )
             result = await fetch(http_client)
             return result.map(lambda data: UserCreds(
