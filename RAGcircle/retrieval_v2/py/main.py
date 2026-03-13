@@ -56,19 +56,35 @@ async def retrieve(body: RetrieveRequest):
     retriever: HybridRetriever = app.state.retriever
 
     try:
-        chunks = await retriever.search(
+        if body.plan is not None:
+            plan_used = body.plan
+            strategy = "plan"
+        else:
+            plan_used = retriever.build_legacy_plan(
+                strategy=body.strategy,
+                top_k=body.top_k,
+                rerank=body.rerank,
+                rerank_top_n=body.rerank_top_n,
+            )
+            strategy = body.strategy
+
+        chunks, warnings = await retriever.execute_plan(
             query=body.query,
             collection=body.project_id,
-            top_k=body.top_k,
-            strategy=body.strategy,
-            rerank=body.rerank,
-            rerank_top_n=body.rerank_top_n,
+            plan=plan_used,
         )
     except Exception:
         logger.exception("Retrieval failed for project %s", body.project_id)
         raise HTTPException(status_code=502, detail="Retrieval backend error")
 
-    return RetrieveResponse(chunks=chunks, strategy=body.strategy, query=body.query)
+    return RetrieveResponse(
+        chunks=chunks,
+        strategy=strategy,
+        query=body.query,
+        plan_used=plan_used,
+        rounds_executed=len(plan_used.rounds),
+        warnings=warnings,
+    )
 
 
 if __name__ == "__main__":
