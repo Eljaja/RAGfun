@@ -192,16 +192,14 @@ services:
       # Optional auth:
       # - RAG_OS_USERNAME=...
       # - RAG_OS_PASSWORD=...
-      - RAG_OS_INDEX_ALIAS=rag_chunks
-      - RAG_OS_INDEX_PREFIX=rag_chunks_v
+      - RAG_OS_INDEX_ALIAS=${STUB_PROJECT_ID:-default}
+      - RAG_OS_INDEX_PREFIX=${STUB_PROJECT_ID:-default}_v
       # Qdrant (Vector)
       - RAG_QDRANT_URL=${RAG_QDRANT_URL:-http://qdrant:6333}
       # Optional auth:
       # - RAG_QDRANT_API_KEY=...
-      # Use a separate collection because the host Infinity embedding model is 512-dim
-      # (existing 'rag_chunks' may already be created with a different vector size).
-      # BAAI/bge-m3 is 1024-dim -> use a separate collection to avoid dimension mismatch.
-      - RAG_QDRANT_COLLECTION=rag_chunks_bge_m3_1024
+      # Single stub project collection shared with gate_v2/doc_processor_v2 ingestion.
+      - RAG_QDRANT_COLLECTION=${STUB_PROJECT_ID:-default}
       - RAG_VECTOR_DISTANCE=cosine
       # Embeddings (Infinity inside docker network)
       - RAG_EMBEDDING_PROVIDER=http
@@ -247,8 +245,8 @@ services:
       - RAG_RERANK_AUTO_MIN_QUERY_TOKENS=6
       - RAG_RERANK_AUTO_MIN_INTERSECTION=2
       # Page-level improvements (QUALITY)
-      - RAG_ENABLE_PAGE_DEDUPLICATION=true
-      - RAG_ENABLE_PARENT_PAGE_RETRIEVAL=true
+      - RAG_ENABLE_PAGE_DEDUPLICATION=false
+      - RAG_ENABLE_PARENT_PAGE_RETRIEVAL=false
       # Observability (optional)
       - RAG_OTEL_ENABLED=false
       - RAG_OTEL_SERVICE_NAME=hybrid-retrieval
@@ -264,6 +262,12 @@ services:
       #   condition: service_started
       # infinity-rerank:
       #   condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/v1/readyz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
     networks:
       - rag-network
       # Optional: attach to rag_fun stack network for shared infinity-embed/rerank
@@ -361,7 +365,7 @@ services:
       document-storage:
         condition: service_started
       retrieval:
-        condition: service_started
+        condition: service_healthy
       # vllm-docling optional for .txt (doc-processor uses extract_text_non_vlm). For PDF/DOCX start vllm-docling or add condition: service_started
       # vllm-docling:
       #   condition: service_started
@@ -394,7 +398,7 @@ services:
       document-storage:
         condition: service_started
       retrieval:
-        condition: service_started
+        condition: service_healthy
       doc-processor:
         condition: service_started
     networks:
@@ -449,8 +453,8 @@ services:
       - GATE_RABBIT_QUEUE=ingestion.tasks
       # LLM (OpenAI-compatible). Keep mock as default to avoid requiring a key by default.
       - GATE_LLM_PROVIDER=${GATE_LLM_PROVIDER:-openai_compat}
-      - GATE_LLM_BASE_URL=${GATE_LLM_BASE_URL:-https://inference.asicloud.cudos.org/v1}
-      - GATE_LLM_MODEL=${GATE_LLM_MODEL:-openai/gpt-oss-120bt}
+      - GATE_LLM_BASE_URL=${GATE_LLM_BASE_URL:-https://llm.c.singularitynet.io/v1}
+      - GATE_LLM_MODEL=${GATE_LLM_MODEL:-minimax/minimax-m2.1}
       - GATE_LLM_API_KEY=${GATE_LLM_API_KEY:-}
       - GATE_LLM_TIMEOUT_S=60
       # ODS tenant enforcement (\"full ODS\")
@@ -485,8 +489,8 @@ services:
       - AGENT_GATE_TIMEOUT_S=60
       - AGENT_MAX_LLM_CALLS=${AGENT_MAX_LLM_CALLS:-12}
       - AGENT_MAX_FACT_QUERIES=${AGENT_MAX_FACT_QUERIES:-2}
-      - AGENT_LLM_BASE_URL=${GATE_LLM_BASE_URL:-https://inference.asicloud.cudos.org/v1}
-      - AGENT_LLM_MODEL=${GATE_LLM_MODEL:-openai/gpt-oss-120bt}
+      - AGENT_LLM_BASE_URL=${GATE_LLM_BASE_URL:-https://llm.c.singularitynet.io/v1}
+      - AGENT_LLM_MODEL=${GATE_LLM_MODEL:-minimax/minimax-m2.1}
       - AGENT_LLM_API_KEY=${GATE_LLM_API_KEY:-}
       - AGENT_LLM_TIMEOUT_S=60
       - AGENT_USE_HYDE=${AGENT_USE_HYDE:-}
@@ -510,10 +514,10 @@ services:
     ports:
       - "${RUGFUNSOTA_DEEP_PORT:-8094}:8092"
     environment:
-      - DEEP_LLM_PROVIDER=${GATE_LLM_PROVIDER:-mock}
-      - DEEP_LLM_BASE_URL=${GATE_LLM_BASE_URL:-https://inference.asicloud.cudos.org/v1}
+      - DEEP_LLM_PROVIDER=${GATE_LLM_PROVIDER:-openai_compat}
+      - DEEP_LLM_BASE_URL=${GATE_LLM_BASE_URL:-https://llm.c.singularitynet.io/v1}
       - DEEP_LLM_API_KEY=${GATE_LLM_API_KEY:-}
-      - DEEP_LLM_MODEL=${GATE_LLM_MODEL:-meta-llama/llama-3.3-70b-instruct}
+      - DEEP_LLM_MODEL=${GATE_LLM_MODEL:-minimax/minimax-m2.1}
       - DEEP_GATE_URL=http://rag-gate:8090
       - DEEP_GATE_TIMEOUT_S=60
       - DEEP_LLM_TEMPERATURE=0

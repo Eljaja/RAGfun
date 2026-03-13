@@ -30,7 +30,7 @@ services:
   postgres:
     image: postgres:16-alpine
     ports:
-      - "127.0.0.1:5438:5432"
+      - "127.0.0.1:${RAGCIRCLE_PG_PORT:-5439}:5432"
     environment:
       POSTGRES_USER: user
       POSTGRES_PASSWORD: pass
@@ -120,6 +120,8 @@ services:
       rabbitmq:
         condition: service_healthy
       rustfs:
+        condition: service_started
+      infinity:
         condition: service_started
     restart: unless-stopped
 

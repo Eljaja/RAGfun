@@ -1,8 +1,18 @@
 """Main FastAPI application for RAG Gate."""
 
 from contextlib import AsyncExitStack, asynccontextmanager
+import asyncio
+from collections import Counter as CollCounter
+import json
+import logging
+import re
+import time
+import unicodedata
+import uuid
 
-from fastapi import FastAPI
+import httpx
+
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
@@ -599,11 +609,13 @@ async def _require_tenant_id(request: Request) -> str | None:
 
 @asynccontextmanager
 async def combined_lifespan(app: FastAPI):
-    """Combine multiple lifespan contexts."""
-    async with AsyncExitStack() as stack:
-        # Enter all context managers
-        await stack.enter_async_context(rag_lifespan(app))
-        await stack.enter_async_context(presign_lifespan(app))
+    """Initialize local gate dependencies for chat/doc endpoints."""
+    try:
+        state.settings = load_settings()
+    except Exception as e:
+        state.config_error = str(e)
+        setup_json_logging("INFO")
+        logger.error("config_error", extra={"extra": {"error": state.config_error}})
         yield
         return
 
@@ -629,27 +641,17 @@ async def combined_lifespan(app: FastAPI):
         try:
             await state.publisher.start()
         except Exception as e:
-            # Degrade gracefully, but keep the publisher object:
-            # it can reconnect lazily on the first publish attempt.
             logger.error("rabbit_publisher_init_failed", extra={"extra": {"error": str(e)}})
-    yield
-    if state.publisher:
-        await state.publisher.close()
-        # All will be properly cleaned up even if errors occur
+
+    try:
+        yield
+    finally:
+        if state.publisher:
+            await state.publisher.close()
 
 
 # Create FastAPI app
 app = FastAPI(title="RAG Gate", version="0.1.0", lifespan=combined_lifespan)
-
-# Register exception handlers
-register_exception_handlers(app)
-
-# Include routers
-app.include_router(health_router)
-app.include_router(chat_router)
-app.include_router(documents_router)
-app.include_router(public_router)
-app.include_router(protected_router)
 
 # Add CORS middleware
 app.add_middleware(
@@ -659,9 +661,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Add metrics middleware
-app.middleware("http")(http_metrics_middleware)
 
 @app.middleware("http")
 async def http_metrics(request: Request, call_next):
