@@ -1,17 +1,17 @@
 from __future__ import annotations
 
 import logging
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from opensearchpy import AsyncOpenSearch
+from qdrant_client import AsyncQdrantClient
 
 from config import Settings
-from store import QdrantStore, BM25Store
-from embedder import Embedder
-from reranker import Reranker
+from models import ExecutionPlan, RetrieveRequest, RetrieveResponse
 from retriever import HybridRetriever
-from models import RetrieveRequest, RetrieveResponse
 
 logger = logging.getLogger(__name__)
 
@@ -19,28 +19,41 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = Settings()
-
     logging.basicConfig(level=settings.log_level)
     logger.info("Starting retrieval service on port %d", settings.port)
 
-    qdrant = QdrantStore(settings.qdrant_url)
-    bm25 = BM25Store(settings.opensearch_url)
-    embedder = Embedder(
-        settings.embedder_url,
-        settings.embedder_model,
-        timeout=settings.embedder_timeout,
-    )
-    reranker = Reranker(settings.reranker_url, settings.reranker_model)
+    async with AsyncExitStack() as stack:
+        qdrant = AsyncQdrantClient(url=settings.qdrant_url)
+        opensearch = AsyncOpenSearch(hosts=[settings.opensearch_url], use_ssl=False)
+        embed_http = httpx.AsyncClient(
+            base_url=settings.embedder_url.rstrip("/"),
+            timeout=httpx.Timeout(settings.embedder_timeout, connect=10.0, read=settings.embedder_timeout),
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+            http2=True,
+        )
+        rerank_http = httpx.AsyncClient(
+            base_url=settings.reranker_url.rstrip("/"),
+            timeout=httpx.Timeout(30.0, connect=10.0, read=30.0),
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+            http2=True,
+        )
 
-    app.state.retriever = HybridRetriever(qdrant, bm25, embedder, reranker)
-    app.state.settings = settings
+        stack.push_async_callback(qdrant.close)
+        stack.push_async_callback(opensearch.close)
+        stack.push_async_callback(embed_http.aclose)
+        stack.push_async_callback(rerank_http.aclose)
 
-    yield
+        app.state.retriever = HybridRetriever(
+            qdrant=qdrant,
+            opensearch=opensearch,
+            embed_http=embed_http,
+            embed_model=settings.embedder_model,
+            rerank_http=rerank_http,
+            rerank_model=settings.reranker_model,
+        )
+        app.state.settings = settings
 
-    await embedder.close()
-    await reranker.close()
-    await bm25.close()
-    await qdrant.close()
+        yield
 
 
 app = FastAPI(lifespan=lifespan, title="Retrieval Service")
@@ -60,7 +73,7 @@ async def retrieve(body: RetrieveRequest):
             plan_used = body.plan
             strategy = "plan"
         else:
-            plan_used = retriever.build_legacy_plan(
+            plan_used = ExecutionPlan.from_legacy(
                 strategy=body.strategy,
                 top_k=body.top_k,
                 rerank=body.rerank,
@@ -68,7 +81,7 @@ async def retrieve(body: RetrieveRequest):
             )
             strategy = body.strategy
 
-        chunks, warnings = await retriever.execute_plan(
+        chunks = await retriever.execute_plan(
             query=body.query,
             collection=body.project_id,
             plan=plan_used,
@@ -83,7 +96,6 @@ async def retrieve(body: RetrieveRequest):
         query=body.query,
         plan_used=plan_used,
         rounds_executed=len(plan_used.rounds),
-        warnings=warnings,
     )
 
 

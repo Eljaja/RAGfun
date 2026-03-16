@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -10,6 +10,19 @@ class ChunkResult(BaseModel):
     source_id: str
     chunk_index: int
     score: float
+
+
+class EmbeddingResponseData(BaseModel):
+    embedding: list[float]
+    index: int
+    object: Literal["embedding"] = Field(...)
+
+
+class EmbeddingResponse(BaseModel):
+    data: list[EmbeddingResponseData]
+    model: str
+    object: Literal["list"] = Field(...)
+    usage: dict[str, Any] | None = None
 
 
 class StepBase(BaseModel):
@@ -105,6 +118,54 @@ class ExecutionPlan(BaseModel):
             raise ValueError("execution plan must include at least one round")
         return self
 
+    @classmethod
+    def from_legacy(
+        cls,
+        *,
+        strategy: str,
+        top_k: int,
+        rerank: bool,
+        rerank_top_n: int,
+    ) -> ExecutionPlan:
+        strategy = (strategy or "hybrid").lower().strip()
+        top_k = max(1, int(top_k))
+        rerank_top_n = max(1, int(rerank_top_n))
+
+        if strategy == "bm25":
+            return cls(
+                rounds=[
+                    PlanRound(
+                        retrieve=[BM25SearchStep(top_k=top_k)],
+                        finalize=[TrimStep(top_k=top_k)],
+                    )
+                ]
+            )
+        if strategy == "vector":
+            return cls(
+                rounds=[
+                    PlanRound(
+                        retrieve=[VectorSearchStep(top_k=top_k)],
+                        finalize=[TrimStep(top_k=top_k)],
+                    )
+                ]
+            )
+
+        fetch_k = max(top_k * 2, top_k)
+        rank_steps = [RerankStep(top_n=min(rerank_top_n, fetch_k))] if rerank else []
+        return cls(
+            rounds=[
+                PlanRound(
+                    retrieve=[
+                        VectorSearchStep(top_k=fetch_k),
+                        BM25SearchStep(top_k=fetch_k),
+                    ],
+                    combine=FuseStep(rrf_k=60),
+                    rank=rank_steps,
+                    finalize=[TrimStep(top_k=top_k)],
+                )
+            ]
+        )
+
 
 class RetrieveRequest(BaseModel):
     project_id: str
@@ -122,4 +183,3 @@ class RetrieveResponse(BaseModel):
     query: str
     plan_used: ExecutionPlan | None = None
     rounds_executed: int = 0
-    warnings: list[str] = Field(default_factory=list)
