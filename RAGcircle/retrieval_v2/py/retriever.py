@@ -34,7 +34,6 @@ from ranking import (
     apply_finalize,
     combine_sources,
     dedupe_keep_best,
-    keyword_query,
 )
 
 logger = logging.getLogger(__name__)
@@ -186,12 +185,7 @@ class HybridRetriever:
         step: RetrievalStep,
     ) -> str:
         query = (step.query or "").strip()
-        if not query:
-            if step.query_mode == "keyword":
-                query = keyword_query(base_query) or base_query
-            else:
-                query = base_query
-        return query
+        return query or base_query
 
     async def _search_step(
         self,

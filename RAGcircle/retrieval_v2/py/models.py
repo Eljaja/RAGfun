@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+_MAX_QUERY_LEN = 2000
 
 
 class ChunkResult(BaseModel):
@@ -30,19 +32,40 @@ class StepBase(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    @field_validator("query", mode="before", check_fields=False)
+    @classmethod
+    def _normalize_and_validate_query(cls, value: object) -> str:
+        """
+        Query handling rules:
+        - missing field -> defaults to "", and retriever falls back to request query
+        - explicit null is rejected
+        - explicit empty/whitespace values are rejected
+        - hidden control chars are rejected
+        """
+        if value is None:
+            raise ValueError("query cannot be null; omit the field to use request query")
+        if not isinstance(value, str):
+            raise ValueError("query must be a string")
+        text = value.strip()
+        if not text:
+            raise ValueError("query cannot be empty; omit the field to use request query")
+        if len(text) > _MAX_QUERY_LEN:
+            raise ValueError(f"query is too long (max {_MAX_QUERY_LEN} chars)")
+        if any((ord(ch) < 32 and ch not in ("\t", "\n", "\r")) for ch in text):
+            raise ValueError("query contains unsupported control characters")
+        return text
+
 
 class BM25SearchStep(StepBase):
     kind: Literal["bm25_search"] = "bm25_search"
     top_k: int = Field(default=20, ge=1, le=2000)
-    query: str | None = None
-    query_mode: Literal["raw", "keyword"] = "raw"
+    query: str = Field(default="", max_length=_MAX_QUERY_LEN)
 
 
 class VectorSearchStep(StepBase):
     kind: Literal["vector_search"] = "vector_search"
     top_k: int = Field(default=20, ge=1, le=2000)
-    query: str | None = None
-    query_mode: Literal["raw", "keyword"] = "raw"
+    query: str = Field(default="", max_length=_MAX_QUERY_LEN)
 
 
 class FuseStep(StepBase):
@@ -169,12 +192,25 @@ class ExecutionPlan(BaseModel):
 
 class RetrieveRequest(BaseModel):
     project_id: str
-    query: str
+    query: str = Field(min_length=1, max_length=_MAX_QUERY_LEN)
     top_k: int = Field(default=5, ge=1, le=2000)
     rerank: bool = True
     rerank_top_n: int = Field(default=5, ge=1, le=2000)
     strategy: str = Field(default="hybrid", pattern="^(hybrid|vector|bm25)$")
-    plan: ExecutionPlan | None = None
+
+    @field_validator("query", mode="before")
+    @classmethod
+    def _validate_query(cls, value: object) -> str:
+        if value is None:
+            raise ValueError("query cannot be null")
+        if not isinstance(value, str):
+            raise ValueError("query must be a string")
+        text = value.strip()
+        if not text:
+            raise ValueError("query cannot be empty")
+        if any((ord(ch) < 32 and ch not in ("\t", "\n", "\r")) for ch in text):
+            raise ValueError("query contains unsupported control characters")
+        return text
 
 
 class RetrieveResponse(BaseModel):
@@ -183,3 +219,30 @@ class RetrieveResponse(BaseModel):
     query: str
     plan_used: ExecutionPlan | None = None
     rounds_executed: int = 0
+
+
+class ExecuteRequest(BaseModel):
+    project_id: str
+    query: str = Field(min_length=1, max_length=_MAX_QUERY_LEN)
+    plan: ExecutionPlan
+
+    @field_validator("query", mode="before")
+    @classmethod
+    def _validate_query(cls, value: object) -> str:
+        if value is None:
+            raise ValueError("query cannot be null")
+        if not isinstance(value, str):
+            raise ValueError("query must be a string")
+        text = value.strip()
+        if not text:
+            raise ValueError("query cannot be empty")
+        if any((ord(ch) < 32 and ch not in ("\t", "\n", "\r")) for ch in text):
+            raise ValueError("query contains unsupported control characters")
+        return text
+
+
+class ExecuteResponse(BaseModel):
+    chunks: list[ChunkResult]
+    query: str
+    plan: ExecutionPlan
+    rounds_executed: int

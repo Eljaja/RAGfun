@@ -1,31 +1,6 @@
 from __future__ import annotations
 
-import re
-from collections import Counter as CollCounter
-
 from models import ChunkResult, FuseStep, TrimStep
-
-_TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9]+")
-
-
-def keyword_query(q: str) -> str:
-    toks = [t.lower() for t in _TOKEN_RE.findall(q or "")]
-    if not toks:
-        return ""
-    stop = {
-        "the", "a", "an", "of", "in", "on", "at", "to", "for", "and", "or", "is",
-        "are", "was", "were", "be", "been", "with", "what", "which", "who", "when",
-        "where", "why", "how", "many", "much", "did", "does", "do", "have", "has",
-        "что", "какой", "какая", "какие", "кто", "где", "когда", "как", "сколько",
-        "это", "эта", "эти", "этот", "для", "или", "а", "и", "в", "на", "по", "с",
-    }
-    toks = [t for t in toks if len(t) >= 3 and t not in stop]
-    if not toks:
-        return ""
-    c = CollCounter(toks)
-    ranked = sorted(c.items(), key=lambda kv: (kv[1], len(kv[0])), reverse=True)
-    keep = [t for t, _ in ranked[:10]]
-    return " ".join(keep)
 
 
 def rrf(rankings: list[list[str]], k: int = 60) -> list[tuple[str, float]]:
