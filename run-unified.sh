@@ -41,26 +41,34 @@ if ! docker network inspect "${EXTERNAL_PRESIGN_NET}" >/dev/null 2>&1; then
   docker network create "${EXTERNAL_PRESIGN_NET}" >/dev/null
 fi
 
-echo "[1/2] Starting retrieval/chat stack..."
+echo "[1/3] Starting retrieval/chat stack..."
 docker compose -p ragfun-unified up -d \
   opensearch qdrant infinity-embed infinity-rerank retrieval \
   postgres pgbouncer document-storage rabbitmq rag-gate ui
 
-echo "[1/2] Waiting for retrieval readiness on http://localhost:8085/v1/readyz ..."
+echo "[1/3] Waiting for retrieval readiness on http://localhost:8085/v1/readyz ..."
 until curl -fsS http://localhost:8085/v1/readyz >/dev/null; do
   sleep 2
 done
 
-echo "[2/2] Starting ingestion infra + embedder..."
+echo "[2/3] Starting agent-search (deep-research disabled in unified mode)..."
+docker compose -p ragfun-unified --profile agent-search up -d agent-search
+
+echo "[2/3] Waiting for agent-search readiness on http://localhost:8093/v1/readyz ..."
+until curl -fsS http://localhost:8093/v1/readyz >/dev/null; do
+  sleep 2
+done
+
+echo "[3/3] Starting ingestion infra + embedder..."
 docker compose -p ragcircle-ingest -f RAGcircle/docker-compose.yaml --profile apps up -d \
   postgres rabbitmq rustfs infinity
 
-echo "[2/2] Waiting for embedder readiness on http://localhost:8902/models ..."
+echo "[3/3] Waiting for embedder readiness on http://localhost:8902/models ..."
 until curl -fsS http://localhost:8902/models >/dev/null; do
   sleep 2
 done
 
-echo "[2/2] Starting ingestion API/worker..."
+echo "[3/3] Starting ingestion API/worker..."
 docker compose -p ragcircle-ingest -f RAGcircle/docker-compose.yaml --profile apps up -d \
   gate doc-processor nginx-gate
 
@@ -68,4 +76,5 @@ echo "Done."
 echo "ui:                  http://localhost:3301"
 echo "rag-gate readyz:     http://localhost:8092/v1/readyz"
 echo "retrieval readyz:    http://localhost:8085/v1/readyz"
+echo "agent-search readyz: http://localhost:8093/v1/readyz"
 echo "gate_v2 health:      http://localhost:8916/public/health"
