@@ -71,11 +71,13 @@ app.include_router(legacy_router)
 app.include_router(plan_router)
 
 
-async def _check(name: str, coro) -> tuple[str, str]:
+async def _check(name: str, fn) -> tuple[str, str]:
     try:
-        await asyncio.wait_for(coro, timeout=3.0)
+        result = await asyncio.wait_for(fn(), timeout=10.0)
+        if result is False:
+            return name, "unavailable"
         return name, "ok"
-    except Exception:
+    except (Exception, asyncio.CancelledError):
         return name, "unavailable"
 
 
@@ -84,10 +86,10 @@ async def health(request: Request):
     r: HybridRetriever = request.app.state.retriever
 
     results = await asyncio.gather(
-        _check("qdrant", r.qdrant.get_collections()),
-        _check("opensearch", r.opensearch.ping()),
-        _check("embedder", r.embed_http.get("/health")),
-        _check("reranker", r.rerank_http.get("/health")),
+        _check("qdrant", r.qdrant.get_collections),
+        _check("opensearch", r.opensearch.ping),
+        _check("embedder", lambda: r.embed_http.get("/health")),
+        _check("reranker", lambda: r.rerank_http.get("/health")),
     )
 
     deps = dict(results)

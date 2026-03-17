@@ -12,15 +12,15 @@ class Settings(BaseSettings):
     embedder_timeout: float = 30.0
 
     # ── Qdrant (vector search) ───────────────────────────────
-    qdrant_url: str = "http://localhost:8903"
+    qdrant_url: str = "http://localhost:6335"
 
     # ── OpenSearch (BM25 search) ─────────────────────────────
-    opensearch_url: str = "http://localhost:8905"
+    opensearch_url: str = "http://localhost:9201"
 
     # ── Reranker ─────────────────────────────────────────────
     reranker_url: str = "http://172.18.0.6:7998"
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
 
     # ── Server ───────────────────────────────────────────────
-    port: int = 8920
+    port: int = 8921
     log_level: str = "INFO"

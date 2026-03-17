@@ -38,7 +38,6 @@ async def retrieve(body: RetrieveRequest, retriever: HybridRetriever = Depends(g
         strategy=body.strategy,
         query=body.query,
         plan_used=plan,
-        rounds_executed=len(plan.rounds),
     )
 
 
@@ -54,5 +53,4 @@ async def plan_retrieve(body: ExecuteRequest, retriever: HybridRetriever = Depen
         chunks=chunks,
         query=body.query,
         plan=body.plan,
-        rounds_executed=len(body.plan.rounds),
     )

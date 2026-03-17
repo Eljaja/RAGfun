@@ -27,6 +27,7 @@ from models import (
     ExecutionPlan,
     RetrievalStep,
     RerankStep,
+    ScoreSource,
     VectorSearchStep,
 )
 from ranking import (
@@ -92,7 +93,13 @@ class HybridRetriever:
         ranked = sorted(
             data["results"], key=lambda x: x["relevance_score"], reverse=True,
         )
-        return [chunks[r["index"]] for r in ranked[:top_n]]
+        return [
+            chunks[r["index"]].model_copy(update={
+                "score": float(r["relevance_score"]),
+                "score_source": ScoreSource.RERANK,
+            })
+            for r in ranked[:top_n]
+        ]
 
     @retry(
         stop=stop_after_attempt(3),
@@ -182,9 +189,9 @@ class HybridRetriever:
         self,
         *,
         base_query: str,
-        step: RetrievalStep,
+        step,
     ) -> str:
-        query = (step.query or "").strip()
+        query = (getattr(step, "query", "") or "").strip()
         return query or base_query
 
     async def _search_step(
@@ -221,7 +228,7 @@ class HybridRetriever:
     async def _apply_rank_steps(
         self,
         *,
-        query: str,
+        base_query: str,
         chunks: list[ChunkResult],
         rank_steps: list[RerankStep | AdaptiveKStep],
     ) -> list[ChunkResult]:
@@ -229,7 +236,10 @@ class HybridRetriever:
         for rank_step in rank_steps:
             match rank_step:
                 case RerankStep(top_n=top_n):
-                    out = await self._rerank(query, out, top_n=min(top_n, len(out)))
+                    rerank_query = self._resolve_step_query(
+                        base_query=base_query, step=rank_step,
+                    )
+                    out = await self._rerank(rerank_query, out, top_n=min(top_n, len(out)))
                 case AdaptiveKStep(min_k=min_k, max_k=max_k):
                     out = adaptive_k_cutoff(out, min_k=min_k, max_k=max_k)
         return out
@@ -242,17 +252,13 @@ class HybridRetriever:
         plan: ExecutionPlan,
     ) -> list[ChunkResult]:
         """Execute a typed retrieval plan. Returns deduped results sorted desc by score."""
-        merged: list[ChunkResult] = []
-
-        for rnd in plan.rounds:
-            source_lists = await self._fetch_sources(
-                query=query, collection=collection, steps=rnd.retrieve,
-            )
-            chunks = combine_sources(source_lists, rnd.combine)
-            chunks = await self._apply_rank_steps(
-                query=query, chunks=chunks, rank_steps=rnd.rank,
-            )
-            chunks = apply_finalize(chunks, rnd.finalize)
-            merged = dedupe_keep_best(merged + chunks)
-
-        return merged
+        rnd = plan.round
+        source_lists = await self._fetch_sources(
+            query=query, collection=collection, steps=rnd.retrieve,
+        )
+        chunks = combine_sources(source_lists, rnd.combine)
+        chunks = await self._apply_rank_steps(
+            base_query=query, chunks=chunks, rank_steps=rnd.rank,
+        )
+        chunks = apply_finalize(chunks, rnd.finalize)
+        return dedupe_keep_best(chunks)

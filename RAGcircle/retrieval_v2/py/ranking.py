@@ -1,15 +1,25 @@
 from __future__ import annotations
 
-from models import ChunkResult, FuseStep, TrimStep
+from collections import Counter
+
+from models import ChunkResult, FuseStep, ScoreSource, TrimStep
 
 
-def rrf(rankings: list[list[str]], k: int = 60) -> list[tuple[str, float]]:
-    """Reciprocal Rank Fusion over multiple ranked doc_id lists."""
-    scores: dict[str, float] = {}
-    for ranking in rankings:
-        for rank, doc_id in enumerate(ranking):
-            scores[doc_id] = scores.get(doc_id, 0) + 1 / (k + rank + 1)
-    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+def rrf(rankings: list[list[str]], k: int = 60) -> dict[str, float]:
+    """Reciprocal Rank Fusion over multiple ranked doc_id lists.
+
+    Returns a mapping of doc_id -> fused score, where each score is
+    the sum of 1/(k + rank + 1) across all rankings that contain the doc.
+    """
+    contributions = (
+        (doc_id, 1.0 / (k + rank + 1))
+        for ranking in rankings
+        for rank, doc_id in enumerate(ranking)
+    )
+    scores: Counter[str] = Counter()
+    for doc_id, value in contributions:
+        scores[doc_id] += value
+    return dict(scores)
 
 
 def chunk_key(chunk: ChunkResult) -> str:
@@ -20,12 +30,13 @@ def dedupe_keep_best(chunks: list[ChunkResult]) -> list[ChunkResult]:
     best: dict[str, ChunkResult] = {}
     for chunk in chunks:
         key = chunk_key(chunk)
-        current = best.get(key)
-        if current is None or chunk.score > current.score:
+        existing = best.get(key)
+        if existing is None or chunk.score > existing.score:
             best[key] = chunk
-    out = list(best.values())
-    out.sort(key=lambda c: c.score, reverse=True)
-    return out
+
+    result = list(best.values())
+    result.sort(key=lambda c: c.score, reverse=True)
+    return result
 
 
 def adaptive_k_cutoff(
@@ -36,13 +47,26 @@ def adaptive_k_cutoff(
 ) -> list[ChunkResult]:
     if len(chunks) <= 1:
         return chunks
+
     scores = [float(c.score) for c in chunks]
     gaps = [scores[i] - scores[i + 1] for i in range(len(scores) - 1)]
     if not gaps:
         return chunks
-    best_i = max(range(len(gaps)), key=lambda i: gaps[i])
-    effective_k = max(min_k, min(max_k, best_i + 1))
-    return chunks[:effective_k]
+
+    largest_gap_idx = max(range(len(gaps)), key=lambda i: gaps[i])
+    cutoff = max(min_k, min(max_k, largest_gap_idx + 1))
+    return chunks[:cutoff]
+
+
+def _build_chunk_lookup(
+    source_lists: list[list[ChunkResult]],
+) -> dict[str, ChunkResult]:
+    """Build a key -> chunk lookup, keeping the first occurrence per key."""
+    return {
+        chunk_key(chunk): chunk
+        for chunks in reversed(source_lists)
+        for chunk in reversed(chunks)
+    }
 
 
 def fuse_sources(
@@ -55,18 +79,18 @@ def fuse_sources(
         return dedupe_keep_best(source_lists[0])
 
     rankings = [[chunk_key(c) for c in chunks] for chunks in source_lists]
-    keyed_chunks = [
-        (chunk_key(c), c)
-        for chunks in source_lists
-        for c in chunks
-    ]
-    payloads = {cid: chunk for cid, chunk in reversed(keyed_chunks)}
+    fused_scores = rrf(rankings, k=fuse_step.rrf_k)
+    lookup = _build_chunk_lookup(source_lists)
 
-    return [
-        base.model_copy(update={"score": float(fused_score)})
-        for cid, fused_score in rrf(rankings, k=fuse_step.rrf_k)
-        if (base := payloads.get(cid)) is not None
-    ]
+    result: list[ChunkResult] = []
+    for key, fused_score in sorted(fused_scores.items(), key=lambda x: x[1], reverse=True):
+        chunk = lookup.get(key)
+        if chunk is not None:
+            result.append(chunk.model_copy(update={
+                "score": fused_score,
+                "score_source": ScoreSource.RRF,
+            }))
+    return result
 
 
 def combine_sources(
@@ -75,8 +99,9 @@ def combine_sources(
 ) -> list[ChunkResult]:
     if combine is not None:
         return fuse_sources(source_lists, combine)
-    flat = [c for chunks in source_lists for c in chunks]
-    return dedupe_keep_best(flat)
+
+    all_chunks = [c for chunks in source_lists for c in chunks]
+    return dedupe_keep_best(all_chunks)
 
 
 def apply_finalize(
