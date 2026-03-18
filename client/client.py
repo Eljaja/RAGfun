@@ -9,22 +9,18 @@ import httpx
 
 try:
     from .sdk import (
-        APIError,
         AgentStreamRequest,
         ChatRequest,
         ChatStreamRequest,
         ClientAuth,
-        ProjectCreateRequest,
         RagGatewayClient,
     )
 except ImportError:  # pragma: no cover - direct script execution
     from sdk import (  # type: ignore
-        APIError,
         AgentStreamRequest,
         ChatRequest,
         ChatStreamRequest,
         ClientAuth,
-        ProjectCreateRequest,
         RagGatewayClient,
     )
 
@@ -81,21 +77,9 @@ def run_stream(name: str, stream_iter, failures: list[str], max_events: int = 25
         failures.append(name)
 
 
-def ensure_project(client: RagGatewayClient, requested_project_id: str) -> str:
-    try:
-        p = client.get_project(requested_project_id).project
-        return str(p.get("project_id") or requested_project_id)
-    except APIError as exc:
-        if exc.status_code != 404:
-            raise
-
-    created = client.create_project(
-        ProjectCreateRequest(
-            name=requested_project_id,
-            description="gateway client smoke project",
-        )
-    ).project
-    return str(created.get("project_id") or requested_project_id)
+def ensure_default_project(client: RagGatewayClient) -> str:
+    project = client.get_project(client.default_project_id).project
+    return str(project.get("project_id") or client.default_project_id)
 
 
 def wait_for_status_event(
@@ -152,11 +136,16 @@ def main() -> int:
         auth=ClientAuth(bearer_token=bearer_token),
     )
     try:
+        if requested_project_id != client.default_project_id:
+            print(
+                f"Ignoring RAG_PROJECT_ID={requested_project_id!r}; "
+                f"single-project mode uses {client.default_project_id!r}."
+            )
         project_id = run_step(
-            "ensure_project",
-            lambda: ensure_project(client, requested_project_id),
+            "ensure_default_project",
+            lambda: ensure_default_project(client),
             failures,
-        ) or requested_project_id
+        ) or client.default_project_id
 
         upload = run_step(
             "upload_document",

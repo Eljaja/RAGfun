@@ -8,6 +8,8 @@ from typing import Any, Iterator
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
+DEFAULT_PROJECT_ID = "default"
+
 
 class SDKError(RuntimeError):
     """Base exception for the gateway SDK."""
@@ -141,6 +143,7 @@ class RagGatewayClient:
         self._auth = auth or ClientAuth()
         self._client = client or httpx.Client(timeout=timeout_s)
         self._owns_client = client is None
+        self._default_project_id = DEFAULT_PROJECT_ID
 
     def close(self) -> None:
         if self._owns_client:
@@ -165,6 +168,46 @@ class RagGatewayClient:
         if extra:
             out.update(extra)
         return out
+
+    @property
+    def default_project_id(self) -> str:
+        return self._default_project_id
+
+    @staticmethod
+    def _extract_project_id(project: dict[str, Any]) -> str | None:
+        raw = project.get("project_id") or project.get("name")
+        if raw is None:
+            return None
+        return str(raw)
+
+    def _ensure_default_project_id(self, project_id: str | None, *, operation: str) -> str:
+        candidate = (project_id or self._default_project_id).strip() or self._default_project_id
+        if candidate != self._default_project_id:
+            raise SDKError(
+                f"{operation} only supports project_id='{self._default_project_id}' (got '{candidate}')."
+            )
+        return self._default_project_id
+
+    def _normalize_default_filters(self, filters: GateFilters | None, *, operation: str) -> GateFilters:
+        raw = filters.model_dump(exclude_none=True) if filters else {}
+
+        project_id = raw.get("project_id")
+        if project_id not in (None, "", self._default_project_id):
+            raise SDKError(
+                f"{operation} only supports filters.project_id='{self._default_project_id}' (got '{project_id}')."
+            )
+
+        project_ids = [str(pid) for pid in (raw.get("project_ids") or []) if str(pid).strip()]
+        invalid = [pid for pid in project_ids if pid != self._default_project_id]
+        if invalid:
+            raise SDKError(
+                f"{operation} only supports filters.project_ids=['{self._default_project_id}'] "
+                f"(got {project_ids})."
+            )
+
+        raw.pop("project_id", None)
+        raw["project_ids"] = [self._default_project_id]
+        return GateFilters.model_validate(raw)
 
     @staticmethod
     def _raise_for_status(resp: httpx.Response) -> None:
@@ -276,30 +319,58 @@ class RagGatewayClient:
         return self._stream_sse("/api/v1/chat/stream", payload=stream_payload)
 
     def agent_stream(self, payload: AgentStreamRequest) -> Iterator[dict[str, Any]]:
-        return self._stream_sse("/agent-api/v1/agent/stream", payload=payload)
+        stream_payload = payload.model_copy(
+            update={"filters": self._normalize_default_filters(payload.filters, operation="agent_stream")}
+        )
+        return self._stream_sse("/agent-api/v1/agent/stream", payload=stream_payload)
 
     # -------------------------
     # Storage / ingestion (gate_v2)
     # -------------------------
     def list_projects(self) -> ProjectsResponse:
         data = self._request_json("GET", "/storage-api/api/v1/projects")
+        if isinstance(data.get("projects"), list):
+            data["projects"] = [
+                p for p in data["projects"]
+                if isinstance(p, dict) and self._extract_project_id(p) == self._default_project_id
+            ]
         return ProjectsResponse.model_validate(data)
 
     def create_project(self, payload: ProjectCreateRequest) -> ProjectResponse:
-        data = self._request_json("POST", "/storage-api/api/v1/projects", json_body=payload.model_dump(exclude_none=True))
-        return ProjectResponse.model_validate(data)
+        raise SDKError(
+            "create_project is disabled in single-project mode. "
+            f"Use the existing '{self._default_project_id}' project."
+        )
 
-    def get_project(self, project_id: str) -> ProjectResponse:
-        data = self._request_json("GET", f"/storage-api/api/v1/projects/{project_id}")
+    def get_project(self, project_id: str = DEFAULT_PROJECT_ID) -> ProjectResponse:
+        pid = self._ensure_default_project_id(project_id, operation="get_project")
+        data = self._request_json("GET", f"/storage-api/api/v1/projects/{pid}")
+        project = data.get("project")
+        if isinstance(project, dict):
+            actual = self._extract_project_id(project)
+            if actual not in (None, self._default_project_id):
+                raise UnexpectedResponse(
+                    f"Expected project_id '{self._default_project_id}' but got '{actual}' from gateway"
+                )
         return ProjectResponse.model_validate(data)
 
     def delete_project(self, project_id: str) -> dict[str, Any]:
-        return self._request_json("DELETE", f"/storage-api/api/v1/projects/{project_id}")
+        raise SDKError(
+            "delete_project is disabled in single-project mode. "
+            f"The '{self._default_project_id}' project is protected."
+        )
 
-    def list_project_documents(self, project_id: str, *, limit: int = 50, offset: int = 0) -> DocumentsResponse:
+    def list_project_documents(
+        self,
+        project_id: str = DEFAULT_PROJECT_ID,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> DocumentsResponse:
+        pid = self._ensure_default_project_id(project_id, operation="list_project_documents")
         data = self._request_json(
             "GET",
-            f"/storage-api/api/v1/projects/{project_id}/documents",
+            f"/storage-api/api/v1/projects/{pid}/documents",
             params={"limit": limit, "offset": offset},
         )
         return DocumentsResponse.model_validate(data)
@@ -318,6 +389,7 @@ class RagGatewayClient:
         acl: str | None = None,
         refresh: bool = False,
     ) -> UploadResponse:
+        pid = self._ensure_default_project_id(project_id, operation="upload_document")
         path = Path(file_path)
         if not path.exists() or not path.is_file():
             raise FileNotFoundError(f"File not found: {path}")
@@ -341,7 +413,7 @@ class RagGatewayClient:
         with path.open("rb") as fh:
             data = self._request_json(
                 "POST",
-                f"/storage-api/api/v1/projects/{project_id}/upload",
+                f"/storage-api/api/v1/projects/{pid}/upload",
                 data=form_data,
                 files={"file": (path.name, fh, "application/octet-stream")},
             )

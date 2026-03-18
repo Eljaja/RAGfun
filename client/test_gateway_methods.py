@@ -9,22 +9,18 @@ import httpx
 
 try:
     from .sdk import (
-        APIError,
         AgentStreamRequest,
         ChatRequest,
         ChatStreamRequest,
         ClientAuth,
-        ProjectCreateRequest,
         RagGatewayClient,
     )
 except ImportError:  # pragma: no cover - direct script execution
     from sdk import (
-        APIError,
         AgentStreamRequest,
         ChatRequest,
         ChatStreamRequest,
         ClientAuth,
-        ProjectCreateRequest,
         RagGatewayClient,
     )
 
@@ -46,20 +42,9 @@ def bearer_headers(token: str | None) -> dict[str, str]:
     return headers
 
 
-def ensure_project(client: RagGatewayClient, requested_project_id: str) -> str:
-    try:
-        p = client.get_project(requested_project_id).project
-        return str(p.get("project_id") or requested_project_id)
-    except APIError as exc:
-        if exc.status_code != 404:
-            raise
-    created = client.create_project(
-        ProjectCreateRequest(
-            name=requested_project_id,
-            description="gateway methods test project",
-        )
-    ).project
-    return str(created.get("project_id") or requested_project_id)
+def ensure_default_project(client: RagGatewayClient) -> str:
+    project = client.get_project(client.default_project_id).project
+    return str(project.get("project_id") or client.default_project_id)
 
 
 def wait_for_status_event(client: RagGatewayClient, doc_id: str, timeout_s: int = 45, poll_s: int = 3) -> dict[str, Any] | None:
@@ -114,7 +99,7 @@ def run_stream(name: str, stream_iter, failures: list[str], max_events: int = 40
 
 
 def main() -> int:
-    gateway_url = os.environ.get("RAG_GATEWAY_URL", "http://localhost:8916").rstrip("/")
+    gateway_url = os.environ.get("RAG_GATEWAY_URL", "http://202.181.159.221:8916").rstrip("/")
     bearer_token = os.environ.get("RAG_BEARER_TOKEN")
     requested_project_id = os.environ.get("RAG_PROJECT_ID", "default")
     run_stream_checks = os.environ.get("RAG_RUN_STREAM_CHECKS", "false").lower() in {"1", "true", "yes"}
@@ -158,13 +143,18 @@ def main() -> int:
         auth=ClientAuth(bearer_token=bearer_token),
     )
     try:
+        if requested_project_id != client.default_project_id:
+            print(
+                f"Ignoring RAG_PROJECT_ID={requested_project_id!r}; "
+                f"single-project mode uses {client.default_project_id!r}."
+            )
         run_step("list_projects", lambda: client.list_projects().model_dump(), failures)
 
         project_id = run_step(
-            "ensure_project",
-            lambda: ensure_project(client, requested_project_id),
+            "ensure_default_project",
+            lambda: ensure_default_project(client),
             failures,
-        ) or requested_project_id
+        ) or client.default_project_id
 
         run_step("get_project", lambda: client.get_project(project_id).model_dump(), failures)
         run_step(
