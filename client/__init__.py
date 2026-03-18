@@ -6,12 +6,14 @@ from .sdk import (
     ChatMessage,
     ChatStreamRequest,
     ClientAuth,
+    DEFAULT_PROJECT_ID,
     DocumentsResponse,
     GateFilters,
     ProjectCreateRequest,
     ProjectResponse,
     ProjectsResponse,
     RagGatewayClient,
+    SDKError,
     UploadResponse,
 )
 
@@ -23,12 +25,14 @@ __all__ = [
     "ChatMessage",
     "ChatStreamRequest",
     "ClientAuth",
+    "DEFAULT_PROJECT_ID",
     "DocumentsResponse",
     "GateFilters",
     "ProjectCreateRequest",
     "ProjectResponse",
     "ProjectsResponse",
     "RagGatewayClient",
+    "SDKError",
     "UploadResponse",
 ]
 
