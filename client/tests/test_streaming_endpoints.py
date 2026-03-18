@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import os
+import sys
 from collections import Counter
+from pathlib import Path
 from typing import Any, Callable, Iterator
 
-try:
-    from .sdk import AgentStreamRequest, ChatStreamRequest, ClientAuth, RagGatewayClient
-except ImportError:  # pragma: no cover - direct script execution
-    from sdk import AgentStreamRequest, ChatStreamRequest, ClientAuth, RagGatewayClient  # type: ignore
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from sdk import AgentStreamRequest, ChatStreamRequest, ClientAuth, RagGatewayClient  # noqa: E402
 
 
 def run_step(name: str, fn: Callable[[], Any], failures: list[str]) -> Any | None:
@@ -75,10 +78,7 @@ def main() -> int:
 
     failures: list[str] = []
 
-    client = RagGatewayClient(
-        base_url=gateway_url,
-        auth=ClientAuth(bearer_token=bearer_token),
-    )
+    client = RagGatewayClient(base_url=gateway_url, auth=ClientAuth(bearer_token=bearer_token))
     try:
         run_step("get_project(default)", lambda: client.get_project().model_dump(), failures)
 
@@ -89,7 +89,6 @@ def main() -> int:
                     ChatStreamRequest(
                         query='What is the pineapple secret message? Return quote only.',
                         include_sources=True,
-                        # Intentionally provided to verify SDK behavior around chat filters.
                         filters={"project_ids": [client.default_project_id]},
                     )
                 ),

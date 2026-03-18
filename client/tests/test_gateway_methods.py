@@ -1,31 +1,20 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any, Callable
 
 import httpx
 
-try:
-    from .sdk import (
-        AgentStreamRequest,
-        ChatRequest,
-        ChatStreamRequest,
-        ClientAuth,
-        RagGatewayClient,
-    )
-except ImportError:  # pragma: no cover - direct script execution
-    from sdk import (
-        AgentStreamRequest,
-        ChatRequest,
-        ChatStreamRequest,
-        ClientAuth,
-        RagGatewayClient,
-    )
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
+from sdk import AgentStreamRequest, ChatRequest, ChatStreamRequest, ClientAuth, RagGatewayClient  # noqa: E402
 
-SECRET_FILE = Path(__file__).with_name("pineapple_secret_message.txt")
+SECRET_FILE = ROOT_DIR / "pineapple_secret_message.txt"
 SECRET_TEXT = 'Here is a secret message about pineapples "they are Sentient"\n'
 
 
@@ -112,36 +101,16 @@ def main() -> int:
 
     failures: list[str] = []
 
-    # Raw health/readiness checks (not all are present in SDK).
     with httpx.Client(timeout=20.0, headers=bearer_headers(bearer_token)) as raw:
-        run_step(
-            "GET /public/health",
-            lambda: raw.get(f"{gateway_url}/public/health").json(),
-            failures,
-        )
-        run_step(
-            "GET /storage-api/public/health",
-            lambda: raw.get(f"{gateway_url}/storage-api/public/health").json(),
-            failures,
-        )
-        run_step(
-            "GET /api/v1/readyz",
-            lambda: raw.get(f"{gateway_url}/api/v1/readyz").json(),
-            failures,
-        )
-        run_step(
-            "GET /agent-api/v1/readyz",
-            lambda: raw.get(f"{gateway_url}/agent-api/v1/readyz").json(),
-            failures,
-        )
+        run_step("GET /public/health", lambda: raw.get(f"{gateway_url}/public/health").json(), failures)
+        run_step("GET /storage-api/public/health", lambda: raw.get(f"{gateway_url}/storage-api/public/health").json(), failures)
+        run_step("GET /api/v1/readyz", lambda: raw.get(f"{gateway_url}/api/v1/readyz").json(), failures)
+        run_step("GET /agent-api/v1/readyz", lambda: raw.get(f"{gateway_url}/agent-api/v1/readyz").json(), failures)
 
     secret_file = ensure_secret_file()
     uploaded_doc_id: str | None = None
 
-    client = RagGatewayClient(
-        base_url=gateway_url,
-        auth=ClientAuth(bearer_token=bearer_token),
-    )
+    client = RagGatewayClient(base_url=gateway_url, auth=ClientAuth(bearer_token=bearer_token))
     try:
         if requested_project_id != client.default_project_id:
             print(
@@ -150,18 +119,10 @@ def main() -> int:
             )
         run_step("list_projects", lambda: client.list_projects().model_dump(), failures)
 
-        project_id = run_step(
-            "ensure_default_project",
-            lambda: ensure_default_project(client),
-            failures,
-        ) or client.default_project_id
+        project_id = run_step("ensure_default_project", lambda: ensure_default_project(client), failures) or client.default_project_id
 
         run_step("get_project", lambda: client.get_project(project_id).model_dump(), failures)
-        run_step(
-            "list_project_documents",
-            lambda: client.list_project_documents(project_id, limit=5, offset=0).model_dump(),
-            failures,
-        )
+        run_step("list_project_documents", lambda: client.list_project_documents(project_id, limit=5, offset=0).model_dump(), failures)
 
         upload = run_step(
             "upload_document",
@@ -178,11 +139,7 @@ def main() -> int:
             uploaded_doc_id = str(upload.get("doc_id") or "")
 
         if uploaded_doc_id:
-            run_step(
-                "wait_for_status_event",
-                lambda: wait_for_status_event(client, uploaded_doc_id) or {"status": "no_index_event_yet"},
-                failures,
-            )
+            run_step("wait_for_status_event", lambda: wait_for_status_event(client, uploaded_doc_id) or {"status": "no_index_event_yet"}, failures)
             run_step("get_document", lambda: client.get_document(uploaded_doc_id), failures)
             run_step("get_document_status", lambda: client.get_document_status(uploaded_doc_id), failures)
 
@@ -193,7 +150,7 @@ def main() -> int:
                     query='What is the secret message about pineapples? Return the exact quote only.',
                     include_sources=True,
                     filters={"project_ids": [project_id]},
-                ),
+                )
             ).model_dump(),
             failures,
         )
@@ -239,4 +196,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

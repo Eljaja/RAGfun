@@ -50,6 +50,25 @@ The SDK now enforces a single project/collection:
 - `GET /api/v1/readyz`
 - `GET /agent-api/v1/readyz`
 
+## Project layout
+
+```text
+client/
+  sdk.py
+  __init__.py
+  requirements.txt
+  pineapple_secret_message.txt
+  examples/
+    basic_chat_stream.py
+    basic_agent_stream.py
+    upload_and_document_status.py
+  tests/
+    test_gateway_methods.py
+    test_default_project_policy.py
+    test_streaming_endpoints.py
+    run_all.py
+```
+
 ### Handling duplicate uploads (`409`)
 
 ```python
@@ -77,7 +96,7 @@ finally:
 
 ```python
 from gate_v2.client import (
-    ChatRequest,
+    AgentStreamRequest,
     ChatStreamRequest,
     ClientAuth,
     RagGatewayClient,
@@ -94,89 +113,74 @@ for event in client.chat_stream(payload):
     if event.get("type") in {"done", "error"}:
         break
 
-# Non-stream chat (actual chat method)
-resp = client.chat(
-    ChatRequest(
-        query="Give me a short summary",
-        include_sources=True,
-    )
+# Agent stream example
+agent_payload = AgentStreamRequest(
+    query="What is the pineapple secret message? Return quote only.",
+    include_sources=True,
+    filters={"project_ids": [client.default_project_id]},
 )
-print(resp.answer)
+for event in client.agent_stream(agent_payload):
+    print(event)
+    if event.get("type") in {"done", "error"}:
+        break
 
 client.close()
 ```
 
-## `client.py` smoke test
+## Examples
 
-`client.py` now runs a small end-to-end check:
-
-1. writes/uses `pineapple_secret_message.txt`
-2. uses the existing `default` project
-3. uploads the file
-4. waits briefly for status
-5. sends a short chat query via rag-gate about the secret message
-
-Optional env vars:
-
-- `RAG_GATEWAY_URL` (default `http://202.181.159.221:8916`)
-- `RAG_BEARER_TOKEN` (if auth is enabled)
-- `RAG_PROJECT_ID` (ignored if not `default`; single-project mode)
-
-## Full methods test script
-
-Use `test_gateway_methods.py` to call the unified endpoint methods with a pass/fail summary:
+### Basic chat stream
 
 ```bash
-python test_gateway_methods.py
+python examples/basic_chat_stream.py
 ```
 
-Optional env vars:
-
-- `RAG_GATEWAY_URL` (default `http://202.181.159.221:8916`)
-- `RAG_BEARER_TOKEN` (if auth is enabled)
-- `RAG_PROJECT_ID` (ignored if not `default`; single-project mode)
-- `RAG_RUN_STREAM_CHECKS` (`true|false`, default `false`)
-- `RAG_CLEANUP_DOC` (`true|false`, default `false`)
-
-## Additional scripts
-
-### Read-only example
+### Basic agent stream
 
 ```bash
-python example_default_project_readonly.py
+python examples/basic_agent_stream.py
+```
+
+### Upload + list documents + status checks
+
+```bash
+python examples/upload_and_document_status.py
 ```
 
 Demonstrates:
-- list/get project (default only)
-- list default project documents
-- run a chat request
+- upload a file to `default`
+- `409` duplicate handling on upload
+- listing documents with `list_project_documents()`
+- checking processing status with `get_document_status()`
 
-### Default-policy checks
+## Tests
 
-```bash
-python test_default_project_policy.py
-```
-
-Verifies:
-- happy-path reads on `default`
-- blocking of project writes
-- blocking of non-default project IDs
-- duplicate upload behavior can return `409` and is considered expected
-
-### Streaming endpoint checks
+### Run all tests
 
 ```bash
-python test_streaming_endpoints.py
+python tests/run_all.py
 ```
 
-Verifies:
-- `chat_stream` completes with SSE `done`
-- `agent_stream` completes with SSE `done`
-- no `error` events are emitted
-- final answer payload is non-empty
+### Run a single test
 
-Optional env vars:
-- `RAG_STREAM_MAX_EVENTS` (default `500`)
+```bash
+python tests/test_gateway_methods.py
+python tests/test_default_project_policy.py
+python tests/test_streaming_endpoints.py
+```
+
+What each test covers:
+- `test_gateway_methods.py`: end-to-end methods/health/storage + optional stream checks
+- `test_default_project_policy.py`: enforces default-only/read-only behavior
+- `test_streaming_endpoints.py`: validates chat + agent SSE flows reach `done`
+
+Common env vars for examples and tests:
+- `RAG_GATEWAY_URL` (default `http://202.181.159.221:8916`)
+- `RAG_BEARER_TOKEN` (if auth is enabled)
+- `RAG_PROJECT_ID` (ignored if not `default`; single-project mode)
+- `RAG_STREAM_MAX_EVENTS` (stream test cap, default `500`)
+- `RAG_RUN_STREAM_CHECKS` (`test_gateway_methods.py`, default `false`)
+- `RAG_CLEANUP_DOC` (`test_gateway_methods.py`, default `false`)
 
 ## Notes
 
