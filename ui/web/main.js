@@ -948,7 +948,7 @@ async function loadCollections() {
     console.warn("Failed to load collections:", e);
     collectionsState.loaded = true;
     populateCollectionsUI([]);
-    if (hintEl) hintEl.textContent = "Could not load projects. Check gate_v2 connection on :8912.";
+    if (hintEl) hintEl.textContent = "Could not load projects. Check unified gateway on :8916.";
   }
 }
 
