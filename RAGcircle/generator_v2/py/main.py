@@ -8,7 +8,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from config import Settings
-from endpoints import agent_router, chat_router
+from endpoints import agent_router, chat_router, execute_router
 from llm import LLMClient
 
 logger = logging.getLogger(__name__)
@@ -41,6 +41,7 @@ app = FastAPI(lifespan=lifespan, title="Brain Service")
 
 app.include_router(chat_router)
 app.include_router(agent_router)
+app.include_router(execute_router)
 
 
 @app.get("/health")

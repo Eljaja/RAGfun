@@ -1,12 +1,17 @@
-"""Chunk processing for LLM context: merging, formatting, citations, sources."""
+"""Chunk processing for LLM context: merging, stitching, formatting, citations, sources."""
 
 from __future__ import annotations
 
 import re
+from itertools import groupby
+from typing import Any
 
 from models import ChunkResult
 
 _CIT_RE = re.compile(r"\[\d+\]")
+
+
+# ── Merging ──────────────────────────────────────────────
 
 
 def merge_chunks(
@@ -26,13 +31,62 @@ def merge_chunks(
     return result[:cap]
 
 
+# ── Segment stitching ────────────────────────────────────
+
+
+def stitch_segments(
+    chunks: list[ChunkResult],
+    *,
+    max_per_segment: int = 4,
+) -> list[ChunkResult]:
+    """Combine adjacent chunks from the same document into larger segments.
+
+    Groups by source_id, sorts by chunk_index within each group,
+    joins text with '\\n...\\n', and returns synthetic chunks using
+    the best score and lowest chunk_index per group.
+    """
+    if not chunks:
+        return []
+
+    keyfn = lambda c: c.source_id
+    sorted_chunks = sorted(chunks, key=lambda c: (c.source_id, c.chunk_index))
+    stitched: list[ChunkResult] = []
+
+    for _src_id, group_iter in groupby(sorted_chunks, key=keyfn):
+        group = list(group_iter)[:max_per_segment]
+        if len(group) == 1:
+            stitched.append(group[0])
+            continue
+        combined_text = "\n...\n".join(c.text.strip() for c in group if c.text.strip())
+        if not combined_text:
+            continue
+        best = max(group, key=lambda c: c.score)
+        stitched.append(ChunkResult(
+            text=combined_text,
+            source_id=group[0].source_id,
+            chunk_index=group[0].chunk_index,
+            score=best.score,
+            score_source=best.score_source,
+        ))
+
+    stitched.sort(key=lambda c: c.score, reverse=True)
+    return stitched
+
+
+# ── Context building ─────────────────────────────────────
+
+
 def build_context(
     chunks: list[ChunkResult],
     *,
     max_chars: int = 6000,
     max_chunk_chars: int = 1200,
+    source_meta: dict[str, dict[str, Any]] | None = None,
 ) -> str:
-    """Format chunks into a numbered context string for the LLM."""
+    """Format chunks into a numbered context string for the LLM.
+
+    source_meta maps source_id -> {title, uri, locator} for richer headers.
+    """
     blocks: list[str] = []
     total = 0
     for i, chunk in enumerate(chunks, start=1):
@@ -41,7 +95,16 @@ def build_context(
             continue
         if len(text) > max_chunk_chars:
             text = text[:max_chunk_chars - 3].rstrip() + "..."
-        header = f"[{i}] source={chunk.source_id} score={chunk.score:.4f}"
+
+        header = f"[{i}] source={chunk.source_id}"
+        if source_meta:
+            meta = source_meta.get(chunk.source_id, {})
+            if meta.get("title"):
+                header += f" title={meta['title']}"
+            if meta.get("uri"):
+                header += f" uri={meta['uri']}"
+        header += f" score={chunk.score:.4f}"
+
         block = f"{header}\n{text}"
         if total + len(block) > max_chars:
             remaining = max_chars - total - len(header) - 10
@@ -52,6 +115,9 @@ def build_context(
         blocks.append(block)
         total += len(block)
     return "\n\n".join(blocks)
+
+
+# ── Source extraction ────────────────────────────────────
 
 
 def extract_sources(chunks: list[ChunkResult]) -> list[str]:
@@ -65,23 +131,61 @@ def extract_sources(chunks: list[ChunkResult]) -> list[str]:
     return sources
 
 
-def extract_source_details(chunks: list[ChunkResult]) -> list[dict]:
-    """Build source list with ref numbers for citation (1-based)."""
+def extract_source_details(
+    chunks: list[ChunkResult],
+    source_meta: dict[str, dict[str, Any]] | None = None,
+) -> list[dict]:
+    """Build source list with ref numbers and optional metadata (title, uri, locator)."""
     seen: dict[str, int] = {}
     sources: list[dict] = []
     for i, chunk in enumerate(chunks, start=1):
         if chunk.source_id not in seen:
             seen[chunk.source_id] = i
-            sources.append({"ref": i, "source_id": chunk.source_id})
+            entry: dict[str, Any] = {"ref": i, "source_id": chunk.source_id}
+            if source_meta:
+                meta = source_meta.get(chunk.source_id, {})
+                if meta.get("title"):
+                    entry["title"] = meta["title"]
+                if meta.get("uri"):
+                    entry["uri"] = meta["uri"]
+                if meta.get("locator"):
+                    entry["locator"] = meta["locator"]
+            sources.append(entry)
     return sources
+
+
+# ── Citations ────────────────────────────────────────────
 
 
 def has_citations(text: str) -> bool:
     return bool(text) and bool(_CIT_RE.search(text))
 
 
+# ── Conversation history ─────────────────────────────────
+
+
+def history_as_messages(
+    history: list[dict[str, str]],
+    *,
+    max_turns: int | None = None,
+) -> list[dict[str, str]]:
+    """Return full chat history as validated message dicts.
+
+    Suitable for direct insertion into the LLM messages list.
+    """
+    valid: list[dict[str, str]] = []
+    for m in history:
+        role = (m.get("role") or "").lower()
+        content = (m.get("content") or "").strip()
+        if role in ("user", "assistant", "system") and content:
+            valid.append({"role": role, "content": content})
+    if max_turns is not None and max_turns > 0:
+        valid = valid[-(max_turns * 2):]
+    return valid
+
+
 def history_summary(history: list[dict[str, str]], max_turns: int = 3) -> str:
-    """Format last N conversation turns for prompt context."""
+    """Format last N conversation turns for prompt context (legacy)."""
     if not history:
         return ""
     turns = history[-(max_turns * 2):]

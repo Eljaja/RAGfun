@@ -13,6 +13,55 @@ from tools import execute_tool
 logger = logging.getLogger(__name__)
 
 
+class ThinkStripper:
+    """Streaming-safe removal of <think>...</think> blocks.
+
+    Handles tags split across SSE chunks by buffering partial matches.
+    """
+
+    _OPEN = "<think>"
+    _CLOSE = "</think>"
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._in_think = False
+
+    def feed(self, chunk: str) -> str:
+        if not chunk:
+            return ""
+        self._buf += chunk
+        out_parts: list[str] = []
+
+        while True:
+            low = self._buf.lower()
+            if not self._in_think:
+                idx = low.find(self._OPEN)
+                if idx == -1:
+                    keep = len(self._OPEN) - 1
+                    if len(self._buf) <= keep:
+                        return "".join(out_parts)
+                    out_parts.append(self._buf[:-keep])
+                    self._buf = self._buf[-keep:]
+                    return "".join(out_parts)
+                out_parts.append(self._buf[:idx])
+                self._buf = self._buf[idx + len(self._OPEN):]
+                self._in_think = True
+            else:
+                idx = low.find(self._CLOSE)
+                if idx == -1:
+                    return "".join(out_parts)
+                self._buf = self._buf[idx + len(self._CLOSE):]
+                self._in_think = False
+
+    def finalize(self) -> str:
+        if self._in_think:
+            tail = ""
+        else:
+            tail = self._buf
+        self._buf = ""
+        return tail
+
+
 class LLMClient:
     """Async client for OpenAI-compatible chat/completions endpoints."""
 
@@ -49,6 +98,7 @@ class LLMClient:
         messages: list[dict[str, Any]],
         *,
         temperature: float = 0.2,
+        strip_thinking: bool = True,
     ) -> AsyncIterator[str]:
         payload = {
             "model": model,
@@ -56,6 +106,7 @@ class LLMClient:
             "temperature": temperature,
             "stream": True,
         }
+        stripper = ThinkStripper() if strip_thinking else None
         async with self._client.stream(
             "POST", self._url, json=payload, headers=self._headers,
         ) as resp:
@@ -72,7 +123,16 @@ class LLMClient:
                     continue
                 content = chunk.get("choices", [{}])[0].get("delta", {}).get("content")
                 if content:
-                    yield content
+                    if stripper:
+                        safe = stripper.feed(content)
+                        if safe:
+                            yield safe
+                    else:
+                        yield content
+            if stripper:
+                tail = stripper.finalize()
+                if tail:
+                    yield tail
 
     async def complete_with_tools(
         self,
