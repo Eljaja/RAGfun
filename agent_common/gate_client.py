@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import httpx
@@ -64,6 +65,8 @@ class AsyncGateClient:
         self._base_url = base_url.rstrip("/")
         self._timeout_s = timeout_s
         self._retry_attempts = retry_attempts
+        self._use_gate_v2 = os.environ.get("AGENT_GATE_USE_V2", "").lower() in ("1", "true", "yes")
+        self._default_project_id = os.environ.get("AGENT_GATE_PROJECT_ID", "default").strip() or "default"
 
     async def chat(
         self,
@@ -79,7 +82,17 @@ class AsyncGateClient:
         include_sources: bool = True,
         headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """Call gate /v1/chat and return normalized response with hits, context, sources."""
+        """Call retrieval backend and return normalized response with hits/context."""
+        if self._use_gate_v2:
+            return await self._chat_gate_v2(
+                client,
+                query,
+                retrieval_mode=retrieval_mode,
+                top_k=top_k,
+                rerank=rerank,
+                filters=filters,
+            )
+
         url = f"{self._base_url}/v1/chat"
         payload: dict[str, Any] = {
             "query": query,
@@ -101,13 +114,37 @@ class AsyncGateClient:
         )
         async def _call() -> dict[str, Any]:
             resp = await client.post(url, json=payload, timeout=self._timeout_s, headers=headers)
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                detail = ""
+                try:
+                    data = resp.json()
+                    detail = str(data.get("detail") or data.get("error") or "")
+                except Exception:
+                    detail = (resp.text or "").strip()
+                msg = f"Gate HTTP {resp.status_code}"
+                if detail:
+                    msg += f": {detail}"
+                raise httpx.HTTPStatusError(msg, request=resp.request, response=resp)
             return resp.json()
 
         try:
             data = await _call()
             return _normalize_gate_response(data, retrieval_mode)
-        except Exception:
+        except httpx.HTTPStatusError as e:
+            status_code = e.response.status_code if e.response is not None else None
+            return {
+                "ok": False,
+                "mode": retrieval_mode,
+                "partial": True,
+                "degraded": ["gate_http_error"],
+                "hits": [],
+                "context": [],
+                "sources": [],
+                "error": str(e),
+                "status_code": status_code,
+                "retrieval": {"ok": False, "partial": True, "degraded": ["gate_http_error"]},
+            }
+        except Exception as e:
             return {
                 "ok": False,
                 "mode": retrieval_mode,
@@ -116,5 +153,121 @@ class AsyncGateClient:
                 "hits": [],
                 "context": [],
                 "sources": [],
+                "error": str(e),
+                "retrieval": {"ok": False, "partial": True, "degraded": ["gate_error"]},
+            }
+
+    async def _chat_gate_v2(
+        self,
+        client: httpx.AsyncClient,
+        query: str,
+        *,
+        retrieval_mode: str,
+        top_k: int,
+        rerank: bool,
+        filters: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        project_id = self._default_project_id
+        if filters:
+            if filters.get("project_id"):
+                project_id = str(filters.get("project_id"))
+            elif isinstance(filters.get("project_ids"), list) and filters.get("project_ids"):
+                project_id = str(filters.get("project_ids")[0])
+        url = f"{self._base_url}/api/v1/projects/{project_id}/retrieve"
+        payload = {
+            "query": query,
+            "top_k": int(top_k),
+            "rerank": bool(rerank),
+            "strategy": retrieval_mode if retrieval_mode in ("hybrid", "bm25", "vector") else "hybrid",
+        }
+        try:
+            resp = await client.post(url, json=payload, timeout=self._timeout_s)
+            if resp.status_code >= 400:
+                detail = ""
+                try:
+                    data = resp.json()
+                    detail = str(data.get("detail") or data.get("error") or "")
+                except Exception:
+                    detail = (resp.text or "").strip()
+                msg = f"Gate HTTP {resp.status_code}"
+                if detail:
+                    msg += f": {detail}"
+                raise httpx.HTTPStatusError(msg, request=resp.request, response=resp)
+            data = resp.json()
+            raw_chunks = list(data.get("chunks") or [])
+            context_chunks: list[dict[str, Any]] = []
+            hits: list[dict[str, Any]] = []
+            for c in raw_chunks:
+                source_id = str(c.get("source_id") or "unknown")
+                chunk_idx = c.get("chunk_index")
+                chunk_id = f"{source_id}:{chunk_idx}" if chunk_idx is not None else source_id
+                score = c.get("score")
+                text = c.get("text")
+                src = {"doc_id": source_id, "title": source_id}
+                ctx = {
+                    "chunk_id": chunk_id,
+                    "doc_id": source_id,
+                    "score": score,
+                    "text": text,
+                    "source": src,
+                }
+                context_chunks.append(ctx)
+                hits.append(
+                    {
+                        "chunk_id": chunk_id,
+                        "doc_id": source_id,
+                        "score": score,
+                        "text": text,
+                        "source": src,
+                    }
+                )
+            seen: set[str] = set()
+            sources: list[dict[str, Any]] = []
+            for h in hits:
+                doc_id = str(h.get("doc_id") or "")
+                if not doc_id or doc_id in seen:
+                    continue
+                seen.add(doc_id)
+                sources.append({"doc_id": doc_id, "title": doc_id, "ref": len(sources) + 1})
+            return {
+                "ok": True,
+                "mode": payload["strategy"],
+                "partial": False,
+                "degraded": [],
+                "hits": hits,
+                "context": context_chunks,
+                "sources": sources,
+                "retrieval": {
+                    "ok": True,
+                    "mode": payload["strategy"],
+                    "partial": False,
+                    "degraded": [],
+                    "hits": hits,
+                },
+            }
+        except httpx.HTTPStatusError as e:
+            status_code = e.response.status_code if e.response is not None else None
+            return {
+                "ok": False,
+                "mode": retrieval_mode,
+                "partial": True,
+                "degraded": ["gate_http_error"],
+                "hits": [],
+                "context": [],
+                "sources": [],
+                "error": str(e),
+                "status_code": status_code,
+                "retrieval": {"ok": False, "partial": True, "degraded": ["gate_http_error"]},
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "mode": retrieval_mode,
+                "partial": True,
+                "degraded": ["gate_error"],
+                "hits": [],
+                "context": [],
+                "sources": [],
+                "error": str(e),
                 "retrieval": {"ok": False, "partial": True, "degraded": ["gate_error"]},
             }

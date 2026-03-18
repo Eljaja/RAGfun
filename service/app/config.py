@@ -16,14 +16,14 @@ class Settings(BaseSettings):
     os_url: AnyHttpUrl = Field(default="http://localhost:9200")
     os_username: str | None = None
     os_password: SecretStr | None = None
-    os_index_alias: str = "rag_chunks"
-    os_index_prefix: str = "rag_chunks_v"
+    os_index_alias: str = "default"
+    os_index_prefix: str = "default_v"
     require_opensearch: bool = False
 
     # Qdrant
     qdrant_url: AnyHttpUrl = Field(default="http://localhost:6333")
     qdrant_api_key: SecretStr | None = None
-    qdrant_collection: str = "rag_chunks"
+    qdrant_collection: str = "default"
     vector_size: int = 768
     vector_distance: str = "cosine"  # cosine|dot|euclid
     require_qdrant: bool = False

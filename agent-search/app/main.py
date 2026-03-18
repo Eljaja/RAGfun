@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 import uuid
 from typing import Any, AsyncIterator
@@ -80,6 +81,34 @@ def _history_summary(history: list[dict[str, str]], max_turns: int = 3) -> str:
     if not parts:
         return ""
     return "Recent conversation:\n" + "\n".join(parts) + "\n\n"
+
+
+def _guess_language_from_text(text: str) -> str:
+    if re.search(r"[\u0400-\u04FF]", text or ""):
+        return "Russian"
+    if re.search(r"[A-Za-z]", text or ""):
+        return "English"
+    return "English"
+
+
+def _normalize_language_name(raw: str | None, fallback_text: str = "") -> str:
+    s = (raw or "").strip().strip('"').strip("'")
+    if not s:
+        return _guess_language_from_text(fallback_text)
+    s_low = s.lower()
+    if "russian" in s_low or "рус" in s_low:
+        return "Russian"
+    if "english" in s_low or "англ" in s_low:
+        return "English"
+    # If model returned a sentence, infer from script and keep canonical names only.
+    return _guess_language_from_text(s)
+
+
+def _looks_like_language_only_answer(text: str) -> bool:
+    s = (text or "").strip().strip(".:;").lower()
+    if not s:
+        return True
+    return s in {"english", "russian", "русский", "английский"}
 
 
 MEME_GRUMPS = [
@@ -466,7 +495,7 @@ async def _detect_language(
         temperature=0.0,
         timeout_s=timeout_s,
     )
-    return (raw or "").strip() or "English"
+    return _normalize_language_name(raw, fallback_text=text)
 
 
 def _with_trace_id(event: dict[str, Any], trace_id: str) -> dict[str, Any]:
@@ -516,6 +545,18 @@ async def _gate_chat_once(
             ),
             timeout=timeout_s,
         )
+        if not result.get("ok", True):
+            err = str(result.get("error") or "gate_error")
+            status_code = result.get("status_code")
+            if status_code == 401 or "missing_api_key" in err.lower():
+                return (
+                    None,
+                    {
+                        "type": "error",
+                        "error": "Gate auth error: missing or invalid ODS API key. Set X-ODS-API-KEY in UI header.",
+                    },
+                )
+            return (None, {"type": "error", "error": f"Gate request failed: {err}"})
         return (result, None)
     except asyncio.TimeoutError:
         return (None, {"type": "error", "error": "Gate (retrieval) timeout. Check rag-gate and retrieval."})
@@ -603,7 +644,7 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient, *, gate_h
             client, llm_base, llm_model, llm_key, payload.query, timeout_s=llm_timeout
         )
     else:
-        answer_lang = "English"
+        answer_lang = _guess_language_from_text(payload.query)
 
     hyde_num = payload.hyde_num if payload.hyde_num is not None else int(_env_get("AGENT_HYDE_NUM", "1"))
     hyde_num = max(1, min(7, hyde_num))
@@ -775,8 +816,14 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient, *, gate_h
         if use_tools:
             context_text = "[No relevant documents. Use calculator for math, execute_code for code.]"
         else:
-            yield {"type": "error", "error": "no_context"}
-            return
+            # Graceful fallback: do not fail the whole agent request when retrieval is empty.
+            # The model can still return a best-effort general answer and explicitly note
+            # that it was not grounded in project documents.
+            context_text = (
+                "[No relevant project documents were retrieved. "
+                "Provide a concise best-effort answer from general knowledge and "
+                "explicitly mention that no local sources were found.]"
+            )
 
     hist_ctx = _history_summary(hist) if hist else ""
     system_content = ANSWER_SYSTEM_WITH_TOOLS.format(lang=answer_lang) if use_tools else ANSWER_SYSTEM.format(lang=answer_lang)
@@ -825,6 +872,27 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient, *, gate_h
         full_answer = strip_thinking("".join(answer_parts))
         if not full_answer.strip():
             full_answer = "[Answer generation timed out or produced no text. Try a shorter query or check the LLM endpoint.]"
+    if _looks_like_language_only_answer(full_answer) and _can_llm():
+        AGENT_LLM_CALLS.labels(stage="answer_recover").inc()
+        yield {
+            "type": "trace",
+            "kind": "thought",
+            "label": "Recover",
+            "content": "Answer looked truncated (language-only). Regenerating once.",
+        }
+        recovered = await _llm_chat(
+            client,
+            llm_base,
+            llm_model,
+            llm_key,
+            [system, user],
+            temperature=0.2,
+            timeout_s=llm_timeout,
+        )
+        recovered = strip_thinking(recovered or "").strip()
+        if recovered:
+            full_answer = recovered
+
     sources = sources_from_context(context_chunks) if context_chunks else (primary.get("sources") or [])
 
     if _can_llm():
@@ -996,6 +1064,27 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient, *, gate_h
                     temperature=0.2,
                     timeout_s=llm_timeout,
                 )
+            full_answer = strip_thinking(full_answer or "").strip()
+            if _looks_like_language_only_answer(full_answer) and _can_llm():
+                AGENT_LLM_CALLS.labels(stage="answer_retry_recover").inc()
+                yield {
+                    "type": "trace",
+                    "kind": "thought",
+                    "label": "Recover",
+                    "content": "Retry answer looked truncated (language-only). Regenerating once.",
+                }
+                recovered_retry = await _llm_chat(
+                    client,
+                    llm_base,
+                    llm_model,
+                    llm_key,
+                    [system, user],
+                    temperature=0.2,
+                    timeout_s=llm_timeout,
+                )
+                recovered_retry = strip_thinking(recovered_retry or "").strip()
+                if recovered_retry:
+                    full_answer = recovered_retry
             sources = sources_from_context(retry_context) if retry_context else (retry_resp.get("sources") or [])
             context_chunks = retry_context
             degraded = retry_degraded

@@ -107,6 +107,36 @@ def get_http_client(request: Request) -> httpx.AsyncClient:
     return request.app.state.http_client
 
 
+def _effective_project_id(requested_project_id: str, settings: Settings) -> str:
+    """Force a single project in stub compatibility mode."""
+    if settings.stub_auth_enabled:
+        return settings.stub_project_id
+    return requested_project_id
+
+
+async def _resolve_project(
+    *,
+    user: UserCreds,
+    requested_project_id: str,
+    settings: Settings,
+    project_db: ProjectDB,
+) -> object:
+    """Return the effective project object, enforcing stub mode when enabled."""
+    effective_project_id = _effective_project_id(requested_project_id, settings)
+    if settings.stub_auth_enabled:
+        return await project_db.ensure_project(
+            project_id=effective_project_id,
+            user_id=settings.stub_user_id,
+            name=settings.stub_project_name,
+            embedding_model=settings.stub_project_embedding_model,
+            chunk_size=settings.stub_project_chunk_size,
+            chunk_overlap=settings.stub_project_chunk_overlap,
+            language=settings.stub_project_language,
+            llm_model=settings.stub_project_llm_model,
+        )
+    return await authorize_project(user, effective_project_id, project_db)
+
+
 # ----------------------------
 # Lifespan
 # ----------------------------
@@ -140,6 +170,21 @@ async def lifecycle(app: FastAPI):
 
         qdrant: QdrantStore = await stack.enter_async_context(create_qdrant_store(settings.qdrant_url))
         opensearch: BM25Store = await stack.enter_async_context(create_bm25_store(settings.opensearch_url))
+
+        if settings.stub_auth_enabled:
+            stub_dim = EMBEDDING_DIMENSIONS.get(settings.stub_project_embedding_model, 768)
+            await project_db.ensure_project(
+                project_id=settings.stub_project_id,
+                user_id=settings.stub_user_id,
+                name=settings.stub_project_name,
+                embedding_model=settings.stub_project_embedding_model,
+                chunk_size=settings.stub_project_chunk_size,
+                chunk_overlap=settings.stub_project_chunk_overlap,
+                language=settings.stub_project_language,
+                llm_model=settings.stub_project_llm_model,
+            )
+            await qdrant.ensure_collection(settings.stub_project_id, dimension=stub_dim)
+            await opensearch.ensure_index(settings.stub_project_id)
 
         http_client = httpx.AsyncClient(timeout=120.0)
 
@@ -183,11 +228,25 @@ async def health_check():
 async def create_project(
     payload: ProjectCreate,
     user: UserCreds = Depends(authenticated),
+    settings: Settings = Depends(get_settings),
     project_db: ProjectDB = Depends(get_project_db),
     qdrant: QdrantStore = Depends(get_qdrant),
     opensearch: BM25Store = Depends(get_opensearch)
 ):
     """Create a new project (enforces max limit per user)."""
+    if settings.stub_auth_enabled:
+        project = await project_db.ensure_project(
+            project_id=settings.stub_project_id,
+            user_id=settings.stub_user_id,
+            name=settings.stub_project_name,
+            embedding_model=settings.stub_project_embedding_model,
+            chunk_size=settings.stub_project_chunk_size,
+            chunk_overlap=settings.stub_project_chunk_overlap,
+            language=settings.stub_project_language,
+            llm_model=settings.stub_project_llm_model,
+        )
+        return {"project": project.to_dict()}
+
     project = await project_db.create(
         user_id=user.user_id,
         name=payload.name,
@@ -208,9 +267,23 @@ async def create_project(
 @protected_router.get("/v1/projects")
 async def list_projects(
     user: UserCreds = Depends(authenticated),
+    settings: Settings = Depends(get_settings),
     project_db: ProjectDB = Depends(get_project_db),
 ):
     """List all projects owned by the authenticated user."""
+    if settings.stub_auth_enabled:
+        project = await project_db.ensure_project(
+            project_id=settings.stub_project_id,
+            user_id=settings.stub_user_id,
+            name=settings.stub_project_name,
+            embedding_model=settings.stub_project_embedding_model,
+            chunk_size=settings.stub_project_chunk_size,
+            chunk_overlap=settings.stub_project_chunk_overlap,
+            language=settings.stub_project_language,
+            llm_model=settings.stub_project_llm_model,
+        )
+        return {"projects": [project.to_dict()]}
+
     projects = await project_db.list_for_user(user.user_id)
     return {"projects": [p.to_dict() for p in projects]}
 
@@ -219,10 +292,16 @@ async def list_projects(
 async def get_project(
     project_id: str,
     user: UserCreds = Depends(authenticated),
+    settings: Settings = Depends(get_settings),
     project_db: ProjectDB = Depends(get_project_db),
 ):
     """Get a single project (with ownership check)."""
-    project = await authorize_project(user, project_id, project_db)
+    project = await _resolve_project(
+        user=user,
+        requested_project_id=project_id,
+        settings=settings,
+        project_db=project_db,
+    )
     return {"project": project.to_dict()}
 
 
@@ -230,6 +309,7 @@ async def get_project(
 async def delete_project(
     project_id: str,
     user: UserCreds = Depends(authenticated),
+    settings: Settings = Depends(get_settings),
     project_db: ProjectDB = Depends(get_project_db),
     document_db: DocumentDB = Depends(get_document_db),
     s3=Depends(get_s3),
@@ -240,24 +320,28 @@ async def delete_project(
     Delete a project (soft delete).
     Also deletes all documents associated with the project.
     """
+    if settings.stub_auth_enabled:
+        raise HTTPException(status_code=409, detail="stub_project_is_fixed")
+
+    effective_project_id = _effective_project_id(project_id, settings)
     # Verify ownership first
-    await authorize_project(user, project_id, project_db)
+    await authorize_project(user, effective_project_id, project_db)
 
-    await qdrant.delete_collection(project_id)
-    await opensearch.delete_index(project_id)
+    await qdrant.delete_collection(effective_project_id)
+    await opensearch.delete_index(effective_project_id)
 
-    documents, _ = await document_db.list_by_project(project_id, limit=10_000)
+    documents, _ = await document_db.list_by_project(effective_project_id, limit=10_000)
     for doc in documents:
         # probably is fine
-        await s3.delete_object(Bucket="ragfun", Key=project_id + "_" + doc.get("storage_id"))
+        await s3.delete_object(Bucket="ragfun", Key=effective_project_id + "_" + doc.get("storage_id"))
 
     # Delete all documents for this project first
-    await document_db.delete_by_project(project_id)
+    await document_db.delete_by_project(effective_project_id)
 
     # Soft-delete the project
-    deleted = await project_db.delete(project_id, user.user_id)
+    deleted = await project_db.delete(effective_project_id, user.user_id)
 
-    return {"project_id": project_id}
+    return {"project_id": effective_project_id}
 
 
 @protected_router.get("/v1/projects/{project_id}/documents")
@@ -266,14 +350,21 @@ async def list_project_documents(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     user: UserCreds = Depends(authenticated),
+    settings: Settings = Depends(get_settings),
     project_db: ProjectDB = Depends(get_project_db),
     document_db: DocumentDB = Depends(get_document_db),
 ):
     """List documents in a project with pagination."""
-    await authorize_project(user, project_id, project_db)
+    effective_project_id = _effective_project_id(project_id, settings)
+    await _resolve_project(
+        user=user,
+        requested_project_id=effective_project_id,
+        settings=settings,
+        project_db=project_db,
+    )
 
     documents, total = await document_db.list_by_project(
-        project_id, limit=limit, offset=offset
+        effective_project_id, limit=limit, offset=offset
     )
     return {
         "documents": documents,
@@ -342,8 +433,14 @@ async def upload(
     settings: Settings = Depends(get_settings),
 ):
     doc_id = uuid.uuid4().hex
+    effective_project_id = _effective_project_id(project_id, settings)
     # Verify user owns the project
-    project = await authorize_project(user, project_id, project_db)
+    project = await _resolve_project(
+        user=user,
+        requested_project_id=effective_project_id,
+        settings=settings,
+        project_db=project_db,
+    )
 
     content_type = await detect_content_type(file)
     meta = UploadMeta(title=attrs.title, description=attrs.description)
@@ -365,7 +462,7 @@ async def upload(
             yield chunk
 
     # Use project_id as storage prefix for S3 organization
-    storage_prefix = f"{project_id}_"
+    storage_prefix = f"{effective_project_id}_"
 
 
     all_attrs = {
@@ -393,11 +490,11 @@ async def upload(
     # shi x3
     # whatever, we do not handle millions of docs, maybe we will scale later
     
-    await document_db.persist_document(doc_id, project_id, upload_result, meta)
+    await document_db.persist_document(doc_id, effective_project_id, upload_result, meta)
 
     return {
         "doc_id": doc_id,
-        "project_id": project_id,
+        "project_id": effective_project_id,
         "size": upload_result.size,
     }
 
@@ -579,16 +676,22 @@ async def retrieve_documents(
     project_id: str,
     body: RetrieveRequest,
     user: UserCreds = Depends(authenticated),
-    project_db: ProjectDB = Depends(get_project_db),
     settings: Settings = Depends(get_settings),
+    project_db: ProjectDB = Depends(get_project_db),
     client: httpx.AsyncClient = Depends(get_http_client),
 ):
-    await authorize_project(project_db, project_id, user.user_id)
+    effective_project_id = _effective_project_id(project_id, settings)
+    await _resolve_project(
+        user=user,
+        requested_project_id=effective_project_id,
+        settings=settings,
+        project_db=project_db,
+    )
 
     resp = await client.post(
         f"{settings.retrieval_url}/retrieve",
         json={
-            "project_id": project_id,
+            "project_id": effective_project_id,
             "query": body.query,
             "top_k": body.top_k,
             "rerank": body.rerank,
@@ -607,16 +710,22 @@ async def chat_with_documents(
     project_id: str,
     body: ChatRequestBody,
     user: UserCreds = Depends(authenticated),
-    project_db: ProjectDB = Depends(get_project_db),
     settings: Settings = Depends(get_settings),
+    project_db: ProjectDB = Depends(get_project_db),
     client: httpx.AsyncClient = Depends(get_http_client),
 ):
-    await authorize_project(project_db, project_id, user.user_id)
+    effective_project_id = _effective_project_id(project_id, settings)
+    await _resolve_project(
+        user=user,
+        requested_project_id=effective_project_id,
+        settings=settings,
+        project_db=project_db,
+    )
 
     resp = await client.post(
         f"{settings.generator_url}/chat",
         json={
-            "project_id": project_id,
+            "project_id": effective_project_id,
             "query": body.query,
             "top_k": body.top_k,
             "rerank": body.rerank,
@@ -654,4 +763,5 @@ app.include_router(public_router)
 app.include_router(protected_router)
 
 
-uvicorn.run(app=app, port=8913, host="localhost")
+if __name__ == "__main__":
+    uvicorn.run(app=app, port=8912, host="0.0.0.0")

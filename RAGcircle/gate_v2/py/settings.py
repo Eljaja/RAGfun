@@ -41,9 +41,21 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Auth check 
-    auth_server: str
-    admin_secret_token: str
+    # Auth check (ignored when STUB_AUTH_ENABLED=true)
+    auth_server: str = ""
+    admin_secret_token: str = ""
+
+    # Stub compatibility mode: force a single user/project surface.
+    # This keeps ingestion-compatible endpoints stable while broader auth/projects are TODO.
+    stub_auth_enabled: bool = True
+    stub_user_id: str = "stub-user"
+    stub_project_id: str = "default"
+    stub_project_name: str = "default"
+    stub_project_embedding_model: str = "BAAI/bge-m3"
+    stub_project_chunk_size: int = 512
+    stub_project_chunk_overlap: int = 64
+    stub_project_language: str = "ru"
+    stub_project_llm_model: str = "openai/gpt-oss-120b"
 
     aws_region: str = "us-east-1"
     aws_access_key_id: str = "rustfs"
@@ -55,7 +67,7 @@ class Settings(BaseSettings):
     queue_arn: str = "arn:rustfs:sqs:us-east-1:primary:mqtt"
     bucket_name: str = "ragfun"
 
-    database_url: str = "postgresql://user:pass@localhost:5438/db"
+    database_url: str = "postgresql://user:pass@localhost:5439/db"
     max_projects_per_user: int = 5
 
     qdrant_url: str = "http://localhost:8903"
