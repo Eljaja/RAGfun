@@ -38,65 +38,155 @@ function initOdsApiKeyUI() {
   });
 }
 
+const STORAGE_API_PREFIX = "/storage-api/api/v1";
+
+function getPrimaryProjectId() {
+  const selected = getSelectedValues("files_collections");
+  if (selected.length) return selected[0];
+  const uploadEl = document.getElementById("upload_collection");
+  const fromInput = uploadEl ? (uploadEl.value || "").trim() : "";
+  return fromInput || "default";
+}
+
+function getChatProjectId() {
+  const filters = buildChatFilters();
+  if (filters && Array.isArray(filters.project_ids) && filters.project_ids.length) {
+    return (filters.project_ids[0] || "").trim() || "default";
+  }
+  return "default";
+}
+
+async function storageRequest(path, opts = {}) {
+  const r = await fetch(`${STORAGE_API_PREFIX}${path}`, opts);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const msg = (data && (data.detail || data.error || data.message)) || `HTTP ${r.status}`;
+    throw new Error(msg);
+  }
+  return data;
+}
+
+async function ensureProject(project_id) {
+  const id = (project_id || "").trim() || "default";
+  try {
+    await storageRequest(`/projects/${encodeURIComponent(id)}`);
+  } catch (e) {
+    await storageRequest("/projects", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: id }),
+    });
+  }
+}
+
 async function callChatStream(query, onToken, onComplete, onError, onRetrieval) {
   const filters = buildChatFilters();
-  const r = await fetch("/api/v1/chat/stream", {
-    method: "POST",
-    headers: { "content-type": "application/json", ...buildOdsAuthHeaders() },
-    body: JSON.stringify({
-      query,
-      include_sources: true,
-      filters,
-    }),
-  });
+  const projectId = getChatProjectId();
+  let answerText = "";
+
+  async function fallbackToGate2() {
+    const data = await storageRequest(`/projects/${encodeURIComponent(projectId)}/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        query,
+        top_k: 5,
+        rerank: true,
+        strategy: "hybrid",
+      }),
+    });
+    const answer = (data && data.answer) || "";
+    if (typeof onRetrieval === "function" && data && Array.isArray(data.chunks_used)) {
+      onRetrieval({ context: data.chunks_used });
+    }
+    // Visual streaming fallback even when backend returns full text.
+    for (let i = 0; i < answer.length; i += 24) {
+      const part = answer.slice(i, i + 24);
+      onToken(part);
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    onComplete({
+      answer,
+      sources: (data && data.sources) || [],
+      context: (data && data.chunks_used) || [],
+      partial: false,
+      degraded: ["old_gate_fallback_to_storage_chat"],
+    });
+  }
+
+  let r;
+  try {
+    r = await fetch("/api/v1/chat/stream", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...buildOdsAuthHeaders() },
+      body: JSON.stringify({
+        query,
+        include_sources: true,
+        filters,
+      }),
+    });
+  } catch (_) {
+    try {
+      await fallbackToGate2();
+    } catch (e) {
+      onError(e);
+    }
+    return;
+  }
 
   if (!r.ok) {
-    const data = await r.json().catch(() => ({}));
-    const msg = (data && (data.detail || data.error)) || `HTTP ${r.status}`;
-    onError(new Error(msg));
+    try {
+      await fallbackToGate2();
+    } catch (e) {
+      const data = await r.json().catch(() => ({}));
+      const msg = (data && (data.detail || data.error)) || `HTTP ${r.status}`;
+      onError(new Error(`${msg}; fallback failed: ${e.message}`));
+    }
     return;
   }
 
   const reader = r.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n\n");
       buffer = lines.pop() || "";
-
       for (const line of lines) {
-        if (line.startsWith("data: ")) {
-          const dataStr = line.slice(6).trim();
-          if (dataStr === "[DONE]") {
-            onComplete();
-            return;
-          }
-          try {
-            const data = JSON.parse(dataStr);
-            if (data.type === "token" && data.content) {
-              onToken(data.content);
-            } else if (data.type === "retrieval") {
-              if (typeof onRetrieval === "function") onRetrieval(data);
-            } else if (data.type === "done") {
-              onComplete(data);
-            } else if (data.type === "error") {
-              onError(new Error(data.error));
-              return;
-            }
-          } catch (e) {
-            console.error("Failed to parse SSE data:", e, dataStr);
-          }
+        if (!line.startsWith("data: ")) continue;
+        const dataStr = line.slice(6).trim();
+        if (dataStr === "[DONE]") {
+          onComplete();
+          return;
+        }
+        const data = JSON.parse(dataStr);
+        if (data.type === "token" && data.content) {
+          answerText += data.content;
+          onToken(data.content);
+        } else if (data.type === "retrieval") {
+          if (typeof onRetrieval === "function") onRetrieval(data);
+        } else if (data.type === "done") {
+          onComplete(data);
+          return;
+        } else if (data.type === "error") {
+          throw new Error(data.error || "old_gate_stream_error");
         }
       }
     }
-  } catch (e) {
-    onError(e);
+    if (!answerText.trim()) {
+      await fallbackToGate2();
+      return;
+    }
+    onComplete({ answer: answerText });
+  } catch (_) {
+    try {
+      await fallbackToGate2();
+    } catch (e) {
+      onError(e);
+    }
   }
 }
 
@@ -195,70 +285,93 @@ async function callAgentStream(query, onToken, onComplete, onError, onRetrieval,
 async function uploadDoc({ file, doc_id, title, uri, source, lang, tags, project_id }) {
   const fd = new FormData();
   fd.append("file", file);
-  fd.append("doc_id", doc_id);
-  if (title) fd.append("title", title);
+  fd.append("title", title || file.name || doc_id);
+  if (doc_id) fd.append("doc_id", doc_id);
   if (uri) fd.append("uri", uri);
   if (source) fd.append("source", source);
   if (lang) fd.append("lang", lang);
   if (tags) fd.append("tags", tags);
-  if (project_id) fd.append("project_id", project_id);
   fd.append("refresh", "false");
-
-  const r = await fetch("/api/v1/documents/upload", { method: "POST", body: fd, headers: { ...buildOdsAuthHeaders() } });
-  const data = await r.json();
-  if (!r.ok) {
-    const msg = (data && (data.detail || data.error)) || `HTTP ${r.status}`;
-    throw new Error(msg);
-  }
-  return data;
+  const pid = (project_id || "").trim() || "default";
+  await ensureProject(pid);
+  return storageRequest(`/projects/${encodeURIComponent(pid)}/upload`, { method: "POST", body: fd });
 }
 
 async function listDocuments() {
   const limit = docsState.limit;
   const offset = docsState.offset;
-  const collections = getSelectedValues("files_collections");
+  const pid = getPrimaryProjectId();
   const q = new URLSearchParams();
   q.set("limit", String(limit));
   q.set("offset", String(offset));
-  if (collections.length) q.set("collections", collections.join(","));
-  const r = await fetch(`/api/v1/documents?${q.toString()}`, { headers: { ...buildOdsAuthHeaders() } });
-  const data = await r.json();
-  if (!r.ok) {
-    throw new Error(data.error || `HTTP ${r.status}`);
-  }
-  return data;
+  return storageRequest(`/projects/${encodeURIComponent(pid)}/documents?${q.toString()}`);
 }
 
 async function fetchDocumentStats() {
-  const collections = getSelectedValues("files_collections");
-  const q = new URLSearchParams();
-  if (collections.length) q.set("collections", collections.join(","));
-  const r = await fetch(`/api/v1/documents/stats?${q.toString()}`, { headers: { ...buildOdsAuthHeaders() } });
-  const data = await r.json();
-  if (!r.ok) {
-    throw new Error(data.error || `HTTP ${r.status}`);
+  const limit = 1000;
+  let offset = 0;
+  let all = [];
+  const pid = getPrimaryProjectId();
+  while (all.length < limit) {
+    const batch = await storageRequest(`/projects/${encodeURIComponent(pid)}/documents?limit=100&offset=${offset}`);
+    const docs = (batch && batch.documents) || [];
+    all = all.concat(docs);
+    if (docs.length < 100) break;
+    offset += docs.length;
   }
-  return data;
+  const by_source = {};
+  const by_lang = {};
+  let bytes = 0;
+  for (const d of all) {
+    const src = d && d.source ? String(d.source) : "unknown";
+    by_source[src] = (by_source[src] || 0) + 1;
+    const lg = d && d.lang ? String(d.lang) : "unknown";
+    by_lang[lg] = (by_lang[lg] || 0) + 1;
+    bytes += Number(d && d.size ? d.size : 0) || 0;
+  }
+  return {
+    ok: true,
+    total: all.length,
+    bytes,
+    indexed_available: false,
+    indexed: 0,
+    not_indexed: 0,
+    ingestion: { queued: 0, processing: 0, retrying: 0, failed: 0, completed: 0, unknown: all.length },
+    by_content_type: {},
+    by_source,
+    by_lang,
+    by_collection: { [pid]: all.length },
+  };
 }
 
 async function deleteDoc(doc_id) {
-  const r = await fetch(`/api/v1/documents/${encodeURIComponent(doc_id)}`, { method: "DELETE", headers: { ...buildOdsAuthHeaders() } });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) {
-    const msg = (data && (data.detail || data.error)) || `HTTP ${r.status}`;
-    throw new Error(msg);
-  }
-  return data;
+  return storageRequest(`/documents/${encodeURIComponent(doc_id)}`, { method: "DELETE" });
 }
 
 async function deleteAllDocs() {
-  const r = await fetch(`/api/v1/documents?confirm=true`, { method: "DELETE", headers: { ...buildOdsAuthHeaders() } });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) {
-    const msg = (data && (data.detail || data.error)) || `HTTP ${r.status}`;
-    throw new Error(msg);
+  const pid = getPrimaryProjectId();
+  let offset = 0;
+  const toDelete = [];
+  while (true) {
+    const data = await storageRequest(`/projects/${encodeURIComponent(pid)}/documents?limit=100&offset=${offset}`);
+    const docs = (data && data.documents) || [];
+    if (!docs.length) break;
+    for (const d of docs) {
+      if (d && d.doc_id) toDelete.push(d.doc_id);
+    }
+    if (docs.length < 100) break;
+    offset += docs.length;
   }
-  return data;
+  let deleted = 0;
+  for (const docId of toDelete) {
+    try {
+      await deleteDoc(docId);
+      deleted += 1;
+    } catch (_) {
+      // continue deleting other docs; UI will show partial result
+    }
+  }
+  return { deleted, partial: deleted !== toDelete.length };
 }
 
 const docsState = {
@@ -269,6 +382,7 @@ const docsState = {
   limit: 100,
   maxItems: 300,
   offset: 0,
+  hasMore: true,
 };
 
 const collectionsState = {
@@ -306,7 +420,7 @@ function updateDocsMeta() {
   const btn = document.getElementById("load_more_docs");
   if (btn) {
     const maxed = docsState.maxItems && shown >= docsState.maxItems;
-    btn.disabled = maxed || !total || shown >= total;
+    btn.disabled = maxed || !docsState.hasMore;
   }
 }
 
@@ -553,7 +667,7 @@ function formatMessageText(text) {
   escaped = escaped.replace(codeBlockPattern, (_match, lang, code) => {
     const placeholder = `__CODE_BLOCK_${blockIndex}__`;
     const language = lang ? ` data-lang="${lang.trim()}"` : "";
-    codeBlockPlaceholders.push(`<pre><code${language}>${code.trim()}</code></pre>`);
+    codeBlockPlaceholders.push(`<pre${language}><code>${code.trim()}</code></pre>`);
     blockIndex += 1;
     return placeholder;
   });
@@ -739,6 +853,35 @@ function formatMessageText(text) {
   return html;
 }
 
+function enhanceRenderedMarkdown(rootEl) {
+  if (!rootEl) return;
+  const blocks = rootEl.querySelectorAll("pre");
+  blocks.forEach(pre => {
+    if (pre.dataset.copyReady === "true") return;
+    const codeEl = pre.querySelector("code");
+    if (!codeEl) return;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "code-copy-btn";
+    btn.textContent = "Copy";
+    btn.addEventListener("click", async () => {
+      const text = codeEl.textContent || "";
+      if (!text) return;
+      try {
+        await navigator.clipboard.writeText(text);
+        btn.textContent = "Copied";
+      } catch (_) {
+        btn.textContent = "Failed";
+      }
+      setTimeout(() => {
+        btn.textContent = "Copy";
+      }, 1200);
+    });
+    pre.appendChild(btn);
+    pre.dataset.copyReady = "true";
+  });
+}
+
 function formatBytes(bytes) {
   if (!bytes) return "0 B";
   const k = 1024;
@@ -748,13 +891,15 @@ function formatBytes(bytes) {
 }
 
 async function fetchCollections() {
-  const r = await fetch("/api/v1/collections", { headers: { ...buildOdsAuthHeaders() } });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) {
-    const msg = (data && (data.detail || data.error)) || `HTTP ${r.status}`;
-    throw new Error(msg);
-  }
-  return data;
+  const data = await storageRequest("/projects");
+  const projects = (data && data.projects) || [];
+  return {
+    collections: projects.map(p => ({
+      id: p.project_id || p.name,
+      name: p.name || p.project_id,
+      count: null,
+    })),
+  };
 }
 
 function populateCollectionsUI(items) {
@@ -780,16 +925,14 @@ function populateCollectionsUI(items) {
 
   const hintEl = document.getElementById("collections_hint");
   if (hintEl) {
-    hintEl.textContent = list.length ? `Loaded ${list.length} collection(s). If empty selection, search across all.` : "Paste ODS API key in the header above to load your collections";
+    hintEl.textContent = list.length ? `Loaded ${list.length} project(s). If empty selection, default project is used.` : "No projects found yet. Upload a file to create one.";
   }
   const summaryEl = document.getElementById("collections_summary");
   if (summaryEl) {
     summaryEl.textContent = list.length ? `Collections (${list.length})` : "Collections";
   }
 
-  // Open "Collections" details in chat so the list is visible when we have collections
-  const chatDetails = document.querySelector(".chat-collections");
-  if (chatDetails && list.length > 0) chatDetails.open = true;
+  // Collections panel is always visible in the compact header layout.
 }
 
 async function loadCollections() {
@@ -805,9 +948,35 @@ async function loadCollections() {
     console.warn("Failed to load collections:", e);
     collectionsState.loaded = true;
     populateCollectionsUI([]);
-    if (hintEl) hintEl.textContent = "Could not load collections. Check connection. Click Refresh to retry.";
+    if (hintEl) hintEl.textContent = "Could not load projects. Check gate_v2 connection on :8912.";
   }
 }
+
+function setCollectionsDrawerOpen(open) {
+  const shell = document.querySelector(".chat-shell");
+  const drawer = document.getElementById("collections_drawer");
+  const toggleBtn = document.getElementById("collections_drawer_toggle");
+  if (!shell || !drawer) return;
+  drawer.classList.toggle("open", !!open);
+  shell.classList.toggle("drawer-open", !!open);
+  if (toggleBtn) toggleBtn.setAttribute("aria-expanded", open ? "true" : "false");
+}
+
+function initCollectionsDrawer() {
+  const toggleBtn = document.getElementById("collections_drawer_toggle");
+  const closeBtn = document.getElementById("collections_drawer_close");
+  const drawer = document.getElementById("collections_drawer");
+  if (!toggleBtn || !closeBtn || !drawer) return;
+
+  toggleBtn.addEventListener("click", () => {
+    setCollectionsDrawerOpen(!drawer.classList.contains("open"));
+  });
+  closeBtn.addEventListener("click", () => setCollectionsDrawerOpen(false));
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape") setCollectionsDrawerOpen(false);
+  });
+}
+
 
 function getMessagesEl() {
   return document.getElementById("messages");
@@ -834,6 +1003,7 @@ function addMessage({ role, text }) {
   if (role === "assistant") {
     // Format assistant messages with markdown support
     bubbleText.innerHTML = formatMessageText(text || "");
+    enhanceRenderedMarkdown(bubbleText);
   } else {
     // User messages - plain text with line breaks
     bubbleText.innerHTML = escapeHtml(text || "").replace(/\n/g, '<br>');
@@ -1084,12 +1254,16 @@ async function askStream() {
           answerText += token;
           if (assistant && assistant.bubbleText) {
             assistant.bubbleText.innerHTML = formatMessageText(answerText);
+            enhanceRenderedMarkdown(assistant.bubbleText);
             scrollMessagesToBottom();
           }
         },
         data => {
           if (data && data.answer) answerText = data.answer;
-          if (assistant && assistant.bubbleText) assistant.bubbleText.innerHTML = formatMessageText(answerText);
+          if (assistant && assistant.bubbleText) {
+            assistant.bubbleText.innerHTML = formatMessageText(answerText);
+            enhanceRenderedMarkdown(assistant.bubbleText);
+          }
           if (assistant && assistant.wrapper && data) {
             setAssistantExtras(assistant.wrapper, { sources: data.sources, context: data.context || latestContext });
           }
@@ -1115,11 +1289,7 @@ async function askStream() {
             setAssistantExtras(assistant.wrapper, { sources: null, context: latestContext });
           }
         },
-        data => {
-          if (!assistant || !assistant.wrapper) return;
-          const traceState = ensureAgentTrace(assistant.wrapper, "agent-search");
-          addTraceItem(traceState, data);
-        }
+        null
       );
     } else {
       await callChatStream(
@@ -1128,13 +1298,17 @@ async function askStream() {
           answerText += token;
           if (assistant && assistant.bubbleText) {
             assistant.bubbleText.innerHTML = formatMessageText(answerText);
+            enhanceRenderedMarkdown(assistant.bubbleText);
             scrollMessagesToBottom();
           }
         },
         data => {
           // done
           if (data && data.answer) answerText = data.answer;
-          if (assistant && assistant.bubbleText) assistant.bubbleText.innerHTML = formatMessageText(answerText);
+          if (assistant && assistant.bubbleText) {
+            assistant.bubbleText.innerHTML = formatMessageText(answerText);
+            enhanceRenderedMarkdown(assistant.bubbleText);
+          }
           if (assistant && assistant.wrapper && data) {
             setAssistantExtras(assistant.wrapper, { sources: data.sources, context: data.context || latestContext });
           }
@@ -1231,7 +1405,9 @@ async function loadDocuments() {
     }
 
     const docs = (data && data.documents) || [];
+    docsState.hasMore = docs.length >= docsState.limit;
     if (typeof data.total === "number") docsState.total = data.total;
+    else docsState.total = docsState.offset + docs.length + (docsState.hasMore ? 1 : 0);
 
     if (docsState.offset === 0) {
       docsState.items = docs;
@@ -1258,6 +1434,7 @@ async function loadDocuments() {
 const refreshBtn = document.getElementById("refresh_docs");
 if (refreshBtn) refreshBtn.addEventListener("click", () => {
   docsState.offset = 0;
+  docsState.hasMore = true;
   loadDocuments();
 });
 
@@ -1272,6 +1449,7 @@ if (applyFilesFiltersBtn) applyFilesFiltersBtn.addEventListener("click", () => {
   docsState.offset = 0;
   docsState.items = [];
   docsState.stats = null;
+  docsState.hasMore = true;
   loadDocuments();
 });
 
@@ -1292,6 +1470,7 @@ if (deleteAllBtn) deleteAllBtn.addEventListener("click", async () => {
     docsState.offset = 0;
     docsState.items = [];
     docsState.stats = null;
+    docsState.hasMore = true;
     await loadDocuments();
     const partial = res && res.partial;
     const deleted = (res && res.deleted) || 0;
@@ -1320,6 +1499,9 @@ function setActiveTab(tab) {
     collectionsState.loaded = false;
     loadCollections();
   }
+  if (tab !== "chat") {
+    setCollectionsDrawerOpen(false);
+  }
   if (tab === "chat") {
     const q = document.getElementById("q");
     if (q) q.focus();
@@ -1345,14 +1527,17 @@ function initTabs() {
   });
 }// Init
 initTabs();
+initCollectionsDrawer();
 const docIdEl = document.getElementById("doc_id");
 if (docIdEl) docIdEl.value = randId();
 docsState.offset = 0;
+docsState.hasMore = true;
 loadDocuments();
 loadCollections();// Auto-refresh document list every 30 seconds
 setInterval(() => {
   docsState.offset = 0;
   docsState.items = [];
   docsState.stats = null;
+  docsState.hasMore = true;
   loadDocuments();
 }, 30000);

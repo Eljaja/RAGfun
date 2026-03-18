@@ -292,7 +292,7 @@ services:
       - STORAGE_S3_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
       - STORAGE_S3_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfsadmin}
       - STORAGE_S3_REGION=${STORAGE_S3_REGION:-us-east-1}
-      - STORAGE_DB_URL=postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@pgbouncer:5432/document_storage
+      - STORAGE_DB_URL=postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/document_storage
       - STORAGE_DB_POOL_MIN=${STORAGE_DB_POOL_MIN:-1}
       - STORAGE_DB_POOL_MAX=${STORAGE_DB_POOL_MAX:-${POSTGRES_MAX_CONNECTIONS:-1000}}
       - STORAGE_MAX_FILE_SIZE_MB=100
@@ -485,7 +485,9 @@ services:
     ports:
       - "${RUGFUNSOTA_AGENT_PORT:-8093}:8091"
     environment:
-      - AGENT_GATE_URL=http://rag-gate:8090
+      - AGENT_GATE_URL=http://host.docker.internal:8912
+      - AGENT_GATE_USE_V2=true
+      - AGENT_GATE_PROJECT_ID=default
       - AGENT_GATE_TIMEOUT_S=60
       - AGENT_MAX_LLM_CALLS=${AGENT_MAX_LLM_CALLS:-12}
       - AGENT_MAX_FACT_QUERIES=${AGENT_MAX_FACT_QUERIES:-2}
@@ -497,7 +499,7 @@ services:
       - AGENT_USE_FACT_QUERIES=${AGENT_USE_FACT_QUERIES:-true}
       - AGENT_USE_RETRY=${AGENT_USE_RETRY:-true}
     depends_on:
-      rag-gate:
+      retrieval:
         condition: service_started
     extra_hosts:
       - "host.docker.internal:host-gateway"
