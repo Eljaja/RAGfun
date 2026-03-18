@@ -68,9 +68,32 @@ until curl -fsS http://localhost:8902/models >/dev/null; do
   sleep 2
 done
 
-echo "[3/3] Starting ingestion API/worker..."
+echo "[3/3] Starting retrieval_v2 for gate_v2..."
+docker compose -p ragcircle-ingest -f RAGcircle/docker-compose.yaml --profile apps up -d retrieval
+
+echo "[3/3] Waiting for retrieval_v2 readiness on http://localhost:8920/health ..."
+until curl -fsS http://localhost:8920/health >/dev/null; do
+  sleep 2
+done
+
+echo "[3/3] Starting ingestion API/worker + unified gateway..."
 docker compose -p ragcircle-ingest -f RAGcircle/docker-compose.yaml --profile apps up -d \
   gate doc-processor nginx-gate
+
+echo "[3/3] Waiting for unified storage route on http://localhost:8916/storage-api/public/health ..."
+until curl -fsS http://localhost:8916/storage-api/public/health >/dev/null; do
+  sleep 2
+done
+
+echo "[3/3] Waiting for unified rag-gate route on http://localhost:8916/api/v1/readyz ..."
+until curl -fsS http://localhost:8916/api/v1/readyz >/dev/null; do
+  sleep 2
+done
+
+echo "[3/3] Waiting for unified agent route on http://localhost:8916/agent-api/v1/readyz ..."
+until curl -fsS http://localhost:8916/agent-api/v1/readyz >/dev/null; do
+  sleep 2
+done
 
 echo "Done."
 echo "ui:                  http://localhost:3301"
@@ -78,3 +101,6 @@ echo "rag-gate readyz:     http://localhost:8092/v1/readyz"
 echo "retrieval readyz:    http://localhost:8085/v1/readyz"
 echo "agent-search readyz: http://localhost:8093/v1/readyz"
 echo "gate_v2 health:      http://localhost:8916/public/health"
+echo "gateway chat:        http://localhost:8916/api/v1/chat"
+echo "gateway agent:       http://localhost:8916/agent-api/v1/agent/stream"
+echo "gateway ingestion:   http://localhost:8916/storage-api/api/v1/projects"
