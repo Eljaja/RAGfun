@@ -1,25 +1,15 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Any, Callable
 
-try:
-    from .sdk import (
-        ChatRequest,
-        ClientAuth,
-        ProjectCreateRequest,
-        RagGatewayClient,
-        SDKError,
-    )
-except ImportError:  # pragma: no cover - direct script execution
-    from sdk import (  # type: ignore
-        ChatRequest,
-        ClientAuth,
-        ProjectCreateRequest,
-        RagGatewayClient,
-        SDKError,
-    )
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from sdk import ChatRequest, ClientAuth, ProjectCreateRequest, RagGatewayClient, SDKError  # noqa: E402
 
 
 def run_step(name: str, fn: Callable[[], Any], failures: list[str]) -> Any | None:
@@ -43,7 +33,7 @@ def expect_sdk_error(name: str, fn: Callable[[], Any], failures: list[str]) -> N
     except SDKError as exc:
         print(f"[PASS] blocked: {exc}")
         return
-    except Exception as exc:  # pragma: no cover - diagnostics
+    except Exception as exc:
         print(f"[FAIL] unexpected exception type: {type(exc).__name__}: {exc}")
         failures.append(name)
         return
@@ -59,17 +49,10 @@ def main() -> int:
     print(f"Gateway URL: {gateway_url}")
     failures: list[str] = []
 
-    client = RagGatewayClient(
-        base_url=gateway_url,
-        auth=ClientAuth(bearer_token=bearer_token),
-    )
+    client = RagGatewayClient(base_url=gateway_url, auth=ClientAuth(bearer_token=bearer_token))
     try:
         run_step("get_project(default)", lambda: client.get_project().model_dump(), failures)
-        run_step(
-            "list_project_documents(default)",
-            lambda: client.list_project_documents(limit=5, offset=0).model_dump(),
-            failures,
-        )
+        run_step("list_project_documents(default)", lambda: client.list_project_documents(limit=5, offset=0).model_dump(), failures)
         run_step(
             "chat(default)",
             lambda: client.chat(
@@ -81,21 +64,9 @@ def main() -> int:
             failures,
         )
 
-        expect_sdk_error(
-            "create_project blocked",
-            lambda: client.create_project(ProjectCreateRequest(name="other-project")),
-            failures,
-        )
-        expect_sdk_error(
-            "delete_project blocked",
-            lambda: client.delete_project("default"),
-            failures,
-        )
-        expect_sdk_error(
-            "get_project(non-default) blocked",
-            lambda: client.get_project("other-project"),
-            failures,
-        )
+        expect_sdk_error("create_project blocked", lambda: client.create_project(ProjectCreateRequest(name="other-project")), failures)
+        expect_sdk_error("delete_project blocked", lambda: client.delete_project("default"), failures)
+        expect_sdk_error("get_project(non-default) blocked", lambda: client.get_project("other-project"), failures)
         expect_sdk_error(
             "list_project_documents(non-default) blocked",
             lambda: client.list_project_documents("other-project", limit=1, offset=0),
