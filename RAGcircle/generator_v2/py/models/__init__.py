@@ -38,7 +38,13 @@ from models.steps import (
     SupplementalRetrieveStep,
     TwoPassStep,
 )
-from models.plan import BrainPlan, BrainRound
+from models.plan import (
+    BrainPlan,
+    BrainRound,
+    ExpandResult,
+    PipelineResult,
+    Verdict,
+)
 from models.api import (
     AgentRequest,
     AgentResponse,
@@ -70,7 +76,7 @@ __all__ = [
     "PlanLLMStep", "PostRetrieveStep", "QualityCheckStep",
     "QueryVariantsStep", "ReflectStep", "StitchStep",
     "SupplementalRetrieveStep", "TwoPassStep",
-    "BrainPlan", "BrainRound",
+    "BrainPlan", "BrainRound", "ExpandResult", "PipelineResult", "Verdict",
     "AgentRequest", "AgentResponse", "ChatRequest", "ChatResponse",
     "ExecuteRequest", "SearchFilters",
     "AssessmentResult", "ReflectionResult",

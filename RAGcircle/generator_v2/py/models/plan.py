@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from typing import Any
+
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from models.chunks import ChunkResult
 from models.steps import (
     BrainRetrieveStep,
     EvalStep,
@@ -12,6 +16,8 @@ from models.steps import (
 
 
 class BrainRound(BaseModel):
+    """A single pipeline pass: expand -> retrieve -> enrich -> generate -> evaluate."""
+
     model_config = ConfigDict(extra="forbid")
 
     expand: list[ExpandStep] = Field(default_factory=list)
@@ -19,6 +25,7 @@ class BrainRound(BaseModel):
     post_retrieve: list[PostRetrieveStep] = Field(default_factory=list)
     generate: GenerateStep = Field(default_factory=GenerateStep)
     evaluate: list[EvalStep] = Field(default_factory=list)
+    max_llm_calls: int = Field(default=12, ge=1, le=100)
 
     @model_validator(mode="after")
     def _validate_structure(self):
@@ -38,8 +45,45 @@ class BrainRound(BaseModel):
         return self
 
 
-class BrainPlan(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+BrainPlan = BrainRound
 
-    rounds: list[BrainRound] = Field(min_length=1)
-    max_llm_calls: int = Field(default=12, ge=1, le=100)
+
+@dataclass
+class ExpandResult:
+    """Output of the expand phase."""
+
+    queries: list[str]
+    lang: str = "English"
+    is_factoid: bool = False
+    retrieval_plan: Any = None
+    retrieval_mode: str = "hybrid"
+    extra_chunks: list[ChunkResult] = field(default_factory=list)
+    traces: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class Verdict:
+    """Output of the evaluate phase."""
+
+    needs_retry: bool = False
+    missing_terms: list[str] = field(default_factory=list)
+    requery: str | None = None
+    answer: str | None = None
+    chunks: list[ChunkResult] | None = None
+    traces: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class PipelineResult:
+    """Output of a single pipeline run."""
+
+    answer: str
+    chunks: list[ChunkResult]
+    sources: list[dict[str, Any]]
+    mode: str = "hybrid"
+    lang: str = "English"
+    is_factoid: bool = False
+    needs_retry: bool = False
+    missing_terms: list[str] = field(default_factory=list)
+    requery: str | None = None
+    traces: list[dict[str, Any]] = field(default_factory=list)

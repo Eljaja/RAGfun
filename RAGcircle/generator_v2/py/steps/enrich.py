@@ -1,119 +1,111 @@
-"""Post-retrieve step handlers: chunk enrichment after retrieval.
+"""Enrich phase: chunks in, better chunks out.
 
-Handlers: quality_check, two_pass, bm25_anchor, factoid_expand, stitch.
+Pure function: (steps, chunks, query, ...) -> (chunks, traces).
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
-from collections.abc import AsyncIterator
 from typing import Any
 
+import httpx
+
+from config import Settings
 from context import merge_chunks, stitch_segments
-from engine.env import StepEnv
-from engine.registry import step_handler
-from models.chunks import ScoreSource
-from models.events import Event, TraceEvent
+from models.chunks import ChunkResult, ScoreSource
+from models.retrieval import ExecutionPlan
+from models.steps import (
+    BM25AnchorStep,
+    FactoidExpandStep,
+    PostRetrieveStep,
+    QualityCheckStep,
+    StitchStep,
+    TwoPassStep,
+)
 from plan_builder import from_preset
 from query_variants import extract_hint_terms, keyword_query, unique_source_count
-from retrieval_client import retrieve
+from steps.retrieve import _safe_retrieve
 
 logger = logging.getLogger(__name__)
 
 
-async def _safe_retrieve(env: StepEnv, query: str, plan: Any) -> list[Any]:
-    try:
-        return await retrieve(
-            env.http_client, env.settings.retrieval_url,
-            project_id=env.ctx.project_id, query=query, plan=plan,
-        )
-    except Exception as e:
-        logger.error("Retrieval failed: %s", e)
-        return []
+async def enrich(
+    steps: list[PostRetrieveStep],
+    *,
+    chunks: list[ChunkResult],
+    query: str,
+    project_id: str,
+    is_factoid: bool,
+    retrieval_plan: ExecutionPlan | None,
+    http_client: httpx.AsyncClient,
+    settings: Settings,
+) -> tuple[list[ChunkResult], list[dict[str, Any]]]:
+    """Run all post-retrieve steps. Returns (enriched_chunks, traces)."""
+    traces: list[dict[str, Any]] = []
 
+    for step in steps:
+        match step:
+            case QualityCheckStep(min_hits=min_hits, min_score=min_score):
+                poor = (
+                    not chunks
+                    or len(chunks) < min_hits
+                    or (chunks[0].score_source == ScoreSource.RERANK and chunks[0].score < min_score)
+                )
+                if poor:
+                    traces.append({"kind": "thought", "label": "Quality", "content": "Retrieval quality is poor"})
 
-@step_handler("quality_check")
-async def run_quality_check(step: Any, env: StepEnv) -> AsyncIterator[Event]:
-    chunks = env.ctx.chunks
-    poor = (
-        not chunks
-        or len(chunks) < step.min_hits
-        or (chunks[0].score_source == ScoreSource.RERANK and chunks[0].score < step.min_score)
-    )
-    if poor:
-        yield TraceEvent(kind="thought", label="Quality", content="Retrieval quality is poor")
-    return
-    yield  # noqa
+            case TwoPassStep(min_unique_sources=min_src):
+                n_unique = unique_source_count(chunks)
+                if n_unique < min_src:
+                    traces.append({
+                        "kind": "action", "label": "TwoPass",
+                        "content": f"Only {n_unique} unique sources, generating follow-up query",
+                    })
+                    hints = extract_hint_terms(chunks, max_terms=3)
+                    if hints:
+                        follow_up = f"{query} {' '.join(hints)}"
+                        plan = retrieval_plan or from_preset("hybrid", top_k=10, rerank=True)
+                        extra = await _safe_retrieve(
+                            follow_up, plan,
+                            project_id=project_id, http_client=http_client, settings=settings,
+                        )
+                        if extra:
+                            chunks = merge_chunks([chunks, extra])
 
+            case BM25AnchorStep(top_k=anchor_k):
+                kw = keyword_query(query)
+                if kw:
+                    traces.append({"kind": "action", "label": "BM25Anchor", "content": f"kw={kw[:60]}"})
+                    bm25_plan = from_preset("fast", top_k=anchor_k, rerank=False)
+                    bm25_hits = await _safe_retrieve(
+                        kw, bm25_plan,
+                        project_id=project_id, http_client=http_client, settings=settings,
+                    )
+                    if bm25_hits:
+                        chunks = merge_chunks([chunks, bm25_hits])
 
-@step_handler("two_pass")
-async def run_two_pass(step: Any, env: StepEnv) -> AsyncIterator[Event]:
-    n_unique = unique_source_count(env.ctx.chunks)
-    if n_unique >= step.min_unique_sources:
-        return
+            case FactoidExpandStep():
+                if is_factoid and chunks:
+                    traces.append({
+                        "kind": "action", "label": "FactoidExpand",
+                        "content": "Expanding within top sources",
+                    })
+                    expand_plan = from_preset("fast", top_k=5, rerank=False)
+                    extra = await _safe_retrieve(
+                        query, expand_plan,
+                        project_id=project_id, http_client=http_client, settings=settings,
+                    )
+                    if extra:
+                        chunks = merge_chunks([chunks, extra])
 
-    yield TraceEvent(
-        kind="action", label="TwoPass",
-        content=f"Only {n_unique} unique sources, generating follow-up query",
-    )
+            case StitchStep(max_per_segment=mps):
+                before = len(chunks)
+                chunks = stitch_segments(chunks, max_per_segment=mps)
+                after = len(chunks)
+                if before != after:
+                    traces.append({
+                        "kind": "action", "label": "Stitch",
+                        "content": f"Stitched {before} chunks into {after} segments",
+                    })
 
-    hints = extract_hint_terms(env.ctx.chunks, max_terms=3)
-    if not hints:
-        return
-
-    follow_up = f"{env.ctx.query} {' '.join(hints)}"
-    plan = env.ctx.retrieval_plan or from_preset("hybrid", top_k=10, rerank=True)
-    extra = await _safe_retrieve(env, follow_up, plan)
-    if extra:
-        env.ctx.chunks = merge_chunks([env.ctx.chunks, extra])
-
-
-@step_handler("bm25_anchor")
-async def run_bm25_anchor(step: Any, env: StepEnv) -> AsyncIterator[Event]:
-    kw = keyword_query(env.ctx.query)
-    if not kw:
-        return
-
-    yield TraceEvent(kind="action", label="BM25Anchor", content=f"kw={kw[:60]}")
-
-    bm25_plan = from_preset("fast", top_k=step.top_k, rerank=False)
-    bm25_hits = await _safe_retrieve(env, kw, bm25_plan)
-    if bm25_hits:
-        env.ctx.chunks = merge_chunks([env.ctx.chunks, bm25_hits])
-
-
-@step_handler("factoid_expand")
-async def run_factoid_expand(step: Any, env: StepEnv) -> AsyncIterator[Event]:
-    if not env.ctx.is_factoid or not env.ctx.chunks:
-        return
-
-    top_sources = list({c.source_id for c in env.ctx.chunks[:3]})
-    if not top_sources:
-        return
-
-    yield TraceEvent(
-        kind="action", label="FactoidExpand",
-        content=f"Expanding within {len(top_sources)} top sources",
-    )
-
-    expand_plan = from_preset("fast", top_k=5, rerank=False)
-    expand_results = await asyncio.gather(*(
-        _safe_retrieve(env, env.ctx.query, expand_plan)
-        for _ in top_sources
-    ))
-    env.ctx.chunks = merge_chunks([env.ctx.chunks, *expand_results])
-
-
-@step_handler("stitch")
-async def run_stitch(step: Any, env: StepEnv) -> AsyncIterator[Event]:
-    before = len(env.ctx.chunks)
-    env.ctx.chunks = stitch_segments(env.ctx.chunks, max_per_segment=step.max_per_segment)
-    after = len(env.ctx.chunks)
-    if before != after:
-        yield TraceEvent(
-            kind="action", label="Stitch",
-            content=f"Stitched {before} chunks into {after} segments",
-        )
-    return
-    yield  # noqa
+    return chunks, traces

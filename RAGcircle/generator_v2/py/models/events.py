@@ -24,6 +24,8 @@ class DoneEvent:
     degraded: list[str]
     sources: list[dict[str, Any]]
     context: list[dict[str, Any]]
+    needs_retry: bool = False
+    missing_terms: list[str] = field(default_factory=list)
     type: Literal["done"] = "done"
 
 

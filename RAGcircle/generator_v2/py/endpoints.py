@@ -1,4 +1,9 @@
-"""FastAPI routers for /chat, /agent, /agent/stream, /execute."""
+"""FastAPI routers for /chat, /agent, /agent/stream, /execute.
+
+The pipeline returns a PipelineResult. Endpoints own:
+- retry logic (calling run_pipeline again with a new plan)
+- streaming the final answer to the client
+"""
 
 from __future__ import annotations
 
@@ -13,18 +18,20 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from brain_presets import AGENT_PRESET_BUILDERS, agent, simple
+from brain_presets import AGENT_PRESET_BUILDERS, agent, retry_round, simple
 from config import Settings
-from engine import execute
+from engine.pipeline import run_pipeline
 from llm import LLMClient
 from models import (
     AgentRequest,
     AgentResponse,
+    BrainRound,
     ChatRequest,
     ChatResponse,
     ExecuteRequest,
+    PipelineResult,
 )
-from models.events import DoneEvent, ErrorEvent, Event, InitEvent, TokenEvent
+from models.events import DoneEvent, ErrorEvent, Event, InitEvent, TokenEvent, TraceEvent
 
 logger = logging.getLogger(__name__)
 
@@ -43,40 +50,206 @@ def _sse(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
-async def _stream_execute(
-    plan: Any,
-    *,
-    trace_id: str,
-    request: Request,
-    timeout_s: float = 120.0,
-    **execute_kwargs: Any,
-) -> StreamingResponse:
+def _pipeline_kwargs(request: Request) -> dict[str, Any]:
+    return dict(
+        llm=request.app.state.llm,
+        http_client=request.app.state.http_client,
+        settings=request.app.state.settings,
+    )
+
+
+def _done_event(result: PipelineResult, *, trace_id: str = "") -> DoneEvent:
+    return DoneEvent(
+        answer=result.answer,
+        mode=result.mode,
+        partial=False,
+        degraded=[],
+        sources=result.sources,
+        context=[
+            {"source_id": c.source_id, "text": c.text[:300], "score": c.score}
+            for c in result.chunks[:10]
+        ],
+    )
+
+
+def _stream_answer(
+    result: PipelineResult, *, trace_id: str, chunk_size: int = 40,
+) -> AsyncIterator[str]:
+    """Stream traces, then the answer as token events, then a done event."""
+    async def _generate() -> AsyncIterator[str]:
+        yield _sse(_event_to_dict(InitEvent(trace_id=trace_id)))
+
+        for trace in result.traces:
+            ev = TraceEvent(**trace)
+            d = _event_to_dict(ev)
+            d["trace_id"] = trace_id
+            yield _sse(d)
+
+        text = result.answer
+        for i in range(0, len(text), chunk_size):
+            d = _event_to_dict(TokenEvent(content=text[i:i + chunk_size]))
+            d["trace_id"] = trace_id
+            yield _sse(d)
+
+        d = _event_to_dict(_done_event(result))
+        d["trace_id"] = trace_id
+        yield _sse(d)
+
+    return _generate()
+
+
+# ── /chat ────────────────────────────────────────────────
+
+@chat_router.post("/chat", response_model=ChatResponse)
+async def chat(body: ChatRequest, request: Request):
+    settings: Settings = request.app.state.settings
+    plan = simple(
+        preset=body.preset,
+        top_k=body.top_k,
+        rerank=body.rerank,
+        reflection_enabled=body.reflection_enabled and settings.reflection_enabled,
+    )
+    kwargs = _pipeline_kwargs(request)
+
+    result: PipelineResult | None = None
+    retries_used = 0
+
+    try:
+        for attempt in range(1 + body.max_retries):
+            result = await run_pipeline(
+                plan,
+                project_id=body.project_id, query=body.query,
+                include_sources=True, **kwargs,
+            )
+            if not result.needs_retry or attempt >= body.max_retries:
+                break
+            retries_used += 1
+    except Exception:
+        logger.exception("Chat pipeline failed for project %s", body.project_id)
+        raise HTTPException(status_code=502, detail="Generation pipeline error")
+
+    if result is None:
+        raise HTTPException(status_code=502, detail="No pipeline result")
+
+    return ChatResponse(
+        answer=result.answer,
+        sources=[s.get("source_id", "") for s in result.sources if isinstance(s, dict)],
+        chunks_used=len(result.chunks),
+        retries_used=retries_used,
+        query=body.query,
+    )
+
+
+# ── /agent (non-streaming) ───────────────────────────────
+
+def _build_agent_plan(body: AgentRequest, settings: Settings) -> BrainRound:
+    mode = (body.mode or "").lower()
+    if mode in AGENT_PRESET_BUILDERS:
+        return AGENT_PRESET_BUILDERS[mode]()
+
+    return agent(
+        use_hyde=body.use_hyde if body.use_hyde is not None else settings.agent_use_hyde,
+        use_fact_queries=body.use_fact_queries if body.use_fact_queries is not None else settings.agent_use_fact_queries,
+        use_retry=body.use_retry if body.use_retry is not None else settings.agent_use_retry,
+        use_tools=body.use_tools if body.use_tools is not None else settings.agent_use_tools,
+        max_llm_calls=body.max_llm_calls or settings.agent_max_llm_calls,
+        max_fact_queries=body.max_fact_queries or settings.agent_max_fact_queries,
+        top_k=body.top_k or 10,
+        rerank=True,
+    )
+
+
+@agent_router.post("/agent", response_model=AgentResponse)
+async def agent_non_streaming(body: AgentRequest, request: Request):
+    settings: Settings = request.app.state.settings
+    trace_id = uuid.uuid4().hex
+    plan = _build_agent_plan(body, settings)
+    kwargs = _pipeline_kwargs(request)
+
+    try:
+        result = await asyncio.wait_for(
+            run_pipeline(
+                plan,
+                project_id=body.project_id, query=body.query,
+                history=body.history, include_sources=body.include_sources,
+                **kwargs,
+            ),
+            timeout=120.0,
+        )
+
+        if result.needs_retry and settings.agent_use_retry:
+            rplan = retry_round(top_k=body.top_k or 10)
+            result = await asyncio.wait_for(
+                run_pipeline(
+                    rplan,
+                    project_id=body.project_id,
+                    query=result.requery or body.query,
+                    history=body.history, include_sources=body.include_sources,
+                    **kwargs,
+                ),
+                timeout=60.0,
+            )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=500, detail="request_timeout")
+    except Exception as exc:
+        logger.exception("Agent pipeline failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return AgentResponse(
+        trace_id=trace_id,
+        answer=result.answer,
+        sources=result.sources if body.include_sources else [],
+        context=[
+            {"source_id": c.source_id, "text": c.text[:300], "score": c.score}
+            for c in result.chunks[:10]
+        ],
+        mode=result.mode,
+        partial=False,
+        degraded=[],
+    )
+
+
+# ── /agent/stream (SSE) ─────────────────────────────────
+
+@agent_router.post("/agent/stream")
+async def agent_stream(body: AgentRequest, request: Request):
+    settings: Settings = request.app.state.settings
+    trace_id = uuid.uuid4().hex
+    plan = _build_agent_plan(body, settings)
+    kwargs = _pipeline_kwargs(request)
+
     async def event_stream() -> AsyncIterator[str]:
-        deadline = asyncio.get_event_loop().time() + timeout_s
         try:
-            yield _sse(_event_to_dict(InitEvent(trace_id=trace_id)))
+            result = await asyncio.wait_for(
+                run_pipeline(
+                    plan,
+                    project_id=body.project_id, query=body.query,
+                    history=body.history, include_sources=body.include_sources,
+                    **kwargs,
+                ),
+                timeout=120.0,
+            )
 
-            engine = execute(plan, **execute_kwargs)
-            while True:
-                remaining = max(5.0, deadline - asyncio.get_event_loop().time())
-                try:
-                    event = await asyncio.wait_for(engine.__anext__(), timeout=min(65.0, remaining))
-                except StopAsyncIteration:
-                    break
-                except asyncio.TimeoutError:
-                    yield _sse({"type": "error", "error": "Timeout waiting for response", "trace_id": trace_id})
-                    return
+            if result.needs_retry and settings.agent_use_retry:
+                rplan = retry_round(top_k=body.top_k or 10)
+                result = await asyncio.wait_for(
+                    run_pipeline(
+                        rplan,
+                        project_id=body.project_id,
+                        query=result.requery or body.query,
+                        history=body.history, include_sources=body.include_sources,
+                        **kwargs,
+                    ),
+                    timeout=60.0,
+                )
 
+            async for chunk in _stream_answer(result, trace_id=trace_id):
                 if await request.is_disconnected():
                     return
-                if asyncio.get_event_loop().time() > deadline:
-                    yield _sse({"type": "error", "error": "request_timeout", "trace_id": trace_id})
-                    return
+                yield chunk
 
-                d = _event_to_dict(event)
-                d["trace_id"] = trace_id
-                yield _sse(d)
-
+        except asyncio.TimeoutError:
+            yield _sse({"type": "error", "error": "request_timeout", "trace_id": trace_id})
         except asyncio.CancelledError:
             pass
         except Exception as exc:
@@ -97,178 +270,38 @@ async def _stream_execute(
     )
 
 
-# ── /chat ────────────────────────────────────────────────
-
-@chat_router.post("/chat", response_model=ChatResponse)
-async def chat(body: ChatRequest, request: Request):
-    settings: Settings = request.app.state.settings
-    llm: LLMClient = request.app.state.llm
-
-    plan = simple(
-        preset=body.preset,
-        top_k=body.top_k,
-        rerank=body.rerank,
-        max_retries=body.max_retries,
-        reflection_enabled=body.reflection_enabled and settings.reflection_enabled,
-    )
-
-    answer = ""
-    chunks_used = 0
-    sources: list[str] = []
-    retries_used = 0
-
-    try:
-        async for event in execute(
-            plan,
-            project_id=body.project_id,
-            query=body.query,
-            include_sources=True,
-            llm=llm,
-            http_client=request.app.state.http_client,
-            settings=settings,
-        ):
-            if isinstance(event, TokenEvent):
-                answer += event.content
-            elif isinstance(event, DoneEvent):
-                answer = event.answer
-                sources = [s.get("source_id", "") for s in event.sources if isinstance(s, dict)]
-                chunks_used = len(event.context)
-            elif isinstance(event, ErrorEvent):
-                raise HTTPException(status_code=502, detail=event.error)
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Chat pipeline failed for project %s", body.project_id)
-        raise HTTPException(status_code=502, detail="Generation pipeline error")
-
-    return ChatResponse(
-        answer=answer,
-        sources=sources,
-        chunks_used=chunks_used,
-        retries_used=retries_used,
-        query=body.query,
-    )
-
-
-# ── /agent (non-streaming) ───────────────────────────────
-
-def _build_agent_plan(body: AgentRequest, settings: Settings):
-    mode = (body.mode or "").lower()
-    if mode in AGENT_PRESET_BUILDERS:
-        return AGENT_PRESET_BUILDERS[mode]()
-
-    return agent(
-        use_hyde=body.use_hyde if body.use_hyde is not None else settings.agent_use_hyde,
-        use_fact_queries=body.use_fact_queries if body.use_fact_queries is not None else settings.agent_use_fact_queries,
-        use_retry=body.use_retry if body.use_retry is not None else settings.agent_use_retry,
-        use_tools=body.use_tools if body.use_tools is not None else settings.agent_use_tools,
-        max_llm_calls=body.max_llm_calls or settings.agent_max_llm_calls,
-        max_fact_queries=body.max_fact_queries or settings.agent_max_fact_queries,
-        top_k=body.top_k or 10,
-        rerank=True,
-    )
-
-
-@agent_router.post("/agent", response_model=AgentResponse)
-async def agent_non_streaming(body: AgentRequest, request: Request):
-    settings: Settings = request.app.state.settings
-    llm: LLMClient = request.app.state.llm
-    trace_id = uuid.uuid4().hex
-    plan = _build_agent_plan(body, settings)
-
-    answer = ""
-    sources: list[dict[str, Any]] = []
-    context: list[dict[str, Any]] = []
-    mode = "hybrid"
-    partial = False
-    degraded: list[str] = []
-    error: str | None = None
-
-    async def _collect():
-        nonlocal answer, sources, context, mode, partial, degraded, error
-        async for event in execute(
-            plan,
-            project_id=body.project_id,
-            query=body.query,
-            history=body.history,
-            include_sources=body.include_sources,
-            llm=llm,
-            http_client=request.app.state.http_client,
-            settings=settings,
-        ):
-            if isinstance(event, TokenEvent):
-                answer += event.content
-            elif isinstance(event, DoneEvent):
-                answer = event.answer
-                sources = event.sources
-                context = event.context
-                mode = event.mode
-                partial = event.partial
-                degraded = event.degraded
-            elif isinstance(event, ErrorEvent):
-                error = event.error
-
-    try:
-        await asyncio.wait_for(_collect(), timeout=120.0)
-    except asyncio.TimeoutError:
-        error = "request_timeout"
-    except Exception as exc:
-        error = str(exc)
-
-    if error:
-        raise HTTPException(status_code=500, detail=error)
-
-    return AgentResponse(
-        trace_id=trace_id,
-        answer=answer,
-        sources=sources if body.include_sources else [],
-        context=context,
-        mode=mode,
-        partial=partial,
-        degraded=degraded,
-    )
-
-
-# ── /agent/stream (SSE) ─────────────────────────────────
-
-@agent_router.post("/agent/stream")
-async def agent_stream(body: AgentRequest, request: Request):
-    settings: Settings = request.app.state.settings
-    llm: LLMClient = request.app.state.llm
-    trace_id = uuid.uuid4().hex
-    plan = _build_agent_plan(body, settings)
-
-    return await _stream_execute(
-        plan,
-        trace_id=trace_id,
-        request=request,
-        project_id=body.project_id,
-        query=body.query,
-        history=body.history,
-        include_sources=body.include_sources,
-        llm=llm,
-        http_client=request.app.state.http_client,
-        settings=settings,
-    )
-
-
 # ── /execute (raw BrainPlan) ─────────────────────────────
 
 @execute_router.post("/execute")
 async def execute_plan(body: ExecuteRequest, request: Request):
-    settings: Settings = request.app.state.settings
-    llm: LLMClient = request.app.state.llm
     trace_id = uuid.uuid4().hex
+    kwargs = _pipeline_kwargs(request)
 
-    return await _stream_execute(
-        body.brain_plan,
-        trace_id=trace_id,
-        request=request,
-        project_id=body.project_id,
-        query=body.query,
-        history=body.history,
-        include_sources=body.include_sources,
-        llm=llm,
-        http_client=request.app.state.http_client,
-        settings=settings,
+    async def event_stream() -> AsyncIterator[str]:
+        try:
+            result = await asyncio.wait_for(
+                run_pipeline(
+                    body.brain_plan,
+                    project_id=body.project_id, query=body.query,
+                    history=body.history, include_sources=body.include_sources,
+                    **kwargs,
+                ),
+                timeout=120.0,
+            )
+            async for chunk in _stream_answer(result, trace_id=trace_id):
+                yield chunk
+        except asyncio.TimeoutError:
+            yield _sse({"type": "error", "error": "request_timeout", "trace_id": trace_id})
+        except Exception as exc:
+            logger.exception("Execute error")
+            yield _sse({"type": "error", "error": str(exc), "trace_id": trace_id})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )

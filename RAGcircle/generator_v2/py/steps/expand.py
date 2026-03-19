@@ -1,6 +1,7 @@
-"""Expand-phase step handlers: query preparation before retrieval.
+"""Expand phase: query preparation before retrieval.
 
-Handlers: plan_retrieval, detect_lang, hyde, fact_queries, keywords, query_variants.
+Pure functions: (query, lang, history, budget, deps) -> ExpandResult.
+No mutable context, no env god object.
 """
 
 from __future__ import annotations
@@ -9,14 +10,24 @@ import asyncio
 import json
 import logging
 import re
-from collections.abc import AsyncIterator
 from typing import Any
 
+from config import Settings
 from context import merge_chunks
-from engine.env import StepEnv
-from engine.registry import step_handler
+from engine.budget import BudgetCounter
 from llm import LLMClient
-from models.events import Event, TraceEvent
+from models.chunks import ChunkResult
+from models.plan import ExpandResult
+from models.retrieval import ExecutionPlan
+from models.steps import (
+    DetectLangStep,
+    ExpandStep,
+    FactQueryStep,
+    HyDEStep,
+    KeywordStep,
+    PlanLLMStep,
+    QueryVariantsStep,
+)
 from plan_builder import from_llm_plan, from_preset
 from prompts import (
     DETECT_LANG_SYSTEM,
@@ -31,55 +42,12 @@ from prompts import (
     PLAN_USER,
 )
 from query_variants import is_factoid_question, query_variants as heuristic_variants
-from retrieval_client import retrieve
+from retrieval_client import retrieve as retrieval_call
 from shared import strip_thinking
 
+import httpx
+
 logger = logging.getLogger(__name__)
-
-
-async def _safe_retrieve(env: StepEnv, query: str, plan: Any) -> list[Any]:
-    try:
-        return await retrieve(
-            env.http_client, env.settings.retrieval_url,
-            project_id=env.ctx.project_id, query=query, plan=plan,
-        )
-    except Exception as e:
-        logger.error("Retrieval failed: %s", e)
-        return []
-
-
-# ── plan_retrieval ───────────────────────────────────────
-
-@step_handler("plan_retrieval")
-async def run_plan_llm(step: Any, env: StepEnv) -> AsyncIterator[Event]:
-    yield TraceEvent(kind="tool", name="llm.plan", payload={"query": env.ctx.query})
-
-    if not env.ctx.budget.try_consume():
-        env.ctx.retrieval_plan = from_preset("hybrid", top_k=10, rerank=True)
-        return
-
-    try:
-        raw = await asyncio.wait_for(
-            _plan_retrieval_llm(env.llm, env.model, env.ctx.query, history_text=env.ctx.history_text),
-            timeout=env.settings.agent_llm_timeout + 10,
-        )
-    except Exception as e:
-        from models.events import ErrorEvent
-        yield ErrorEvent(error=f"Plan error: {e!s}")
-        return
-
-    env.ctx.retrieval_mode = str(raw.get("retrieval_mode") or "hybrid")
-    reason = str(raw.get("reason") or "")
-    env.ctx.retrieval_plan = from_llm_plan(
-        raw,
-        top_k_min=env.settings.agent_top_k_min,
-        top_k_max=env.settings.agent_top_k_max,
-    )
-    yield TraceEvent(
-        kind="thought", label="Plan",
-        content=f"mode={env.ctx.retrieval_mode}. Reason: {reason}",
-    )
-
 
 _DEFAULT_PLAN_DICT = {
     "retrieval_mode": "hybrid",
@@ -88,6 +56,133 @@ _DEFAULT_PLAN_DICT = {
     "use_hyde": False,
     "reason": "fallback",
 }
+
+
+async def expand(
+    steps: list[ExpandStep],
+    *,
+    query: str,
+    project_id: str,
+    lang: str,
+    history_text: str,
+    budget: BudgetCounter,
+    llm: LLMClient,
+    model: str,
+    http_client: httpx.AsyncClient,
+    settings: Settings,
+) -> ExpandResult:
+    """Run all expand steps, return the accumulated result."""
+    queries = [query]
+    is_factoid = False
+    retrieval_plan: ExecutionPlan | None = None
+    retrieval_mode = "hybrid"
+    extra_chunks: list[ChunkResult] = []
+    traces: list[dict[str, Any]] = []
+
+    for step in steps:
+        match step:
+            case PlanLLMStep():
+                rp, rm, t = await _plan_retrieval(
+                    query=query, history_text=history_text, budget=budget,
+                    llm=llm, model=model, settings=settings,
+                )
+                retrieval_plan = rp
+                retrieval_mode = rm
+                traces.extend(t)
+
+            case DetectLangStep():
+                lang, is_factoid, t = await _detect_lang(
+                    query=query, budget=budget, llm=llm, model=model,
+                )
+                traces.extend(t)
+
+            case HyDEStep():
+                new_query, t = await _hyde(
+                    query=query, lang=lang, budget=budget,
+                    llm=llm, model=model,
+                )
+                if new_query:
+                    queries[0] = new_query
+                traces.extend(t)
+
+            case FactQueryStep(max_queries=max_q):
+                chunks, t = await _fact_queries(
+                    query=query, project_id=project_id,
+                    history_text=history_text,
+                    max_queries=max_q, budget=budget,
+                    retrieval_plan=retrieval_plan,
+                    existing_chunks=extra_chunks,
+                    llm=llm, model=model,
+                    http_client=http_client, settings=settings,
+                )
+                extra_chunks = chunks
+                traces.extend(t)
+
+            case KeywordStep():
+                chunks, t = await _keywords(
+                    query=query, project_id=project_id,
+                    history_text=history_text,
+                    budget=budget, retrieval_plan=retrieval_plan,
+                    existing_chunks=extra_chunks,
+                    llm=llm, model=model,
+                    http_client=http_client, settings=settings,
+                )
+                extra_chunks = chunks
+                traces.extend(t)
+
+            case QueryVariantsStep():
+                variants = heuristic_variants(query)
+                if len(variants) > 1:
+                    queries = variants
+                    traces.append({
+                        "kind": "action", "label": "QueryVariants",
+                        "content": f"Generated {len(variants)} variants",
+                    })
+
+    return ExpandResult(
+        queries=queries,
+        lang=lang,
+        is_factoid=is_factoid,
+        retrieval_plan=retrieval_plan,
+        retrieval_mode=retrieval_mode,
+        extra_chunks=extra_chunks,
+        traces=traces,
+    )
+
+
+# ── Individual step implementations ──────────────────────
+
+
+async def _plan_retrieval(
+    *, query: str, history_text: str, budget: BudgetCounter,
+    llm: LLMClient, model: str, settings: Settings,
+) -> tuple[ExecutionPlan, str, list[dict[str, Any]]]:
+    traces: list[dict[str, Any]] = [{"kind": "tool", "name": "llm.plan", "payload": {"query": query}}]
+
+    if not budget.try_consume():
+        return from_preset("hybrid", top_k=10, rerank=True), "hybrid", traces
+
+    try:
+        raw = await asyncio.wait_for(
+            _plan_retrieval_llm(llm, model, query, history_text=history_text),
+            timeout=settings.agent_llm_timeout + 10,
+        )
+    except Exception as e:
+        logger.warning("Plan LLM failed: %s", e)
+        return from_preset("hybrid", top_k=10, rerank=True), "hybrid", traces
+
+    retrieval_mode = str(raw.get("retrieval_mode") or "hybrid")
+    reason = str(raw.get("reason") or "")
+    plan = from_llm_plan(
+        raw,
+        top_k_min=settings.agent_top_k_min,
+        top_k_max=settings.agent_top_k_max,
+    )
+    traces.append({
+        "kind": "thought", "label": "Plan",
+        "content": f"mode={retrieval_mode}. Reason: {reason}",
+    })
+    return plan, retrieval_mode, traces
 
 
 async def _plan_retrieval_llm(
@@ -110,100 +205,119 @@ async def _plan_retrieval_llm(
         return dict(_DEFAULT_PLAN_DICT)
 
 
-# ── detect_lang ──────────────────────────────────────────
-
-@step_handler("detect_lang")
-async def run_detect_lang(step: Any, env: StepEnv) -> AsyncIterator[Event]:
-    if env.ctx.budget.try_consume():
-        raw = await env.llm.complete(
-            env.model,
+async def _detect_lang(
+    *, query: str, budget: BudgetCounter, llm: LLMClient, model: str,
+) -> tuple[str, bool, list[dict[str, Any]]]:
+    lang = "English"
+    if budget.try_consume():
+        raw = await llm.complete(
+            model,
             [
                 {"role": "system", "content": DETECT_LANG_SYSTEM},
-                {"role": "user", "content": DETECT_LANG_USER.format(text=env.ctx.query)},
+                {"role": "user", "content": DETECT_LANG_USER.format(text=query)},
             ],
             temperature=0.0,
         )
-        env.ctx.lang = (raw or "").strip() or "English"
-    env.ctx.is_factoid = is_factoid_question(env.ctx.query)
-    return
-    yield  # noqa: make this an async generator
+        lang = (raw or "").strip() or "English"
+    is_factoid = is_factoid_question(query)
+    return lang, is_factoid, []
 
 
-# ── hyde ─────────────────────────────────────────────────
+async def _hyde(
+    *, query: str, lang: str, budget: BudgetCounter,
+    llm: LLMClient, model: str,
+) -> tuple[str | None, list[dict[str, Any]]]:
+    if not budget.try_consume():
+        return None, []
 
-@step_handler("hyde")
-async def run_hyde(step: Any, env: StepEnv) -> AsyncIterator[Event]:
-    if not env.ctx.budget.try_consume():
-        return
-
-    yield TraceEvent(kind="tool", name="llm.hyde", payload={"query": env.ctx.query})
+    traces: list[dict[str, Any]] = [{"kind": "tool", "name": "llm.hyde", "payload": {"query": query}}]
     try:
-        passage = await env.llm.complete(
-            env.model,
+        passage = await llm.complete(
+            model,
             [
-                {"role": "system", "content": HYDE_SYSTEM.format(lang=env.ctx.lang)},
-                {"role": "user", "content": HYDE_USER.format(query=env.ctx.query, lang=env.ctx.lang)},
+                {"role": "system", "content": HYDE_SYSTEM.format(lang=lang)},
+                {"role": "user", "content": HYDE_USER.format(query=query, lang=lang)},
             ],
             temperature=0.2,
         )
-        if passage.strip():
-            env.ctx.search_query = passage
+        return (passage.strip() or None), traces
     except Exception:
         logger.warning("HyDE failed, using original query")
+        return None, traces
 
 
-# ── fact_queries ─────────────────────────────────────────
-
-@step_handler("fact_queries")
-async def run_fact_queries(step: Any, env: StepEnv) -> AsyncIterator[Event]:
-    if not env.ctx.budget.try_consume():
-        return
-
-    yield TraceEvent(kind="tool", name="llm.fact_split", payload={"query": env.ctx.query})
-
+async def _safe_retrieve(
+    query: str, plan: ExecutionPlan, *,
+    project_id: str, http_client: httpx.AsyncClient, settings: Settings,
+) -> list[ChunkResult]:
     try:
-        raw = await env.llm.complete(
-            env.model,
+        return await retrieval_call(
+            http_client, settings.retrieval_url,
+            project_id=project_id, query=query, plan=plan,
+        )
+    except Exception as e:
+        logger.error("Retrieval failed: %s", e)
+        return []
+
+
+async def _fact_queries(
+    *, query: str, project_id: str, history_text: str, max_queries: int,
+    budget: BudgetCounter, retrieval_plan: ExecutionPlan | None,
+    existing_chunks: list[ChunkResult],
+    llm: LLMClient, model: str,
+    http_client: httpx.AsyncClient, settings: Settings,
+) -> tuple[list[ChunkResult], list[dict[str, Any]]]:
+    if not budget.try_consume():
+        return existing_chunks, []
+
+    traces: list[dict[str, Any]] = [{"kind": "tool", "name": "llm.fact_split", "payload": {"query": query}}]
+    try:
+        raw = await llm.complete(
+            model,
             [
                 {"role": "system", "content": FACT_QUERIES_SYSTEM},
                 {"role": "user", "content": FACT_QUERIES_USER.format(
-                    history=env.ctx.history_text, query=env.ctx.query,
+                    history=history_text, query=query,
                 )},
             ],
             temperature=0.2,
         )
         data = json.loads(strip_thinking(raw))
         sub_queries = [str(q).strip() for q in (data.get("fact_queries") or []) if str(q).strip()]
-        sub_queries = sub_queries[:step.max_queries]
+        sub_queries = sub_queries[:max_queries]
     except Exception:
-        return
+        return existing_chunks, traces
 
-    if not sub_queries or env.ctx.retrieval_plan is None:
-        return
+    if not sub_queries or retrieval_plan is None:
+        return existing_chunks, traces
 
     fact_results = await asyncio.gather(*(
-        _safe_retrieve(env, fq, env.ctx.retrieval_plan)
+        _safe_retrieve(fq, retrieval_plan,
+                       project_id=project_id, http_client=http_client, settings=settings)
         for fq in sub_queries
     ))
-    env.ctx.chunks = merge_chunks([env.ctx.chunks, *fact_results])
+    chunks = merge_chunks([existing_chunks, *fact_results])
+    return chunks, traces
 
 
-# ── keywords ─────────────────────────────────────────────
+async def _keywords(
+    *, query: str, project_id: str, history_text: str,
+    budget: BudgetCounter, retrieval_plan: ExecutionPlan | None,
+    existing_chunks: list[ChunkResult],
+    llm: LLMClient, model: str,
+    http_client: httpx.AsyncClient, settings: Settings,
+) -> tuple[list[ChunkResult], list[dict[str, Any]]]:
+    if not budget.try_consume():
+        return existing_chunks, []
 
-@step_handler("keywords")
-async def run_keywords(step: Any, env: StepEnv) -> AsyncIterator[Event]:
-    if not env.ctx.budget.try_consume():
-        return
-
-    yield TraceEvent(kind="tool", name="llm.keywords", payload={"query": env.ctx.query})
-
+    traces: list[dict[str, Any]] = [{"kind": "tool", "name": "llm.keywords", "payload": {"query": query}}]
     try:
-        raw = await env.llm.complete(
-            env.model,
+        raw = await llm.complete(
+            model,
             [
                 {"role": "system", "content": KEYWORD_QUERIES_SYSTEM},
                 {"role": "user", "content": KEYWORD_QUERIES_USER.format(
-                    history=env.ctx.history_text, query=env.ctx.query,
+                    history=history_text, query=query,
                 )},
             ],
             temperature=0.0,
@@ -211,30 +325,15 @@ async def run_keywords(step: Any, env: StepEnv) -> AsyncIterator[Event]:
         data = json.loads(strip_thinking(raw))
         kw = [str(q).strip() for q in (data.get("keywords") or []) if str(q).strip()]
     except Exception:
-        return
+        return existing_chunks, traces
 
-    if not kw or env.ctx.retrieval_plan is None:
-        return
+    if not kw or retrieval_plan is None:
+        return existing_chunks, traces
 
     kw_results = await asyncio.gather(*(
-        _safe_retrieve(env, k, env.ctx.retrieval_plan)
+        _safe_retrieve(k, retrieval_plan,
+                       project_id=project_id, http_client=http_client, settings=settings)
         for k in kw[:4]
     ))
-    env.ctx.chunks = merge_chunks([env.ctx.chunks, *kw_results])
-    return
-    yield  # noqa
-
-
-# ── query_variants ───────────────────────────────────────
-
-@step_handler("query_variants")
-async def run_query_variants(step: Any, env: StepEnv) -> AsyncIterator[Event]:
-    variants = heuristic_variants(env.ctx.query)
-    if len(variants) > 1:
-        env.ctx.search_queries = variants
-        yield TraceEvent(
-            kind="action", label="QueryVariants",
-            content=f"Generated {len(variants)} variants",
-        )
-    return
-    yield  # noqa
+    chunks = merge_chunks([existing_chunks, *kw_results])
+    return chunks, traces
