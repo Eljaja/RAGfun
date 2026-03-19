@@ -97,14 +97,32 @@ def agent(
     )
 
 
-def retry_round(*, top_k: int = 10, use_stitch: bool = True) -> BrainRound:
-    """Lightweight retry round: keyword expand -> thorough retrieve -> generate."""
+def retry_round(
+    *,
+    top_k: int = 10,
+    use_stitch: bool = True,
+    use_hyde: bool = True,
+    use_fact_queries: bool = True,
+    max_fact_queries: int = 2,
+) -> BrainRound:
+    """Retry round: HyDE + keywords + fact queries -> thorough retrieve -> generate.
+
+    Mirrors the old agent-search retry which used HyDE, missing-term queries,
+    and keyword expansion before re-retrieving at 2x top_k.
+    """
+    expand: list = []
+    if use_hyde:
+        expand.append(HyDEStep())
+    expand.append(KeywordStep())
+    if use_fact_queries:
+        expand.append(FactQueryStep(max_queries=max_fact_queries))
+
     return BrainRound(
-        expand=[KeywordStep()],
-        retrieve=BrainRetrieveStep(preset="thorough", top_k=top_k, rerank=True),
+        expand=expand,
+        retrieve=BrainRetrieveStep(preset="thorough", top_k=max(12, top_k * 2), rerank=True),
         post_retrieve=[StitchStep()] if use_stitch else [],
         generate=GenerateStep(stream=True),
-        max_llm_calls=4,
+        max_llm_calls=6,
     )
 
 

@@ -96,13 +96,13 @@ async def expand(
                 )
                 traces.extend(t)
 
-            case HyDEStep():
-                new_query, t = await _hyde(
+            case HyDEStep(num_passages=num_passages):
+                hyde_queries, t = await _hyde(
                     query=query, lang=lang, budget=budget,
-                    llm=llm, model=model,
+                    llm=llm, model=model, num_passages=num_passages,
                 )
-                if new_query:
-                    queries[0] = new_query
+                if hyde_queries:
+                    queries = hyde_queries + queries[1:]
                 traces.extend(t)
 
             case FactQueryStep(max_queries=max_q):
@@ -225,25 +225,56 @@ async def _detect_lang(
 
 async def _hyde(
     *, query: str, lang: str, budget: BudgetCounter,
-    llm: LLMClient, model: str,
-) -> tuple[str | None, list[dict[str, Any]]]:
-    if not budget.try_consume():
-        return None, []
+    llm: LLMClient, model: str, num_passages: int = 1,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Generate hypothetical passages for retrieval.
 
-    traces: list[dict[str, Any]] = [{"kind": "tool", "name": "llm.hyde", "payload": {"query": query}}]
-    try:
-        passage = await llm.complete(
-            model,
-            [
-                {"role": "system", "content": HYDE_SYSTEM.format(lang=lang)},
-                {"role": "user", "content": HYDE_USER.format(query=query, lang=lang)},
-            ],
-            temperature=0.2,
-        )
-        return (passage.strip() or None), traces
-    except Exception:
-        logger.warning("HyDE failed, using original query")
-        return None, traces
+    When num_passages > 1, generates N passages at escalating temperatures
+    (0.2, 0.35, 0.50, ...) for recall diversity, matching the old agent-search
+    multi-HyDE strategy.
+    """
+    actual_n = min(num_passages, budget.remaining)
+    if actual_n < 1 or not budget.try_consume():
+        return [], []
+
+    messages = [
+        {"role": "system", "content": HYDE_SYSTEM.format(lang=lang)},
+        {"role": "user", "content": HYDE_USER.format(query=query, lang=lang)},
+    ]
+    traces: list[dict[str, Any]] = [
+        {"kind": "tool", "name": "llm.hyde",
+         "payload": {"query": query, "num": actual_n}},
+    ]
+
+    if actual_n == 1:
+        try:
+            passage = await llm.complete(model, messages, temperature=0.2)
+            result = [passage.strip()] if passage and passage.strip() else []
+            return result, traces
+        except Exception:
+            logger.warning("HyDE failed, using original query")
+            return [], traces
+
+    for _ in range(actual_n - 1):
+        budget.try_consume()
+
+    temps = [0.2 + 0.15 * i for i in range(actual_n)]
+    tasks = [llm.complete(model, messages, temperature=t) for t in temps]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    passages = []
+    for r in results:
+        if isinstance(r, BaseException):
+            logger.warning("HyDE passage failed: %s", r)
+            continue
+        text = (r or "").strip()
+        if text:
+            passages.append(text)
+
+    traces.append({
+        "kind": "thought", "label": "HyDE",
+        "content": f"Generated {len(passages)}/{actual_n} hypothetical passages",
+    })
+    return passages, traces
 
 
 async def _safe_retrieve(

@@ -178,12 +178,17 @@ async def agent_non_streaming(body: AgentRequest, request: Request):
         )
 
         if result.needs_retry and settings.agent_use_retry:
+            retry_query = result.requery or body.query
+            if result.missing_terms:
+                suffix = " ".join(t for t in result.missing_terms if t.lower() not in retry_query.lower())
+                if suffix:
+                    retry_query = f"{retry_query} {suffix}"
             rplan = retry_round(top_k=body.top_k or 10)
             result = await asyncio.wait_for(
                 run_pipeline(
                     rplan,
                     project_id=body.project_id,
-                    query=result.requery or body.query,
+                    query=retry_query,
                     history=body.history, include_sources=body.include_sources,
                     **kwargs,
                 ),
@@ -231,12 +236,17 @@ async def agent_stream(body: AgentRequest, request: Request):
             )
 
             if result.needs_retry and settings.agent_use_retry:
+                retry_query = result.requery or body.query
+                if result.missing_terms:
+                    suffix = " ".join(t for t in result.missing_terms if t.lower() not in retry_query.lower())
+                    if suffix:
+                        retry_query = f"{retry_query} {suffix}"
                 rplan = retry_round(top_k=body.top_k or 10)
                 result = await asyncio.wait_for(
                     run_pipeline(
                         rplan,
                         project_id=body.project_id,
-                        query=result.requery or body.query,
+                        query=retry_query,
                         history=body.history, include_sources=body.include_sources,
                         **kwargs,
                     ),
