@@ -51,4 +51,4 @@ async def health():
 
 if __name__ == "__main__":
     settings = Settings()
-    uvicorn.run(app=app, port=settings.port, host="0.0.0.0")
+    uvicorn.run(app=app, port=settings.port+1, host="0.0.0.0")

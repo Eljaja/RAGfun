@@ -7,12 +7,12 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(frozen=True, extra="ignore")
 
     # ── Retrieval service ────────────────────────────────────
-    retrieval_url: str = "http://localhost:8920"
+    retrieval_url: str = "http://localhost:8921"
 
     # ── LLM (generation) ────────────────────────────────────
     llm_base_url: str = "https://llm.c.singularitynet.io/v1"
     llm_model: str = "openai/gpt-oss-120b"
-    llm_api_key: str = ""
+    llm_api_key: str = "sk-FQ0o8MR5WWeLgqCTP_cZSxtpL8xbpopVCTFxSs5GQk0"
     llm_timeout: float = 60.0
 
     # ── Reflection (simple pipeline) ─────────────────────────
