@@ -8,7 +8,6 @@ from opensearchpy import AsyncOpenSearch
 from opensearchpy.exceptions import (
     ConnectionError as OSConnectionError,
     ConnectionTimeout as OSConnectionTimeout,
-    NotFoundError as OSNotFoundError,
 )
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse as QdrantUnexpectedResponse
@@ -25,6 +24,7 @@ from models import (
     ChunkResult,
     EmbeddingResponse,
     ExecutionPlan,
+    QueryStepBase,
     RetrievalStep,
     RerankStep,
     ScoreSource,
@@ -136,33 +136,16 @@ class HybridRetriever:
             index=collection,
             body={"query": {"match": {"text": query}}, "size": top_k},
         )
-        hits = resp["hits"]["hits"][:top_k]
-        docs = await asyncio.gather(
-            *(self._os_get(hit["_id"], collection) for hit in hits),
-        )
         return [
             ChunkResult(
-                text=doc["text"],
-                source_id=doc.get("source_id") or doc.get("doc_id", ""),
-                chunk_index=doc.get("chunk_index", 0),
+                text=src["text"],
+                source_id=src.get("source_id") or src.get("doc_id", ""),
+                chunk_index=src.get("chunk_index", 0),
                 score=hit["_score"],
             )
-            for hit, doc in zip(hits, docs, strict=False)
-            if doc
+            for hit in resp["hits"]["hits"][:top_k]
+            if (src := hit.get("_source")) and "text" in src
         ]
-
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=0.3, max=2),
-        retry=retry_if_exception_type(_RETRYABLE_OS),
-        reraise=True,
-    )
-    async def _os_get(self, doc_id: str, index: str) -> dict | None:
-        try:
-            resp = await self.opensearch.get(index=index, id=doc_id)
-            return resp["_source"]
-        except OSNotFoundError:
-            return None
 
     # ── plan execution ────────────────────────────────────────
 
@@ -189,17 +172,16 @@ class HybridRetriever:
         self,
         *,
         base_query: str,
-        step,
+        step: QueryStepBase,
     ) -> str:
-        query = (getattr(step, "query", "") or "").strip()
-        return query or base_query
+        return step.query.strip() or base_query
 
     async def _search_step(
         self,
         *,
         base_query: str,
         collection: str,
-        step,
+        step: QueryStepBase,
     ) -> list[ChunkResult]:
         step_query = self._resolve_step_query(
             base_query=base_query, step=step,

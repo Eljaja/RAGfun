@@ -8,6 +8,31 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 _MAX_QUERY_LEN = 2000
 
 
+def _validate_query_str(value: object, *, required: bool) -> str:
+    """Shared query validation.
+
+    required=True  -> null/empty is an error (request-level queries).
+    required=False -> null/empty is an error too, but with a hint to omit
+                      the field instead (step-level optional overrides).
+    """
+    if value is None:
+        if required:
+            raise ValueError("query cannot be null")
+        raise ValueError("query cannot be null; omit the field to use request query")
+    if not isinstance(value, str):
+        raise ValueError("query must be a string")
+    text = value.strip()
+    if not text:
+        if required:
+            raise ValueError("query cannot be empty")
+        raise ValueError("query cannot be empty; omit the field to use request query")
+    if len(text) > _MAX_QUERY_LEN:
+        raise ValueError(f"query is too long (max {_MAX_QUERY_LEN} chars)")
+    if any(ord(ch) < 32 and ch not in ("\t", "\n", "\r") for ch in text):
+        raise ValueError("query contains unsupported control characters")
+    return text
+
+
 class ScoreSource(StrEnum):
     RETRIEVAL = "retrieval"
     RRF = "rrf"
@@ -35,85 +60,42 @@ class EmbeddingResponse(BaseModel):
     usage: dict[str, Any] | None = None
 
 
+# ── Step base classes ────────────────────────────────────
+
+
 class StepBase(BaseModel):
-    """Base model for retrieval plan steps with strict field checks."""
+    """Base for all plan steps."""
 
     model_config = ConfigDict(extra="forbid")
 
-    @field_validator("query", mode="before", check_fields=False)
-    @classmethod
-    def _normalize_and_validate_query(cls, value: object) -> str:
-        """
-        Query handling rules:
-        - missing field -> defaults to "", and retriever falls back to request query
-        - explicit null is rejected
-        - explicit empty/whitespace values are rejected
-        - hidden control chars are rejected
-        """
-        if value is None:
-            raise ValueError("query cannot be null; omit the field to use request query")
-        if not isinstance(value, str):
-            raise ValueError("query must be a string")
-        text = value.strip()
-        if not text:
-            raise ValueError("query cannot be empty; omit the field to use request query")
-        if len(text) > _MAX_QUERY_LEN:
-            raise ValueError(f"query is too long (max {_MAX_QUERY_LEN} chars)")
-        if any((ord(ch) < 32 and ch not in ("\t", "\n", "\r")) for ch in text):
-            raise ValueError("query contains unsupported control characters")
-        return text
 
+class QueryStepBase(StepBase):
+    """Base for steps that accept an optional per-step query override."""
 
-class BM25SearchStep(StepBase):
-    kind: Literal["bm25_search"] = "bm25_search"
-    top_k: int = Field(default=20, ge=1, le=2000)
     query: str = Field(default="", max_length=_MAX_QUERY_LEN)
 
-# TODO: take embedding model from the project 
+    @field_validator("query", mode="before")
+    @classmethod
+    def _normalize_query(cls, v: object) -> str:
+        return _validate_query_str(v, required=False)
+
+
+# ── Step types ───────────────────────────────────────────
+
+# TODO: take embedding model from the project
 # TODO: allow model choice for reranker
 # TODO: will probably require router or smth (or infinity will be able to serve multiple)
 # TODO: will require some new methods
-"""
-Right, stripping out anything that's indexing-time or brain-layer, here's what's left -- things that belong in this retrieval service:
 
-## New Retrieval Step Types
 
-**Metadata filtering** on existing search steps. Push filters into Qdrant/OpenSearch queries so you search a narrower candidate set. Tags, language, source document, ACL -- all already indexed by the doc processor. Not a separate step, just a `filters` field on `VectorSearchStep` and `BM25SearchStep`.
+class BM25SearchStep(QueryStepBase):
+    kind: Literal["bm25_search"] = "bm25_search"
+    top_k: int = Field(default=20, ge=1, le=2000)
 
-**Phrase search.** Exact phrase matching via OpenSearch `match_phrase`. Different from BM25's fuzzy term matching. When the user searches for "error code 5042", you want exact string match, not BM25's term-frequency weighting across "error" and "code" and "5042" separately.
 
-## New Fusion Methods
-
-**Weighted RRF.** Per-source weights on the existing RRF formula. "Trust vector 70%, BM25 30%." One multiplier change in `rrf()`, same rank-based properties, but tunable.
-
-## New Ranking Step Types
-
-**Score threshold.** Drop everything below a minimum score. Only valid after rerank (same constraint as adaptive_k). The brain or user says "don't give me anything the reranker scored below 0.5."
-
-**Diversity / MMR.** After reranking gives you the most relevant chunks, diversity removes near-duplicates. Penalizes chunks that are too similar to already-selected chunks. Needs pairwise similarity (cosine on embeddings), the embedding endpoint is already available. Solves the "top 5 results are all from the same paragraph" problem.
-
-## New Finalize Step Types
-
-**Context expansion.** Given the final selected chunks, fetch neighboring chunks from the same document. Chunk #5 scored best, also return #4 and #6. Uses `source_id` and `chunk_index` which are already on every `ChunkResult`. One extra fetch to the stores per expanded chunk.
-
-## Summary
-
-| Step | Phase | Complexity | What it solves |
-|---|---|---|---|
-| Metadata filters | retrieve | Small -- fields on existing steps | Precision, multi-tenancy, ACL |
-| Phrase search | retrieve | Small -- new step, one OS query type | Exact term matching |
-| Weighted RRF | combine | Tiny -- one multiplier | Source preference tuning |
-| Score threshold | rank | Tiny -- one comparison | Quality floor |
-| Diversity / MMR | rank | Medium -- needs embeddings | Redundancy elimination |
-| Context expansion | finalize | Small -- adjacent chunk fetch | Chunk boundary problem |
-
-Six additions, all within the retrieval service boundary, all expressible as plan steps.
-"""
-
-class VectorSearchStep(StepBase):
+class VectorSearchStep(QueryStepBase):
     kind: Literal["vector_search"] = "vector_search"
     top_k: int = Field(default=20, ge=1, le=2000)
-    query: str = Field(default="", max_length=_MAX_QUERY_LEN)
 
 
 class FuseStep(StepBase):
@@ -122,12 +104,10 @@ class FuseStep(StepBase):
     rrf_k: int = Field(default=60, ge=1, le=5000)
 
 
-# TODO: model choice 
-# right now it is rigid
-class RerankStep(StepBase):
+# TODO: model choice -- right now it is rigid
+class RerankStep(QueryStepBase):
     kind: Literal["rerank"] = "rerank"
     top_n: int = Field(default=8, ge=1, le=1000)
-    query: str = Field(default="", max_length=_MAX_QUERY_LEN)
 
 
 class AdaptiveKStep(StepBase):
@@ -153,10 +133,9 @@ FinalizeStep = Annotated[TrimStep, Field(discriminator="kind")]
 
 
 class PlanRound(BaseModel):
-    """
-    One retrieval round with explicit phases.
+    """One retrieval round with explicit phases.
 
-    This shape provides basic composition checks:
+    Validates:
     - retrieval comes first (bm25/vector only),
     - optional fuse step after retrieval,
     - ranking/post-processing next.
@@ -247,27 +226,24 @@ class ExecutionPlan(BaseModel):
         )
 
 
-class RetrieveRequest(BaseModel):
+# ── Request / response models ────────────────────────────
+
+
+class _RequestBase(BaseModel):
     project_id: str
     query: str = Field(min_length=1, max_length=_MAX_QUERY_LEN)
+
+    @field_validator("query", mode="before")
+    @classmethod
+    def _validate_query(cls, v: object) -> str:
+        return _validate_query_str(v, required=True)
+
+
+class RetrieveRequest(_RequestBase):
     top_k: int = Field(default=5, ge=1, le=2000)
     rerank: bool = True
     rerank_top_n: int = Field(default=5, ge=1, le=2000)
     strategy: str = Field(default="hybrid", pattern="^(hybrid|vector|bm25)$")
-
-    @field_validator("query", mode="before")
-    @classmethod
-    def _validate_query(cls, value: object) -> str:
-        if value is None:
-            raise ValueError("query cannot be null")
-        if not isinstance(value, str):
-            raise ValueError("query must be a string")
-        text = value.strip()
-        if not text:
-            raise ValueError("query cannot be empty")
-        if any((ord(ch) < 32 and ch not in ("\t", "\n", "\r")) for ch in text):
-            raise ValueError("query contains unsupported control characters")
-        return text
 
 
 class RetrieveResponse(BaseModel):
@@ -277,24 +253,8 @@ class RetrieveResponse(BaseModel):
     plan_used: ExecutionPlan | None = None
 
 
-class ExecuteRequest(BaseModel):
-    project_id: str
-    query: str = Field(min_length=1, max_length=_MAX_QUERY_LEN)
+class ExecuteRequest(_RequestBase):
     plan: ExecutionPlan
-
-    @field_validator("query", mode="before")
-    @classmethod
-    def _validate_query(cls, value: object) -> str:
-        if value is None:
-            raise ValueError("query cannot be null")
-        if not isinstance(value, str):
-            raise ValueError("query must be a string")
-        text = value.strip()
-        if not text:
-            raise ValueError("query cannot be empty")
-        if any((ord(ch) < 32 and ch not in ("\t", "\n", "\r")) for ch in text):
-            raise ValueError("query contains unsupported control characters")
-        return text
 
 
 class ExecuteResponse(BaseModel):
