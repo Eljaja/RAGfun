@@ -1,21 +1,17 @@
-"""Tool executors and OpenAI-compatible tool definitions."""
+"""Tool executors and OpenAI-compatible tool definitions.
+
+Only the AST-based calculator is kept — it's actually safe.
+execute_code was removed: the substring blocklist was trivially bypassable
+(blocks "os" but chr(111)+chr(115) escapes it). A RAG service should not
+run arbitrary code; if needed, use a proper sandbox.
+"""
 
 from __future__ import annotations
 
 import ast
 import math
 import re
-import subprocess
-import sys
 from typing import Any
-
-_CODE_BLOCKED = frozenset({
-    "import", "from", "open", "exec", "eval", "compile", "execfile",
-    "__import__", "getattr", "setattr", "delattr", "globals", "locals",
-    "input", "raw_input", "file", "reload", "exit", "quit", "os", "sys",
-    "subprocess", "socket", "requests", "urllib", "builtins", "code",
-    "frame", "traceback", "ctypes", "pickle", "marshal", "dis",
-})
 
 _SAFE_MATH = {
     "sqrt": math.sqrt, "log": math.log, "log10": math.log10,
@@ -23,8 +19,6 @@ _SAFE_MATH = {
     "pi": math.pi, "e": math.e, "abs": abs, "round": round,
     "min": min, "max": max,
 }
-
-# ── Executors ────────────────────────────────────────────
 
 
 def run_calculator(expression: str) -> dict[str, Any]:
@@ -46,50 +40,12 @@ def run_calculator(expression: str) -> dict[str, Any]:
         return {"ok": False, "error": str(e), "result": None}
 
 
-def run_execute_code(code: str, timeout_s: float = 5.0) -> dict[str, Any]:
-    code = (code or "").strip()
-    if not code:
-        return {"ok": False, "error": "Empty code", "stdout": "", "stderr": ""}
-    code_lower = code.lower()
-    for blocked in _CODE_BLOCKED:
-        if blocked in code_lower:
-            return {"ok": False, "error": f"Blocked: {blocked}", "stdout": "", "stderr": ""}
-    if "__" in code:
-        return {"ok": False, "error": "Blocked: __", "stdout": "", "stderr": ""}
-    try:
-        result = subprocess.run(
-            [sys.executable, "-c", code],
-            timeout=timeout_s,
-            capture_output=True,
-            text=True,
-            env={"PATH": "/usr/bin:/bin", "PYTHONIOENCODING": "utf-8"},
-        )
-        return {
-            "ok": result.returncode == 0,
-            "stdout": (result.stdout or "").strip(),
-            "stderr": (result.stderr or "").strip(),
-            "returncode": result.returncode,
-        }
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": "Timeout", "stdout": "", "stderr": ""}
-    except Exception as e:
-        return {"ok": False, "error": str(e), "stdout": "", "stderr": ""}
-
-
-# ── Tool dispatch ────────────────────────────────────────
-
-
 def execute_tool(name: str, args: dict[str, Any]) -> str:
     if name == "calculator":
         out = run_calculator(args.get("expression", ""))
         return str(out.get("result")) if out.get("ok") else f"Error: {out.get('error', 'unknown')}"
-    if name == "execute_code":
-        out = run_execute_code(args.get("code", ""))
-        return out.get("stdout", "") or (f"stderr: {out.get('stderr', '')}" if not out.get("ok") else "ok")
     return "Unknown tool"
 
-
-# ── OpenAI-compatible tool definitions ───────────────────
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
@@ -103,20 +59,6 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "expression": {"type": "string", "description": "Math expression to evaluate"},
                 },
                 "required": ["expression"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "execute_code",
-            "description": "Execute Python code in a sandbox. No network or file I/O.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "code": {"type": "string", "description": "Python code to execute"},
-                },
-                "required": ["code"],
             },
         },
     },

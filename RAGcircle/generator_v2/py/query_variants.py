@@ -11,6 +11,7 @@ import unicodedata
 from collections import Counter
 
 from models import ChunkResult
+from shared import strip_thinking
 
 try:
     from rapidfuzz import fuzz as _fuzz
@@ -27,7 +28,6 @@ _WS_RE = re.compile(r"\s+")
 _QUOTED_RE = re.compile(r"\"([^\"]+)\"|'([^']+)'")
 _YEAR_RE = re.compile(r"\b(18\d{2}|19\d{2}|20\d{2})\b")
 _TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9]+")
-_THINKING_RE = re.compile(r"<think>.*?</think>", flags=re.DOTALL | re.IGNORECASE)
 
 _FACTOID_LEAD_RE = re.compile(
     r"^\s*(who|what|which|where|when|how many|how much|кто|что|какой|какая|какие|где|когда|сколько)\b",
@@ -176,8 +176,8 @@ def answer_is_grounded(*, answer: str, context_text: str) -> bool:
     return bool(ans and ctx and ans in ctx)
 
 
-def strip_thinking(text: str) -> str:
-    """Remove <think>...</think> blocks from text."""
-    if not text or not text.strip():
-        return text
-    return _THINKING_RE.sub("", text).strip()
+__all__ = [
+    "keyword_query", "query_variants", "dedupe_queries",
+    "extract_hint_terms", "unique_source_count",
+    "is_factoid_question", "answer_is_grounded", "strip_thinking",
+]

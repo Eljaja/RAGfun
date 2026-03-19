@@ -20,6 +20,7 @@ from models import (
     QueryVariantsStep,
     ReflectStep,
     StitchStep,
+    SupplementalRetrieveStep,
     TwoPassStep,
 )
 
@@ -99,6 +100,7 @@ def agent(
     evaluate: list = []
     if use_retry:
         evaluate.append(AssessStep())
+        evaluate.append(SupplementalRetrieveStep())
     if use_factoid_retry:
         evaluate.append(FactoidRetryStep())
 
@@ -186,17 +188,6 @@ def gate(
     are heuristic: multi-query variants, BM25 anchor, two-pass hint
     expansion, factoid within-doc expand, segment stitching, and
     factoid post-generation grounding retry.
-
-    Gate flow mapped to BrainPlan steps:
-      _query_variants()           -> QueryVariantsStep  (expand)
-      hybrid search fan-out       -> _exec_retrieve multi-query
-      _apply_bm25_anchor_pass()   -> BM25AnchorStep     (post-retrieve)
-      two_pass (hint terms)       -> TwoPassStep         (post-retrieve)
-      factoid pre-expansion       -> FactoidExpandStep   (post-retrieve)
-      segment stitching           -> StitchStep          (post-retrieve)
-      build_messages (history)    -> history_as_messages  (generate)
-      _strip_thinking_text        -> ThinkStripper        (llm.stream)
-      factoid grounding retry     -> FactoidRetryStep    (evaluate)
     """
     post_retrieve: list = [QualityCheckStep()]
     if use_bm25_anchor:
