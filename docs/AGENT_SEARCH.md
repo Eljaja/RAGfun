@@ -65,3 +65,48 @@ curl -s -X POST "http://localhost:8093/v1/agent" \
   -H "Content-Type: application/json" \
   -d '{"query":"What is RAG?","include_sources":true}' | jq .
 ```
+
+## RAGcircle v2 quick examples
+
+Generator v2 (`http://localhost:8930`):
+
+```bash
+# Non-streaming
+curl -sS "http://localhost:8930/agent" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "project_id": "default",
+    "query": "What is RAG?",
+    "strategy": "hybrid",
+    "top_k": 8,
+    "mode": "aggressive",
+    "include_sources": true
+  }' | jq .
+
+# Streaming
+curl -N -sS "http://localhost:8930/agent/stream" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "project_id": "default",
+    "query": "What is RAG?",
+    "strategy": "hybrid",
+    "top_k": 8,
+    "mode": "conservative",
+    "include_sources": true
+  }'
+```
+
+Gate v2 proxy (`http://localhost:8912`):
+
+```bash
+curl -sS "http://localhost:8912/api/v1/projects/default/agent" \
+  -H "Content-Type: application/json" \
+  -H "X-ODS-API-KEY: <TOKEN>" \
+  -d '{
+    "query": "What is RAG?",
+    "strategy": "hybrid",
+    "top_k": 8,
+    "mode": "aggressive",
+    "include_sources": true
+  }' | jq .
+```

@@ -2,6 +2,7 @@ from __future__ import annotations
 import uvicorn
 import uuid
 import re
+import json
 import httpx
 from storage import UploadMeta, upload_with_content_addressing, detect_content_type, download_from_s3
 from collectors import QdrantStore, BM25Store
@@ -20,7 +21,7 @@ from exceptions import register_exception_handlers
 
 from fastapi import UploadFile, File, Form, HTTPException, Query
 from inspect import Parameter, Signature
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 from database_ops import DocumentEventDB, create_db, ProjectDB, DocumentDB
@@ -671,6 +672,16 @@ class ChatRequestBody(BaseModel):
     reflection_enabled: bool = True
 
 
+class AgentRequestBody(BaseModel):
+    query: str
+    history: list[dict[str, str]] = Field(default_factory=list)
+    include_sources: bool = True
+    top_k: int = 8
+    rerank: bool = True
+    strategy: str = "hybrid"
+    mode: str | None = None
+
+
 @protected_router.post("/v1/projects/{project_id}/retrieve")
 async def retrieve_documents(
     project_id: str,
@@ -739,6 +750,87 @@ async def chat_with_documents(
         raise HTTPException(status_code=502, detail="Generator service error")
 
     return resp.json()
+
+
+@protected_router.post("/v1/projects/{project_id}/agent")
+async def agent_with_documents(
+    project_id: str,
+    body: AgentRequestBody,
+    user: UserCreds = Depends(authenticated),
+    project_db: ProjectDB = Depends(get_project_db),
+    settings: Settings = Depends(get_settings),
+    client: httpx.AsyncClient = Depends(get_http_client),
+):
+    await authorize_project(project_db, project_id, user.user_id)
+
+    resp = await client.post(
+        f"{settings.generator_url}/agent",
+        json={
+            "project_id": project_id,
+            "query": body.query,
+            "history": body.history,
+            "include_sources": body.include_sources,
+            "top_k": body.top_k,
+            "rerank": body.rerank,
+            "strategy": body.strategy,
+            "mode": body.mode,
+        },
+    )
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail="Agent service error")
+
+    return resp.json()
+
+
+@protected_router.post("/v1/projects/{project_id}/agent/stream")
+async def agent_with_documents_stream(
+    project_id: str,
+    body: AgentRequestBody,
+    user: UserCreds = Depends(authenticated),
+    project_db: ProjectDB = Depends(get_project_db),
+    settings: Settings = Depends(get_settings),
+    client: httpx.AsyncClient = Depends(get_http_client),
+):
+    await authorize_project(project_db, project_id, user.user_id)
+
+    async def _proxy_stream():
+        try:
+            async with client.stream(
+                "POST",
+                f"{settings.generator_url}/agent/stream",
+                json={
+                    "project_id": project_id,
+                    "query": body.query,
+                    "history": body.history,
+                    "include_sources": body.include_sources,
+                    "top_k": body.top_k,
+                    "rerank": body.rerank,
+                    "strategy": body.strategy,
+                    "mode": body.mode,
+                },
+            ) as upstream:
+                if upstream.status_code != 200:
+                    detail = await upstream.aread()
+                    raise HTTPException(status_code=502, detail=f"Agent stream error: {detail.decode('utf-8', errors='ignore')}")
+                async for chunk in upstream.aiter_text():
+                    if chunk:
+                        yield chunk
+        except HTTPException:
+            raise
+        except Exception as exc:
+            err = {"type": "error", "error": f"Agent stream proxy failed: {exc!s}"}
+            yield f"data: {json.dumps(err)}\n\n"
+
+    return StreamingResponse(
+        _proxy_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 

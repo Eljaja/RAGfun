@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import json
 import logging
+import uuid
 from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator
 
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 
 from config import Settings
 from llm import LLMClient
-from pipeline import rag_pipeline
-from models import ChatRequest, ChatResponse
+from pipeline import rag_agent_pipeline, rag_pipeline
+from models import AgentRequest, AgentResponse, ChatRequest, ChatResponse
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +70,114 @@ async def chat(body: ChatRequest):
         raise HTTPException(status_code=502, detail="Generation pipeline error")
 
     return result
+
+
+@app.post("/agent", response_model=AgentResponse)
+async def agent(body: AgentRequest):
+    settings: Settings = app.state.settings
+    trace_id = uuid.uuid4().hex
+
+    try:
+        result = await rag_agent_pipeline(
+            request=body,
+            retrieval_url=settings.retrieval_url,
+            http_client=app.state.http_client,
+            llm=app.state.llm,
+            gen_model=settings.llm_model,
+        )
+    except Exception:
+        logger.exception("Agent pipeline failed for project %s", body.project_id)
+        raise HTTPException(status_code=502, detail="Agent pipeline error")
+
+    return AgentResponse(
+        trace_id=trace_id,
+        answer=result["answer"],
+        sources=result["sources"],
+        context=result["context"],
+        mode=result["mode"],
+        partial=result["partial"],
+        degraded=result["degraded"],
+    )
+
+
+@app.post("/agent/stream")
+async def agent_stream(body: AgentRequest):
+    settings: Settings = app.state.settings
+    trace_id = uuid.uuid4().hex
+
+    async def _event_stream() -> AsyncIterator[str]:
+        try:
+            yield _sse({"type": "init", "trace_id": trace_id})
+
+            result = await rag_agent_pipeline(
+                request=body,
+                retrieval_url=settings.retrieval_url,
+                http_client=app.state.http_client,
+                llm=app.state.llm,
+                gen_model=settings.llm_model,
+            )
+            yield _sse(
+                {
+                    "type": "trace",
+                    "kind": "tool",
+                    "name": "retrieval.plan",
+                    "payload": {
+                        "query": body.query,
+                        "strategy": body.strategy,
+                        "top_k": body.top_k,
+                        "rerank": body.rerank,
+                        "mode": body.mode,
+                        "plan": result.get("plan"),
+                    },
+                    "trace_id": trace_id,
+                }
+            )
+            yield _sse(
+                {
+                    "type": "retrieval",
+                    "mode": result["mode"],
+                    "partial": result["partial"],
+                    "degraded": result["degraded"],
+                    "context": result["context"],
+                    "trace_id": trace_id,
+                }
+            )
+
+            answer = result["answer"]
+            if answer:
+                # Stream words to keep UI responsive while preserving simple generation path.
+                for token in answer.split(" "):
+                    yield _sse({"type": "token", "content": f"{token} ", "trace_id": trace_id})
+
+            yield _sse(
+                {
+                    "type": "done",
+                    "answer": answer,
+                    "sources": result["sources"],
+                    "context": result["context"],
+                    "mode": result["mode"],
+                    "partial": result["partial"],
+                    "degraded": result["degraded"],
+                    "trace_id": trace_id,
+                }
+            )
+        except Exception as exc:
+            logger.exception("Agent stream failed for project %s", body.project_id)
+            yield _sse({"type": "error", "error": str(exc), "trace_id": trace_id})
+
+    return StreamingResponse(
+        _event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def _sse(event: dict[str, Any]) -> str:
+    return f"data: {json.dumps(event)}\n\n"
 
 
 if __name__ == "__main__":

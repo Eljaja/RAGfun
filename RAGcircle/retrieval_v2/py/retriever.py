@@ -5,7 +5,17 @@ import logging
 from store import QdrantStore, BM25Store
 from embedder import Embedder
 from reranker import Reranker
-from models import ChunkResult
+from models import (
+    AdaptiveKStep,
+    BM25SearchStep,
+    ChunkResult,
+    ExecutionPlan,
+    FuseStep,
+    RerankStep,
+    ScoreSource,
+    TrimStep,
+    VectorSearchStep,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +27,23 @@ def rrf(rankings: list[list[str]], k: int = 60) -> list[tuple[str, float]]:
         for rank, doc_id in enumerate(ranking):
             scores[doc_id] = scores.get(doc_id, 0) + 1 / (k + rank + 1)
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+
+def adaptive_k_cutoff(
+    chunks: list[ChunkResult],
+    *,
+    min_k: int = 3,
+    max_k: int = 24,
+) -> list[ChunkResult]:
+    if len(chunks) <= 1:
+        return chunks
+    scores = [c.score for c in chunks]
+    gaps = [scores[i] - scores[i + 1] for i in range(len(scores) - 1)]
+    if not gaps:
+        return chunks
+    best_i = max(range(len(gaps)), key=lambda i: gaps[i])
+    effective_k = max(min_k, min(max_k, best_i + 1))
+    return chunks[:effective_k]
 
 
 class HybridRetriever:
@@ -60,11 +87,57 @@ class HybridRetriever:
 
         return chunks
 
+    async def execute_plan(
+        self,
+        query: str,
+        collection: str,
+        plan: ExecutionPlan,
+    ) -> list[ChunkResult]:
+        round_plan = plan.round
+
+        retrieval_outputs: list[list[ChunkResult]] = []
+        for step in round_plan.retrieve:
+            if isinstance(step, VectorSearchStep):
+                q = step.query.strip() if step.query.strip() else query
+                vector = (await self.embedder.embed([q]))[0]
+                retrieval_outputs.append(await self._vector_search(vector, collection, step.top_k))
+            elif isinstance(step, BM25SearchStep):
+                q = step.query.strip() if step.query.strip() else query
+                retrieval_outputs.append(await self._bm25_search(q, collection, step.top_k))
+
+        if not retrieval_outputs:
+            return []
+
+        chunks: list[ChunkResult]
+        if len(retrieval_outputs) == 1:
+            chunks = retrieval_outputs[0]
+        else:
+            combine = round_plan.combine or FuseStep()
+            chunks = self._fuse_rrf(retrieval_outputs, combine.rrf_k)
+
+        for step in round_plan.rank:
+            if isinstance(step, RerankStep):
+                if not chunks or not self.reranker:
+                    continue
+                rq = step.query.strip() if step.query.strip() else query
+                try:
+                    chunks = await self.reranker.rerank(rq, chunks, top_n=step.top_n)
+                except Exception:
+                    logger.warning("Reranker failed in execution plan", exc_info=True)
+            elif isinstance(step, AdaptiveKStep):
+                chunks = adaptive_k_cutoff(chunks, min_k=step.min_k, max_k=step.max_k)
+
+        for step in round_plan.finalize:
+            if isinstance(step, TrimStep):
+                chunks = chunks[: step.top_k]
+
+        return chunks
+
     async def _vector_search(
         self, vector: list[float], collection: str, top_k: int,
     ) -> list[ChunkResult]:
         hits = await self.qdrant.search(collection, vector, limit=top_k)
-        return [ChunkResult(**h) for h in hits]
+        return [ChunkResult(**h, score_source=ScoreSource.RETRIEVAL) for h in hits]
 
     async def _bm25_search(
         self, query: str, collection: str, top_k: int,
@@ -79,6 +152,7 @@ class HybridRetriever:
                     source_id=doc.get("source_id") or doc.get("doc_id", ""),
                     chunk_index=doc.get("chunk_index", 0),
                     score=score,
+                    score_source=ScoreSource.RETRIEVAL,
                 ))
         return results
 
@@ -118,7 +192,38 @@ class HybridRetriever:
                 source_id=payloads[doc_id]["source_id"],
                 chunk_index=payloads[doc_id]["chunk_index"],
                 score=score,
+                score_source=ScoreSource.RRF,
             )
             for doc_id, score in fused[:top_k]
             if doc_id in payloads
+        ]
+
+    def _fuse_rrf(
+        self,
+        retrieval_outputs: list[list[ChunkResult]],
+        rrf_k: int = 60,
+    ) -> list[ChunkResult]:
+        payloads: dict[str, ChunkResult] = {}
+        rankings: list[list[str]] = []
+
+        for output in retrieval_outputs:
+            ranking_ids: list[str] = []
+            for c in output:
+                cid = f"{c.source_id}_{c.chunk_index}"
+                ranking_ids.append(cid)
+                if cid not in payloads:
+                    payloads[cid] = c
+            rankings.append(ranking_ids)
+
+        fused = rrf(rankings, k=rrf_k)
+        return [
+            ChunkResult(
+                text=payloads[cid].text,
+                source_id=payloads[cid].source_id,
+                chunk_index=payloads[cid].chunk_index,
+                score=score,
+                score_source=ScoreSource.RRF,
+            )
+            for cid, score in fused
+            if cid in payloads
         ]

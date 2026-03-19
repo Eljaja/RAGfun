@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import httpx
 
-from models import ChunkResult
+from models import ChunkResult, ScoreSource
 
 
 class Reranker:
@@ -29,7 +29,20 @@ class Reranker:
             key=lambda x: x["relevance_score"],
             reverse=True,
         )
-        return [chunks[r["index"]] for r in ranked[:top_n]]
+        reranked: list[ChunkResult] = []
+        for r in ranked[:top_n]:
+            i = int(r["index"])
+            c = chunks[i]
+            reranked.append(
+                ChunkResult(
+                    text=c.text,
+                    source_id=c.source_id,
+                    chunk_index=c.chunk_index,
+                    score=float(r["relevance_score"]),
+                    score_source=ScoreSource.RERANK,
+                )
+            )
+        return reranked
 
     async def close(self):
         await self.client.aclose()

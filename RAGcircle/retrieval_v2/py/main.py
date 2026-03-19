@@ -11,7 +11,7 @@ from store import QdrantStore, BM25Store
 from embedder import Embedder
 from reranker import Reranker
 from retriever import HybridRetriever
-from models import RetrieveRequest, RetrieveResponse
+from models import ExecuteRequest, ExecuteResponse, ExecutionPlan, RetrieveRequest, RetrieveResponse
 
 logger = logging.getLogger(__name__)
 
@@ -56,19 +56,42 @@ async def retrieve(body: RetrieveRequest):
     retriever: HybridRetriever = app.state.retriever
 
     try:
-        chunks = await retriever.search(
-            query=body.query,
-            collection=body.project_id,
-            top_k=body.top_k,
+        plan = ExecutionPlan.from_legacy(
             strategy=body.strategy,
+            top_k=body.top_k,
             rerank=body.rerank,
             rerank_top_n=body.rerank_top_n,
+        )
+        chunks = await retriever.execute_plan(
+            query=body.query,
+            collection=body.project_id,
+            plan=plan,
         )
     except Exception:
         logger.exception("Retrieval failed for project %s", body.project_id)
         raise HTTPException(status_code=502, detail="Retrieval backend error")
 
-    return RetrieveResponse(chunks=chunks, strategy=body.strategy, query=body.query)
+    return RetrieveResponse(chunks=chunks, strategy=body.strategy, query=body.query, plan_used=plan)
+
+
+@app.post("/plan/retrieve", response_model=ExecuteResponse)
+async def plan_retrieve(body: ExecuteRequest):
+    retriever: HybridRetriever = app.state.retriever
+    try:
+        chunks = await retriever.execute_plan(
+            query=body.query,
+            collection=body.project_id,
+            plan=body.plan,
+        )
+    except Exception:
+        logger.exception("Plan retrieval failed for project %s", body.project_id)
+        raise HTTPException(status_code=502, detail="Retrieval backend error")
+
+    return ExecuteResponse(
+        chunks=chunks,
+        query=body.query,
+        plan=body.plan,
+    )
 
 
 if __name__ == "__main__":
