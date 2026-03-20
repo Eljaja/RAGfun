@@ -9,10 +9,15 @@ from models.chunks import ChunkResult
 from models.retrieval import ExecutionPlan
 from models.steps import (
     BrainRetrieveStep,
+    ConfigStep,
     EvalStep,
     ExpandStep,
     GenerateStep,
+    InitialExpandStep,
+    LoopExpandStep,
     PostRetrieveStep,
+    QualityCheckStep,
+    StitchStep,
 )
 
 
@@ -47,6 +52,52 @@ class BrainRound(BaseModel):
 
 
 BrainPlan = BrainRound
+
+
+# ── Spec-aligned types (used by new retrieval pipeline) ──
+
+
+class RetrievalPlan(BaseModel):
+    """Full retrieval pipeline configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    default_config: BrainRetrieveStep = Field(default_factory=BrainRetrieveStep)
+    initial_expand: list[InitialExpandStep] = Field(default_factory=list)
+    loop_check: list[QualityCheckStep] = Field(default_factory=list)
+    loop_expand: list[LoopExpandStep] = Field(default_factory=list)
+    finalize: list[StitchStep] = Field(default_factory=list)
+    max_rounds: int = Field(default=2, ge=1, le=10)
+
+
+@dataclass
+class ConfigMeta:
+    """Output of the configure phase."""
+
+    lang: str = "English"
+    is_factoid: bool = False
+    retrieval_plan: ExecutionPlan | None = None
+    retrieval_mode: str = "hybrid"
+    traces: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class RetrievalRequest:
+    """A single retrieval request — query plus optional config override."""
+
+    query: str
+    plan_override: ExecutionPlan | None = None
+
+
+@dataclass
+class RetrievalResult:
+    """Output of the retrieval pipeline."""
+
+    chunks: list[ChunkResult]
+    traces: list[dict[str, Any]] = field(default_factory=list)
+
+
+# ── Legacy types (used by current pipeline, removed in Session 2) ──
 
 
 @dataclass

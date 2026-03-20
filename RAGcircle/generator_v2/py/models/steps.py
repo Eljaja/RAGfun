@@ -108,6 +108,7 @@ class GroundingCheckStep(BaseModel):
 
 # ── Discriminated unions ─────────────────────────────────
 
+# Old unions (used by current pipeline, removed in Session 2)
 ExpandStep = Annotated[
     PlanLLMStep | DetectLangStep | HyDEStep | FactQueryStep | KeywordStep | QueryVariantsStep,
     Field(discriminator="kind"),
@@ -120,5 +121,21 @@ PostRetrieveStep = Annotated[
 
 EvalStep = Annotated[
     ReflectStep | AssessStep | GroundingCheckStep,
+    Field(discriminator="kind"),
+]
+
+# New unions (spec-aligned, used by retrieval pipeline)
+ConfigStep = Annotated[
+    PlanLLMStep | DetectLangStep,
+    Field(discriminator="kind"),
+]
+
+InitialExpandStep = Annotated[
+    HyDEStep | FactQueryStep | KeywordStep | QueryVariantsStep | BM25AnchorStep,
+    Field(discriminator="kind"),
+]
+
+LoopExpandStep = Annotated[
+    TwoPassStep | FactoidExpandStep,
     Field(discriminator="kind"),
 ]

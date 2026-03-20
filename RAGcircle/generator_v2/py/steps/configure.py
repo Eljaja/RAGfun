@@ -1,0 +1,150 @@
+"""Configure phase: detect language, plan retrieval strategy.
+
+Pure functions: (query, history, budget, deps) -> ConfigMeta.
+Runs before retrieval — no chunks yet, no generation.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+from typing import Any
+
+from config import Settings
+from engine.budget import BudgetCounter
+from llm import LLMClient
+from models.plan import ConfigMeta
+from models.retrieval import ExecutionPlan
+from models.steps import ConfigStep, DetectLangStep, PlanLLMStep
+from plan_builder import from_llm_plan, from_preset
+from prompts import DETECT_LANG_SYSTEM, DETECT_LANG_USER, PLAN_SYSTEM, PLAN_USER
+from query_variants import is_factoid_question
+from shared import strip_thinking
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_PLAN_DICT = {
+    "retrieval_mode": "hybrid",
+    "top_k": 10,
+    "rerank": True,
+    "use_hyde": False,
+    "reason": "fallback",
+}
+
+
+async def configure(
+    steps: list[ConfigStep],
+    *,
+    query: str,
+    history_text: str,
+    budget: BudgetCounter,
+    llm: LLMClient,
+    model: str,
+    settings: Settings,
+) -> ConfigMeta:
+    """Run all configure steps, return metadata for downstream phases."""
+    lang = "English"
+    is_factoid = False
+    retrieval_plan: ExecutionPlan | None = None
+    retrieval_mode = "hybrid"
+    traces: list[dict[str, Any]] = []
+
+    for step in steps:
+        match step:
+            case PlanLLMStep():
+                rp, rm, t = await _plan_retrieval(
+                    query=query, history_text=history_text, budget=budget,
+                    llm=llm, model=model, settings=settings,
+                )
+                retrieval_plan = rp
+                retrieval_mode = rm
+                traces.extend(t)
+
+            case DetectLangStep():
+                lang, is_factoid, t = await _detect_lang(
+                    query=query, budget=budget, llm=llm, model=model,
+                )
+                traces.extend(t)
+
+    return ConfigMeta(
+        lang=lang,
+        is_factoid=is_factoid,
+        retrieval_plan=retrieval_plan,
+        retrieval_mode=retrieval_mode,
+        traces=traces,
+    )
+
+
+# ── Individual step implementations ──────────────────────
+
+
+async def _plan_retrieval(
+    *, query: str, history_text: str, budget: BudgetCounter,
+    llm: LLMClient, model: str, settings: Settings,
+) -> tuple[ExecutionPlan, str, list[dict[str, Any]]]:
+    traces: list[dict[str, Any]] = [{"kind": "tool", "name": "llm.plan", "payload": {"query": query}}]
+
+    if not budget.try_consume():
+        return from_preset("hybrid", top_k=10, rerank=True), "hybrid", traces
+
+    try:
+        raw = await asyncio.wait_for(
+            _plan_retrieval_llm(llm, model, query, history_text=history_text),
+            timeout=settings.agent_llm_timeout + 10,
+        )
+    except Exception as e:
+        logger.warning("Plan LLM failed: %s", e)
+        return from_preset("hybrid", top_k=10, rerank=True), "hybrid", traces
+
+    retrieval_mode = str(raw.get("retrieval_mode") or "hybrid")
+    reason = str(raw.get("reason") or "")
+    plan = from_llm_plan(
+        raw,
+        top_k_min=settings.agent_top_k_min,
+        top_k_max=settings.agent_top_k_max,
+    )
+    traces.append({
+        "kind": "thought", "label": "Plan",
+        "content": f"mode={retrieval_mode}. Reason: {reason}",
+    })
+    return plan, retrieval_mode, traces
+
+
+async def _plan_retrieval_llm(
+    llm: LLMClient, model: str, query: str, *, history_text: str = "",
+) -> dict:
+    raw = await llm.complete(
+        model,
+        [
+            {"role": "system", "content": PLAN_SYSTEM},
+            {"role": "user", "content": PLAN_USER.format(history=history_text, query=query)},
+        ],
+        temperature=0.0,
+    )
+    cleaned = strip_thinking(raw or "")
+    cleaned = re.sub(r"```.*?```", "", cleaned, flags=re.DOTALL | re.IGNORECASE).strip()
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        logger.warning("Failed to parse LLM plan output, using fallback")
+        return dict(_DEFAULT_PLAN_DICT)
+
+
+async def _detect_lang(
+    *, query: str, budget: BudgetCounter, llm: LLMClient, model: str,
+) -> tuple[str, bool, list[dict[str, Any]]]:
+    lang = "English"
+    if budget.try_consume():
+        raw = await llm.complete(
+            model,
+            [
+                {"role": "system", "content": DETECT_LANG_SYSTEM},
+                {"role": "user", "content": DETECT_LANG_USER.format(text=query)},
+            ],
+            temperature=0.0,
+        )
+        lang = (raw or "").strip() or "English"
+    is_factoid = is_factoid_question(query)
+    return lang, is_factoid, []
