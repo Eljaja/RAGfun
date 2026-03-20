@@ -6,22 +6,24 @@ The caller (endpoints.py) owns retry and presentation.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
 import httpx
 
 from config import Settings
-from context import extract_source_details, history_summary
+from context import extract_source_details, history_summary, merge_chunks
 from engine.budget import BudgetCounter
 from llm import LLMClient
 from models.chunks import ChunkResult
 from models.plan import BrainRound, PipelineResult
+from plan_builder import from_preset
 from steps.enrich import enrich
 from steps.evaluate import evaluate
 from steps.expand import expand
 from steps.generate import generate
-from steps.retrieve import retrieve_all
+from steps.retrieve import _safe_retrieve, retrieve_all
 
 logger = logging.getLogger(__name__)
 
@@ -71,14 +73,27 @@ async def run_pipeline(
             is_factoid=exp.is_factoid, traces=traces,
         )
 
-    # 3. Enrich
-    chunks, enrich_traces = await enrich(
+    # 3. Enrich (emit retrieval requests, don't fetch yet)
+    chunks, enrich_requests, enrich_traces = await enrich(
         plan.post_retrieve,
-        chunks=chunks, query=query, project_id=project_id,
+        chunks=chunks, query=query,
         is_factoid=exp.is_factoid, retrieval_plan=exp.retrieval_plan,
-        http_client=http_client, settings=settings,
     )
     traces.extend(enrich_traces)
+
+    # 3b. Fetch any enrich retrieval requests
+    if enrich_requests:
+        default_plan = from_preset(
+            plan.retrieve.preset, top_k=plan.retrieve.top_k, rerank=plan.retrieve.rerank,
+        )
+        fetch_results = await asyncio.gather(*(
+            _safe_retrieve(
+                req.query, req.plan or default_plan,
+                project_id=project_id, http_client=http_client, settings=settings,
+            )
+            for req in enrich_requests
+        ))
+        chunks = merge_chunks([chunks, *fetch_results])
 
     # 4. Generate
     answer = await generate(

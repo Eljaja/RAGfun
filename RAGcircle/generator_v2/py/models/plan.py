@@ -6,6 +6,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from models.chunks import ChunkResult
+from models.retrieval import ExecutionPlan
 from models.steps import (
     BrainRetrieveStep,
     EvalStep,
@@ -46,6 +47,14 @@ class BrainRound(BaseModel):
 
 
 BrainPlan = BrainRound
+
+
+@dataclass
+class EnrichRetrievalRequest:
+    """A deferred retrieval request emitted by an enrich step."""
+
+    query: str
+    plan: ExecutionPlan | None = None
 
 
 @dataclass
