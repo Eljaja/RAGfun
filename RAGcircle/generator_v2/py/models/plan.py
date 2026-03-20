@@ -57,7 +57,6 @@ class ExpandResult:
     is_factoid: bool = False
     retrieval_plan: Any = None
     retrieval_mode: str = "hybrid"
-    extra_chunks: list[ChunkResult] = field(default_factory=list)
     traces: list[dict[str, Any]] = field(default_factory=list)
 
 

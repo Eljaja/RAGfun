@@ -13,10 +13,8 @@ import re
 from typing import Any
 
 from config import Settings
-from context import merge_chunks
 from engine.budget import BudgetCounter
 from llm import LLMClient
-from models.chunks import ChunkResult
 from models.plan import ExpandResult
 from models.retrieval import ExecutionPlan
 from models.steps import (
@@ -42,10 +40,7 @@ from prompts import (
     PLAN_USER,
 )
 from query_variants import is_factoid_question, query_variants as heuristic_variants
-from retrieval_client import retrieve as retrieval_call
 from shared import strip_thinking
-
-import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -62,13 +57,11 @@ async def expand(
     steps: list[ExpandStep],
     *,
     query: str,
-    project_id: str,
     lang: str,
     history_text: str,
     budget: BudgetCounter,
     llm: LLMClient,
     model: str,
-    http_client: httpx.AsyncClient,
     settings: Settings,
 ) -> ExpandResult:
     """Run all expand steps, return the accumulated result."""
@@ -76,7 +69,6 @@ async def expand(
     is_factoid = False
     retrieval_plan: ExecutionPlan | None = None
     retrieval_mode = "hybrid"
-    extra_chunks: list[ChunkResult] = []
     traces: list[dict[str, Any]] = []
 
     for step in steps:
@@ -106,28 +98,22 @@ async def expand(
                 traces.extend(t)
 
             case FactQueryStep(max_queries=max_q):
-                chunks, t = await _fact_queries(
-                    query=query, project_id=project_id,
-                    history_text=history_text,
+                sub_queries, t = await _fact_queries(
+                    query=query, history_text=history_text,
                     max_queries=max_q, budget=budget,
                     retrieval_plan=retrieval_plan,
-                    existing_chunks=extra_chunks,
                     llm=llm, model=model,
-                    http_client=http_client, settings=settings,
                 )
-                extra_chunks = chunks
+                queries.extend(sub_queries)
                 traces.extend(t)
 
             case KeywordStep():
-                chunks, t = await _keywords(
-                    query=query, project_id=project_id,
-                    history_text=history_text,
+                sub_queries, t = await _keywords(
+                    query=query, history_text=history_text,
                     budget=budget, retrieval_plan=retrieval_plan,
-                    existing_chunks=extra_chunks,
                     llm=llm, model=model,
-                    http_client=http_client, settings=settings,
                 )
-                extra_chunks = chunks
+                queries.extend(sub_queries)
                 traces.extend(t)
 
             case QueryVariantsStep():
@@ -145,7 +131,6 @@ async def expand(
         is_factoid=is_factoid,
         retrieval_plan=retrieval_plan,
         retrieval_mode=retrieval_mode,
-        extra_chunks=extra_chunks,
         traces=traces,
     )
 
@@ -277,31 +262,23 @@ async def _hyde(
     return passages, traces
 
 
-async def _safe_retrieve(
-    query: str, plan: ExecutionPlan, *,
-    project_id: str, http_client: httpx.AsyncClient, settings: Settings,
-) -> list[ChunkResult]:
-    try:
-        return await retrieval_call(
-            http_client, settings.retrieval_url,
-            project_id=project_id, query=query, plan=plan,
-        )
-    except Exception as e:
-        logger.error("Retrieval failed: %s", e)
-        return []
-
 
 async def _fact_queries(
-    *, query: str, project_id: str, history_text: str, max_queries: int,
-    budget: BudgetCounter, retrieval_plan: ExecutionPlan | None,
-    existing_chunks: list[ChunkResult],
+    *,
+    query: str,
+    history_text: str,
+    max_queries: int,
+    budget: BudgetCounter,
+    retrieval_plan: ExecutionPlan | None,
     llm: LLMClient, model: str,
-    http_client: httpx.AsyncClient, settings: Settings,
-) -> tuple[list[ChunkResult], list[dict[str, Any]]]:
-    if not budget.try_consume():
-        return existing_chunks, []
+) -> tuple[list[str], list[dict[str, Any]]]:
+    if retrieval_plan is None or not budget.try_consume():
+        return [], []
 
-    traces: list[dict[str, Any]] = [{"kind": "tool", "name": "llm.fact_split", "payload": {"query": query}}]
+    traces: list[dict[str, Any]] = [
+        {"kind": "tool", "name": "llm.fact_split", "payload": {"query": query}},
+    ]
+
     try:
         raw = await llm.complete(
             model,
@@ -317,31 +294,26 @@ async def _fact_queries(
         sub_queries = [str(q).strip() for q in (data.get("fact_queries") or []) if str(q).strip()]
         sub_queries = sub_queries[:max_queries]
     except Exception:
-        return existing_chunks, traces
+        return [], traces
 
-    if not sub_queries or retrieval_plan is None:
-        return existing_chunks, traces
-
-    fact_results = await asyncio.gather(*(
-        _safe_retrieve(fq, retrieval_plan,
-                       project_id=project_id, http_client=http_client, settings=settings)
-        for fq in sub_queries
-    ))
-    chunks = merge_chunks([existing_chunks, *fact_results])
-    return chunks, traces
+    return sub_queries, traces
 
 
 async def _keywords(
-    *, query: str, project_id: str, history_text: str,
-    budget: BudgetCounter, retrieval_plan: ExecutionPlan | None,
-    existing_chunks: list[ChunkResult],
+    *,
+    query: str,
+    history_text: str,
+    budget: BudgetCounter,
+    retrieval_plan: ExecutionPlan | None,
     llm: LLMClient, model: str,
-    http_client: httpx.AsyncClient, settings: Settings,
-) -> tuple[list[ChunkResult], list[dict[str, Any]]]:
-    if not budget.try_consume():
-        return existing_chunks, []
+) -> tuple[list[str], list[dict[str, Any]]]:
+    if retrieval_plan is None or not budget.try_consume():
+        return [], []
 
-    traces: list[dict[str, Any]] = [{"kind": "tool", "name": "llm.keywords", "payload": {"query": query}}]
+    traces: list[dict[str, Any]] = [
+        {"kind": "tool", "name": "llm.keywords", "payload": {"query": query}},
+    ]
+
     try:
         raw = await llm.complete(
             model,
@@ -356,15 +328,6 @@ async def _keywords(
         data = json.loads(strip_thinking(raw))
         kw = [str(q).strip() for q in (data.get("keywords") or []) if str(q).strip()]
     except Exception:
-        return existing_chunks, traces
+        return [], traces
 
-    if not kw or retrieval_plan is None:
-        return existing_chunks, traces
-
-    kw_results = await asyncio.gather(*(
-        _safe_retrieve(k, retrieval_plan,
-                       project_id=project_id, http_client=http_client, settings=settings)
-        for k in kw[:4]
-    ))
-    chunks = merge_chunks([existing_chunks, *kw_results])
-    return chunks, traces
+    return kw[:4], traces

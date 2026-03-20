@@ -12,7 +12,7 @@ from typing import Any
 import httpx
 
 from config import Settings
-from context import extract_source_details, history_summary, merge_chunks
+from context import extract_source_details, history_summary
 from engine.budget import BudgetCounter
 from llm import LLMClient
 from models.chunks import ChunkResult
@@ -47,9 +47,9 @@ async def run_pipeline(
     # 1. Expand
     exp = await expand(
         plan.expand,
-        query=query, project_id=project_id, lang="English",
+        query=query, lang="English",
         history_text=history_text, budget=budget,
-        llm=llm, model=model, http_client=http_client, settings=settings,
+        llm=llm, model=model, settings=settings,
     )
     traces.extend(exp.traces)
 
@@ -63,9 +63,6 @@ async def run_pipeline(
         project_id=project_id,
         http_client=http_client, settings=settings,
     )
-
-    if exp.extra_chunks:
-        chunks = merge_chunks([chunks, exp.extra_chunks])
 
     if not chunks:
         return PipelineResult(
