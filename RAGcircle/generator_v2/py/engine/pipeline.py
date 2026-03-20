@@ -94,11 +94,10 @@ async def run_pipeline(
     verdict = await evaluate(
         plan.evaluate,
         answer=answer, chunks=chunks, query=query,
-        project_id=project_id, history=raw_history,
-        history_text=history_text, lang=exp.lang,
+        history_text=history_text,
         is_factoid=exp.is_factoid, source_meta={},
         budget=budget, llm=llm, model=model,
-        http_client=http_client, settings=settings,
+        settings=settings,
     )
     traces.extend(verdict.traces)
 

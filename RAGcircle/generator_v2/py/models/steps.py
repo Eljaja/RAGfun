@@ -100,17 +100,10 @@ class AssessStep(BaseModel):
     kind: Literal["assess"] = "assess"
 
 
-class SupplementalRetrieveStep(BaseModel):
-    """Re-retrieve using missing_terms from a prior AssessStep."""
+class GroundingCheckStep(BaseModel):
+    """Heuristic grounding check — is the answer grounded in chunks?"""
     model_config = ConfigDict(extra="forbid")
-    kind: Literal["supplemental_retrieve"] = "supplemental_retrieve"
-    max_queries: int = Field(default=4, ge=1, le=10)
-
-
-class FactoidRetryStep(BaseModel):
-    """Post-generation grounding check — does NOT re-generate inline."""
-    model_config = ConfigDict(extra="forbid")
-    kind: Literal["factoid_retry"] = "factoid_retry"
+    kind: Literal["grounding_check"] = "grounding_check"
 
 
 # ── Discriminated unions ─────────────────────────────────
@@ -126,6 +119,6 @@ PostRetrieveStep = Annotated[
 ]
 
 EvalStep = Annotated[
-    ReflectStep | AssessStep | FactoidRetryStep | SupplementalRetrieveStep,
+    ReflectStep | AssessStep | GroundingCheckStep,
     Field(discriminator="kind"),
 ]

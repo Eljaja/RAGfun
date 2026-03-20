@@ -9,9 +9,9 @@ from models import (
     BrainRound,
     DetectLangStep,
     FactoidExpandStep,
-    FactoidRetryStep,
     FactQueryStep,
     GenerateStep,
+    GroundingCheckStep,
     HyDEStep,
     KeywordStep,
     PlanLLMStep,
@@ -19,7 +19,6 @@ from models import (
     QueryVariantsStep,
     ReflectStep,
     StitchStep,
-    SupplementalRetrieveStep,
     TwoPassStep,
 )
 
@@ -83,9 +82,8 @@ def agent(
     evaluate: list = []
     if use_retry:
         evaluate.append(AssessStep())
-        evaluate.append(SupplementalRetrieveStep())
     if use_factoid_retry:
-        evaluate.append(FactoidRetryStep())
+        evaluate.append(GroundingCheckStep())
 
     return BrainRound(
         expand=expand,
@@ -202,7 +200,7 @@ def gate(
         retrieve=BrainRetrieveStep(preset=preset, top_k=top_k, rerank=rerank),
         post_retrieve=post_retrieve,
         generate=GenerateStep(stream=False, use_tools=False),
-        evaluate=[FactoidRetryStep()],
+        evaluate=[GroundingCheckStep()],
         max_llm_calls=3,
     )
 
