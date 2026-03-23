@@ -1,7 +1,8 @@
-"""Expand phase: query preparation before retrieval.
+"""Expand step implementations: LLM-based query expansion.
 
-Pure functions: (query, lang, history, budget, deps) -> ExpandResult.
-No mutable context, no env god object.
+These are the leaf functions called by engine/retrieval._initial_expand().
+Each takes (query, budget, llm, ...) and returns (list[str], traces).
+No I/O, no retrieval — pure LLM query generators.
 """
 
 from __future__ import annotations
@@ -9,203 +10,22 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 from typing import Any
 
-from config import Settings
 from engine.budget import BudgetCounter
 from llm import LLMClient
-from models.plan import ExpandResult
 from models.retrieval import ExecutionPlan
-from models.steps import (
-    DetectLangStep,
-    ExpandStep,
-    FactQueryStep,
-    HyDEStep,
-    KeywordStep,
-    PlanLLMStep,
-    QueryVariantsStep,
-)
-from plan_builder import from_llm_plan, from_preset
 from prompts import (
-    DETECT_LANG_SYSTEM,
-    DETECT_LANG_USER,
     FACT_QUERIES_SYSTEM,
     FACT_QUERIES_USER,
     HYDE_SYSTEM,
     HYDE_USER,
     KEYWORD_QUERIES_SYSTEM,
     KEYWORD_QUERIES_USER,
-    PLAN_SYSTEM,
-    PLAN_USER,
 )
-from query_variants import is_factoid_question, query_variants as heuristic_variants
 from shared import strip_thinking
 
 logger = logging.getLogger(__name__)
-
-_DEFAULT_PLAN_DICT = {
-    "retrieval_mode": "hybrid",
-    "top_k": 10,
-    "rerank": True,
-    "use_hyde": False,
-    "reason": "fallback",
-}
-
-
-async def expand(
-    steps: list[ExpandStep],
-    *,
-    query: str,
-    lang: str,
-    history_text: str,
-    budget: BudgetCounter,
-    llm: LLMClient,
-    model: str,
-    settings: Settings,
-) -> ExpandResult:
-    """Run all expand steps, return the accumulated result."""
-    queries = [query]
-    is_factoid = False
-    retrieval_plan: ExecutionPlan | None = None
-    retrieval_mode = "hybrid"
-    traces: list[dict[str, Any]] = []
-
-    for step in steps:
-        match step:
-            case PlanLLMStep():
-                rp, rm, t = await _plan_retrieval(
-                    query=query, history_text=history_text, budget=budget,
-                    llm=llm, model=model, settings=settings,
-                )
-                retrieval_plan = rp
-                retrieval_mode = rm
-                traces.extend(t)
-
-            case DetectLangStep():
-                lang, is_factoid, t = await _detect_lang(
-                    query=query, budget=budget, llm=llm, model=model,
-                )
-                traces.extend(t)
-
-            case HyDEStep(num_passages=num_passages):
-                hyde_queries, t = await _hyde(
-                    query=query, lang=lang, budget=budget,
-                    llm=llm, model=model, num_passages=num_passages,
-                )
-                if hyde_queries:
-                    queries = hyde_queries + queries[1:]
-                traces.extend(t)
-
-            case FactQueryStep(max_queries=max_q):
-                sub_queries, t = await _fact_queries(
-                    query=query, history_text=history_text,
-                    max_queries=max_q, budget=budget,
-                    retrieval_plan=retrieval_plan,
-                    llm=llm, model=model,
-                )
-                queries.extend(sub_queries)
-                traces.extend(t)
-
-            case KeywordStep():
-                sub_queries, t = await _keywords(
-                    query=query, history_text=history_text,
-                    budget=budget, retrieval_plan=retrieval_plan,
-                    llm=llm, model=model,
-                )
-                queries.extend(sub_queries)
-                traces.extend(t)
-
-            case QueryVariantsStep():
-                variants = heuristic_variants(query)
-                if len(variants) > 1:
-                    queries = variants
-                    traces.append({
-                        "kind": "action", "label": "QueryVariants",
-                        "content": f"Generated {len(variants)} variants",
-                    })
-
-    return ExpandResult(
-        queries=queries,
-        lang=lang,
-        is_factoid=is_factoid,
-        retrieval_plan=retrieval_plan,
-        retrieval_mode=retrieval_mode,
-        traces=traces,
-    )
-
-
-# ── Individual step implementations ──────────────────────
-
-
-async def _plan_retrieval(
-    *, query: str, history_text: str, budget: BudgetCounter,
-    llm: LLMClient, model: str, settings: Settings,
-) -> tuple[ExecutionPlan, str, list[dict[str, Any]]]:
-    traces: list[dict[str, Any]] = [{"kind": "tool", "name": "llm.plan", "payload": {"query": query}}]
-
-    if not budget.try_consume():
-        return from_preset("hybrid", top_k=10, rerank=True), "hybrid", traces
-
-    try:
-        raw = await asyncio.wait_for(
-            _plan_retrieval_llm(llm, model, query, history_text=history_text),
-            timeout=settings.agent_llm_timeout + 10,
-        )
-    except Exception as e:
-        logger.warning("Plan LLM failed: %s", e)
-        return from_preset("hybrid", top_k=10, rerank=True), "hybrid", traces
-
-    retrieval_mode = str(raw.get("retrieval_mode") or "hybrid")
-    reason = str(raw.get("reason") or "")
-    plan = from_llm_plan(
-        raw,
-        top_k_min=settings.agent_top_k_min,
-        top_k_max=settings.agent_top_k_max,
-    )
-    traces.append({
-        "kind": "thought", "label": "Plan",
-        "content": f"mode={retrieval_mode}. Reason: {reason}",
-    })
-    return plan, retrieval_mode, traces
-
-
-async def _plan_retrieval_llm(
-    llm: LLMClient, model: str, query: str, *, history_text: str = "",
-) -> dict:
-    raw = await llm.complete(
-        model,
-        [
-            {"role": "system", "content": PLAN_SYSTEM},
-            {"role": "user", "content": PLAN_USER.format(history=history_text, query=query)},
-        ],
-        temperature=0.0,
-    )
-    cleaned = strip_thinking(raw or "")
-    cleaned = re.sub(r"```.*?```", "", cleaned, flags=re.DOTALL | re.IGNORECASE).strip()
-    try:
-        return json.loads(cleaned)
-    except Exception:
-        logger.warning("Failed to parse LLM plan output, using fallback")
-        return dict(_DEFAULT_PLAN_DICT)
-
-
-async def _detect_lang(
-    *, query: str, budget: BudgetCounter, llm: LLMClient, model: str,
-) -> tuple[str, bool, list[dict[str, Any]]]:
-    lang = "English"
-    if budget.try_consume():
-        raw = await llm.complete(
-            model,
-            [
-                {"role": "system", "content": DETECT_LANG_SYSTEM},
-                {"role": "user", "content": DETECT_LANG_USER.format(text=query)},
-            ],
-            temperature=0.0,
-        )
-        lang = (raw or "").strip() or "English"
-    is_factoid = is_factoid_question(query)
-    return lang, is_factoid, []
 
 
 async def _hyde(
@@ -260,7 +80,6 @@ async def _hyde(
         "content": f"Generated {len(passages)}/{actual_n} hypothetical passages",
     })
     return passages, traces
-
 
 
 async def _fact_queries(

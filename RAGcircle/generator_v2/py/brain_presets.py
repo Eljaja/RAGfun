@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from itertools import chain
+
 from models import (
     AssessStep,
     BM25AnchorStep,
@@ -18,9 +20,21 @@ from models import (
     QualityCheckStep,
     QueryVariantsStep,
     ReflectStep,
+    RetrievalPlan,
     StitchStep,
     TwoPassStep,
 )
+
+
+def when(cond: bool, *items):
+    """Return items if cond else (). Use with chain() for declarative list building.
+
+    Items may be values or callables (e.g. lambda: Step()) for lazy evaluation
+    when the step constructor has side effects or validation.
+    """
+    if not cond:
+        return ()
+    return tuple(x() if callable(x) else x for x in items)
 
 
 def simple(
@@ -33,9 +47,11 @@ def simple(
 ) -> BrainRound:
     """Simple /chat pipeline: retrieve -> generate, with optional reflect."""
     return BrainRound(
-        expand=[QueryVariantsStep()],
-        retrieve=BrainRetrieveStep(preset=preset, top_k=top_k, rerank=rerank),
-        post_retrieve=[StitchStep()],
+        retrieval=RetrievalPlan(
+            default_config=BrainRetrieveStep(preset=preset, top_k=top_k, rerank=rerank),
+            initial_expand=[QueryVariantsStep()],
+            finalize=[StitchStep()],
+        ),
         generate=GenerateStep(stream=False),
         evaluate=[ReflectStep()] if reflection_enabled else [],
         max_llm_calls=max_llm_calls,
@@ -59,36 +75,35 @@ def agent(
     top_k: int = 10,
     rerank: bool = True,
 ) -> BrainRound:
-    """Full agent pipeline: plan -> expand -> retrieve -> generate -> evaluate."""
-    expand: list = [PlanLLMStep(), DetectLangStep()]
-    if use_hyde:
-        expand.append(HyDEStep())
-    if use_query_variants:
-        expand.append(QueryVariantsStep())
+    """Full agent pipeline: configure -> retrieve -> generate -> evaluate."""
+    configure = [PlanLLMStep(), DetectLangStep()]
 
-    post_retrieve: list = []
-    if use_fact_queries:
-        expand.append(FactQueryStep(max_queries=max_fact_queries))
-        post_retrieve.append(QualityCheckStep())
-    if use_two_pass:
-        post_retrieve.append(TwoPassStep())
-    if use_bm25_anchor:
-        post_retrieve.append(BM25AnchorStep())
-    if use_factoid_expand:
-        post_retrieve.append(FactoidExpandStep())
-    if use_stitch:
-        post_retrieve.append(StitchStep())
-
-    evaluate: list = []
-    if use_retry:
-        evaluate.append(AssessStep())
-    if use_factoid_retry:
-        evaluate.append(GroundingCheckStep())
+    initial_expand = list(chain(
+        when(use_hyde, HyDEStep()),
+        when(use_query_variants, QueryVariantsStep()),
+        when(use_fact_queries, lambda: FactQueryStep(max_queries=max_fact_queries)),
+        when(use_bm25_anchor, BM25AnchorStep()),
+    ))
+    loop_check = list(chain(when(use_fact_queries, QualityCheckStep())))
+    loop_expand = list(chain(
+        when(use_two_pass, TwoPassStep()),
+        when(use_factoid_expand, FactoidExpandStep()),
+    ))
+    finalize = list(chain(when(use_stitch, StitchStep())))
+    evaluate = list(chain(
+        when(use_retry, AssessStep()),
+        when(use_factoid_retry, GroundingCheckStep()),
+    ))
 
     return BrainRound(
-        expand=expand,
-        retrieve=BrainRetrieveStep(preset="hybrid", top_k=top_k, rerank=rerank),
-        post_retrieve=post_retrieve,
+        configure=configure,
+        retrieval=RetrievalPlan(
+            default_config=BrainRetrieveStep(preset="hybrid", top_k=top_k, rerank=rerank),
+            initial_expand=initial_expand,
+            loop_check=loop_check,
+            loop_expand=loop_expand,
+            finalize=finalize,
+        ),
         generate=GenerateStep(use_tools=use_tools, stream=True),
         evaluate=evaluate,
         max_llm_calls=max_llm_calls,
@@ -108,17 +123,20 @@ def retry_round(
     Mirrors the old agent-search retry which used HyDE, missing-term queries,
     and keyword expansion before re-retrieving at 2x top_k.
     """
-    expand: list = []
-    if use_hyde:
-        expand.append(HyDEStep())
-    expand.append(KeywordStep())
-    if use_fact_queries:
-        expand.append(FactQueryStep(max_queries=max_fact_queries))
+    initial_expand = list(chain(
+        when(use_hyde, HyDEStep()),
+        (KeywordStep(),),
+        when(use_fact_queries, lambda: FactQueryStep(max_queries=max_fact_queries)),
+    ))
 
     return BrainRound(
-        expand=expand,
-        retrieve=BrainRetrieveStep(preset="thorough", top_k=max(12, top_k * 2), rerank=True),
-        post_retrieve=[StitchStep()] if use_stitch else [],
+        retrieval=RetrievalPlan(
+            default_config=BrainRetrieveStep(
+                preset="thorough", top_k=max(12, top_k * 2), rerank=True,
+            ),
+            initial_expand=initial_expand,
+            finalize=[StitchStep()] if use_stitch else [],
+        ),
         generate=GenerateStep(stream=True),
         max_llm_calls=6,
     )
@@ -186,19 +204,25 @@ def gate(
     Single-round, zero LLM expansion calls. All retrieval improvements
     are heuristic.
     """
-    post_retrieve: list = [QualityCheckStep()]
-    if use_bm25_anchor:
-        post_retrieve.append(BM25AnchorStep(top_k=min(top_k, 30)))
-    if use_two_pass:
-        post_retrieve.append(TwoPassStep(min_unique_sources=3))
-    post_retrieve.append(FactoidExpandStep())
-    if use_stitch:
-        post_retrieve.append(StitchStep(max_per_segment=4))
+    initial_expand = list(chain(
+        (QueryVariantsStep(),),
+        when(use_bm25_anchor, BM25AnchorStep(top_k=min(top_k, 30))),
+    ))
+    loop_check = [QualityCheckStep()]
+    loop_expand = list(chain(
+        when(use_two_pass, TwoPassStep(min_unique_sources=3)),
+        (FactoidExpandStep(),),
+    ))
+    finalize = list(chain(when(use_stitch, StitchStep(max_per_segment=4))))
 
     return BrainRound(
-        expand=[QueryVariantsStep()],
-        retrieve=BrainRetrieveStep(preset=preset, top_k=top_k, rerank=rerank),
-        post_retrieve=post_retrieve,
+        retrieval=RetrievalPlan(
+            default_config=BrainRetrieveStep(preset=preset, top_k=top_k, rerank=rerank),
+            initial_expand=initial_expand,
+            loop_check=loop_check,
+            loop_expand=loop_expand,
+            finalize=finalize,
+        ),
         generate=GenerateStep(stream=False, use_tools=False),
         evaluate=[GroundingCheckStep()],
         max_llm_calls=3,

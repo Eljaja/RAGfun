@@ -4,6 +4,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from models.plan import BrainRound
+
 
 class SearchFilters(BaseModel):
     """Optional filters narrowing the retrieval scope."""
@@ -111,3 +113,40 @@ class ExecuteRequest(BaseModel):
     history: list[dict[str, str]] = Field(default_factory=list)
     brain_plan: Any = Field(description="Full BrainPlan JSON")
     include_sources: bool = True
+
+
+# ── Dynamic plan endpoint models ─────────────────────────
+
+
+class PlanRunRequest(BaseModel):
+    """Run an explicit BrainPlan for testing / experimentation.
+
+    Unlike ExecuteRequest, the brain_plan field is strongly typed:
+    Pydantic validates the full plan tree at parse time, giving clear
+    errors for invalid step combinations.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str = Field(description="Project / collection to search")
+    query: str = Field(min_length=1, max_length=2000, description="User question")
+    history: list[dict[str, str]] = Field(default_factory=list)
+    brain_plan: BrainRound
+    include_sources: bool = Field(default=True, description="Include source metadata")
+    include_traces: bool = Field(default=True, description="Include execution traces")
+
+
+class PlanRunResponse(BaseModel):
+    """Structured result echoing the validated plan alongside outputs."""
+
+    brain_plan: BrainRound
+    answer: str
+    sources: list[dict[str, Any]] = Field(default_factory=list)
+    context: list[dict[str, Any]] = Field(default_factory=list)
+    traces: list[dict[str, Any]] = Field(default_factory=list)
+    mode: str = "hybrid"
+    lang: str = "English"
+    is_factoid: bool = False
+    needs_retry: bool = False
+    missing_terms: list[str] = Field(default_factory=list)
+    requery: str | None = None

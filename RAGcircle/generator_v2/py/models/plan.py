@@ -11,50 +11,12 @@ from models.steps import (
     BrainRetrieveStep,
     ConfigStep,
     EvalStep,
-    ExpandStep,
     GenerateStep,
     InitialExpandStep,
     LoopExpandStep,
-    PostRetrieveStep,
     QualityCheckStep,
     StitchStep,
 )
-
-
-class BrainRound(BaseModel):
-    """A single pipeline pass: expand -> retrieve -> enrich -> generate -> evaluate."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    expand: list[ExpandStep] = Field(default_factory=list)
-    retrieve: BrainRetrieveStep = Field(default_factory=BrainRetrieveStep)
-    post_retrieve: list[PostRetrieveStep] = Field(default_factory=list)
-    generate: GenerateStep = Field(default_factory=GenerateStep)
-    evaluate: list[EvalStep] = Field(default_factory=list)
-    max_llm_calls: int = Field(default=12, ge=1, le=100)
-
-    @model_validator(mode="after")
-    def _validate_structure(self):
-        expand_kinds = [s.kind for s in self.expand]
-        if expand_kinds.count("plan_retrieval") > 1:
-            raise ValueError("at most one plan_retrieval step per round")
-        if expand_kinds.count("detect_lang") > 1:
-            raise ValueError("at most one detect_lang step per round")
-        if expand_kinds.count("query_variants") > 1:
-            raise ValueError("at most one query_variants step per round")
-        eval_kinds = [s.kind for s in self.evaluate]
-        if "reflect" in eval_kinds and "assess" in eval_kinds:
-            raise ValueError("reflect and assess are mutually exclusive in a single round")
-        post_kinds = [s.kind for s in self.post_retrieve]
-        if post_kinds.count("stitch") > 1:
-            raise ValueError("at most one stitch step per round")
-        return self
-
-
-BrainPlan = BrainRound
-
-
-# ── Spec-aligned types (used by new retrieval pipeline) ──
 
 
 class RetrievalPlan(BaseModel):
@@ -68,6 +30,39 @@ class RetrievalPlan(BaseModel):
     loop_expand: list[LoopExpandStep] = Field(default_factory=list)
     finalize: list[StitchStep] = Field(default_factory=list)
     max_rounds: int = Field(default=2, ge=1, le=10)
+
+
+class BrainRound(BaseModel):
+    """A single pipeline pass: configure -> retrieve -> generate -> evaluate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    configure: list[ConfigStep] = Field(default_factory=list)
+    retrieval: RetrievalPlan = Field(default_factory=RetrievalPlan)
+    generate: GenerateStep = Field(default_factory=GenerateStep)
+    evaluate: list[EvalStep] = Field(default_factory=list)
+    max_llm_calls: int = Field(default=12, ge=1, le=100)
+
+    @model_validator(mode="after")
+    def _validate_structure(self):
+        config_kinds = [s.kind for s in self.configure]
+        if config_kinds.count("plan_retrieval") > 1:
+            raise ValueError("at most one plan_retrieval step per round")
+        if config_kinds.count("detect_lang") > 1:
+            raise ValueError("at most one detect_lang step per round")
+        expand_kinds = [s.kind for s in self.retrieval.initial_expand]
+        if expand_kinds.count("query_variants") > 1:
+            raise ValueError("at most one query_variants step per round")
+        eval_kinds = [s.kind for s in self.evaluate]
+        if "reflect" in eval_kinds and "assess" in eval_kinds:
+            raise ValueError("reflect and assess are mutually exclusive in a single round")
+        finalize_kinds = [s.kind for s in self.retrieval.finalize]
+        if finalize_kinds.count("stitch") > 1:
+            raise ValueError("at most one stitch step per round")
+        return self
+
+
+BrainPlan = BrainRound
 
 
 @dataclass
@@ -94,29 +89,6 @@ class RetrievalResult:
     """Output of the retrieval pipeline."""
 
     chunks: list[ChunkResult]
-    traces: list[dict[str, Any]] = field(default_factory=list)
-
-
-# ── Legacy types (used by current pipeline, removed in Session 2) ──
-
-
-@dataclass
-class EnrichRetrievalRequest:
-    """A deferred retrieval request emitted by an enrich step."""
-
-    query: str
-    plan: ExecutionPlan | None = None
-
-
-@dataclass
-class ExpandResult:
-    """Output of the expand phase."""
-
-    queries: list[str]
-    lang: str = "English"
-    is_factoid: bool = False
-    retrieval_plan: Any = None
-    retrieval_mode: str = "hybrid"
     traces: list[dict[str, Any]] = field(default_factory=list)
 
 
