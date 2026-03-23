@@ -8,12 +8,11 @@ No I/O, no retrieval — pure LLM query generators.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from typing import Any
 
 from engine.budget import BudgetCounter
-from llm import LLMClient
+from llm import LLMClient, LLMParseError, LLMTransportError
 from models.retrieval import ExecutionPlan
 from prompts import (
     FACT_QUERIES_SYSTEM,
@@ -23,7 +22,6 @@ from prompts import (
     KEYWORD_QUERIES_SYSTEM,
     KEYWORD_QUERIES_USER,
 )
-from shared import strip_thinking
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +54,8 @@ async def _hyde(
             passage = await llm.complete(model, messages, temperature=0.2)
             result = [passage.strip()] if passage and passage.strip() else []
             return result, traces
-        except Exception:
-            logger.warning("HyDE failed, using original query")
+        except LLMTransportError as exc:
+            logger.warning("HyDE failed (transport): %s", exc)
             return [], traces
 
     for _ in range(actual_n - 1):
@@ -99,7 +97,7 @@ async def _fact_queries(
     ]
 
     try:
-        raw = await llm.complete(
+        data = await llm.complete_json(
             model,
             [
                 {"role": "system", "content": FACT_QUERIES_SYSTEM},
@@ -109,13 +107,15 @@ async def _fact_queries(
             ],
             temperature=0.2,
         )
-        data = json.loads(strip_thinking(raw))
-        sub_queries = [str(q).strip() for q in (data.get("fact_queries") or []) if str(q).strip()]
-        sub_queries = sub_queries[:max_queries]
-    except Exception:
+    except LLMTransportError as exc:
+        logger.warning("fact_queries LLM unavailable: %s", exc)
+        return [], traces
+    except LLMParseError as exc:
+        logger.warning("fact_queries parse failed: %s — raw: %s", exc, exc.raw[:300])
         return [], traces
 
-    return sub_queries, traces
+    sub_queries = [str(q).strip() for q in (data.get("fact_queries") or []) if str(q).strip()]
+    return sub_queries[:max_queries], traces
 
 
 async def _keywords(
@@ -134,7 +134,7 @@ async def _keywords(
     ]
 
     try:
-        raw = await llm.complete(
+        data = await llm.complete_json(
             model,
             [
                 {"role": "system", "content": KEYWORD_QUERIES_SYSTEM},
@@ -144,9 +144,12 @@ async def _keywords(
             ],
             temperature=0.0,
         )
-        data = json.loads(strip_thinking(raw))
-        kw = [str(q).strip() for q in (data.get("keywords") or []) if str(q).strip()]
-    except Exception:
+    except LLMTransportError as exc:
+        logger.warning("keywords LLM unavailable: %s", exc)
+        return [], traces
+    except LLMParseError as exc:
+        logger.warning("keywords parse failed: %s — raw: %s", exc, exc.raw[:300])
         return [], traces
 
+    kw = [str(q).strip() for q in (data.get("keywords") or []) if str(q).strip()]
     return kw[:4], traces

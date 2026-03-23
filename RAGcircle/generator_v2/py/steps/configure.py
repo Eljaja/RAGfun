@@ -7,31 +7,30 @@ Runs before retrieval — no chunks yet, no generation.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import re
 from typing import Any
 
 from config import Settings
 from engine.budget import BudgetCounter
-from llm import LLMClient
+from llm import LLMClient, LLMParseError, LLMTransportError
 from models.plan import ConfigMeta
 from models.retrieval import ExecutionPlan
 from models.steps import ConfigStep, DetectLangStep, PlanLLMStep
 from plan_builder import from_llm_plan, from_preset
 from prompts import DETECT_LANG_SYSTEM, DETECT_LANG_USER, PLAN_SYSTEM, PLAN_USER
 from query_variants import is_factoid_question
-from shared import strip_thinking
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_PLAN_DICT = {
+_DEFAULT_PLAN_DICT: dict[str, Any] = {
     "retrieval_mode": "hybrid",
     "top_k": 10,
     "rerank": True,
     "use_hyde": False,
     "reason": "fallback",
 }
+
+_FALLBACK = ("hybrid", from_preset("hybrid", top_k=10, rerank=True))
 
 
 async def configure(
@@ -85,18 +84,34 @@ async def _plan_retrieval(
     llm: LLMClient, model: str, settings: Settings,
 ) -> tuple[ExecutionPlan, str, list[dict[str, Any]]]:
     traces: list[dict[str, Any]] = [{"kind": "tool", "name": "llm.plan", "payload": {"query": query}}]
+    fallback_mode, fallback_plan = _FALLBACK
 
     if not budget.try_consume():
-        return from_preset("hybrid", top_k=10, rerank=True), "hybrid", traces
+        return fallback_plan, fallback_mode, traces
 
     try:
         raw = await asyncio.wait_for(
-            _plan_retrieval_llm(llm, model, query, history_text=history_text),
+            llm.complete_json(
+                model,
+                [
+                    {"role": "system", "content": PLAN_SYSTEM},
+                    {"role": "user", "content": PLAN_USER.format(
+                        history=history_text, query=query,
+                    )},
+                ],
+                temperature=0.0,
+            ),
             timeout=settings.agent_llm_timeout + 10,
         )
-    except Exception as e:
-        logger.warning("Plan LLM failed: %s", e)
-        return from_preset("hybrid", top_k=10, rerank=True), "hybrid", traces
+    except LLMTransportError as exc:
+        logger.warning("Plan LLM unavailable: %s", exc)
+        return fallback_plan, fallback_mode, traces
+    except LLMParseError as exc:
+        logger.warning("Plan LLM parse failed: %s — raw: %s", exc, exc.raw[:300])
+        return fallback_plan, fallback_mode, traces
+    except asyncio.TimeoutError:
+        logger.warning("Plan LLM timed out")
+        return fallback_plan, fallback_mode, traces
 
     retrieval_mode = str(raw.get("retrieval_mode") or "hybrid")
     reason = str(raw.get("reason") or "")
@@ -112,39 +127,22 @@ async def _plan_retrieval(
     return plan, retrieval_mode, traces
 
 
-async def _plan_retrieval_llm(
-    llm: LLMClient, model: str, query: str, *, history_text: str = "",
-) -> dict:
-    raw = await llm.complete(
-        model,
-        [
-            {"role": "system", "content": PLAN_SYSTEM},
-            {"role": "user", "content": PLAN_USER.format(history=history_text, query=query)},
-        ],
-        temperature=0.0,
-    )
-    cleaned = strip_thinking(raw or "")
-    cleaned = re.sub(r"```.*?```", "", cleaned, flags=re.DOTALL | re.IGNORECASE).strip()
-    try:
-        return json.loads(cleaned)
-    except Exception:
-        logger.warning("Failed to parse LLM plan output, using fallback")
-        return dict(_DEFAULT_PLAN_DICT)
-
-
 async def _detect_lang(
     *, query: str, budget: BudgetCounter, llm: LLMClient, model: str,
 ) -> tuple[str, bool, list[dict[str, Any]]]:
     lang = "English"
     if budget.try_consume():
-        raw = await llm.complete(
-            model,
-            [
-                {"role": "system", "content": DETECT_LANG_SYSTEM},
-                {"role": "user", "content": DETECT_LANG_USER.format(text=query)},
-            ],
-            temperature=0.0,
-        )
-        lang = (raw or "").strip() or "English"
+        try:
+            raw = await llm.complete(
+                model,
+                [
+                    {"role": "system", "content": DETECT_LANG_SYSTEM},
+                    {"role": "user", "content": DETECT_LANG_USER.format(text=query)},
+                ],
+                temperature=0.0,
+            )
+            lang = (raw or "").strip() or "English"
+        except LLMTransportError as exc:
+            logger.warning("detect_lang LLM unavailable: %s", exc)
     is_factoid = is_factoid_question(query)
     return lang, is_factoid, []

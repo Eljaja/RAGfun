@@ -15,7 +15,7 @@ from context import merge_chunks
 from models.chunks import ChunkResult
 from models.retrieval import ExecutionPlan
 from plan_builder import from_preset
-from retrieval_client import retrieve as retrieval_call
+from retrieval_client import RetrievalTransportError, retrieve as retrieval_call
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +29,8 @@ async def _safe_retrieve(
             http_client, settings.retrieval_url,
             project_id=project_id, query=query, plan=plan,
         )
-    except Exception as e:
-        logger.error("Retrieval failed: %s", e)
+    except RetrievalTransportError as exc:
+        logger.error("Retrieval failed (transport): %s", exc)
         return []
 
 

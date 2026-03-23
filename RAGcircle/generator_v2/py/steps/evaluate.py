@@ -5,14 +5,13 @@ Pure judging: no retrieval, no generation. Returns a Verdict.
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
 from config import Settings
 from context import build_context
 from engine.budget import BudgetCounter
-from llm import LLMClient
+from llm import LLMClient, LLMParseError, LLMTransportError
 from models.assessment import AssessmentResult, ReflectionResult
 from models.chunks import ChunkResult
 from models.plan import Verdict
@@ -29,7 +28,6 @@ from prompts import (
     REFLECT_USER,
 )
 from query_variants import answer_is_grounded
-from shared import strip_thinking
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +111,7 @@ async def _reflect(
     )
 
     try:
-        raw = await llm.complete(
+        result = await llm.complete_model(
             model,
             [
                 {"role": "system", "content": REFLECT_SYSTEM},
@@ -121,6 +119,7 @@ async def _reflect(
                     query=query, context=context_text, answer=answer,
                 )},
             ],
+            ReflectionResult,
             response_format={
                 "type": "json_schema",
                 "json_schema": {
@@ -129,14 +128,11 @@ async def _reflect(
                 },
             },
         )
-        data = json.loads(raw)
-        result = ReflectionResult(
-            complete=data.get("complete", True),
-            missing_context=data.get("missing_context"),
-            requery=data.get("requery"),
-        )
-    except Exception:
-        logger.warning("Reflection failed, continuing")
+    except LLMTransportError as exc:
+        logger.warning("Reflection LLM unavailable: %s", exc)
+        return None, traces
+    except LLMParseError as exc:
+        logger.warning("Reflection parse failed: %s — raw: %s", exc, exc.raw[:300])
         return None, traces
 
     if not result.complete and result.requery:
@@ -161,31 +157,23 @@ async def _assess(
 
     traces: list[dict[str, Any]] = [{"kind": "tool", "name": "llm.assess", "payload": {}}]
 
-    raw = await llm.complete(
-        model,
-        [
-            {"role": "system", "content": ASSESS_SYSTEM},
-            {"role": "user", "content": ASSESS_USER.format(
-                history=history_text, question=query, answer=answer,
-            )},
-        ],
-        temperature=0.0,
-    )
-
     try:
-        data = json.loads(strip_thinking(raw))
-        if not isinstance(data, dict):
-            return [], traces
-        missing = data.get("missing_terms") or []
-        if not isinstance(missing, list):
-            missing = []
-        assessment = AssessmentResult(
-            incomplete=bool(data.get("incomplete")),
-            missing_terms=[str(t).strip() for t in missing if str(t).strip()],
-            reason=str(data.get("reason") or ""),
+        assessment = await llm.complete_model(
+            model,
+            [
+                {"role": "system", "content": ASSESS_SYSTEM},
+                {"role": "user", "content": ASSESS_USER.format(
+                    history=history_text, question=query, answer=answer,
+                )},
+            ],
+            AssessmentResult,
+            temperature=0.0,
         )
-    except Exception:
-        logger.warning("Failed to parse assessment result")
+    except LLMTransportError as exc:
+        logger.warning("Assessment LLM unavailable: %s", exc)
+        return [], traces
+    except LLMParseError as exc:
+        logger.warning("Assessment parse failed: %s — raw: %s", exc, exc.raw[:300])
         return [], traces
 
     if not assessment.incomplete:
