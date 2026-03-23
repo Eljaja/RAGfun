@@ -126,11 +126,45 @@ class PlanRunRequest(BaseModel):
     errors for invalid step combinations.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "example": {
+                "project_id": "my-project",
+                "query": "Compare vector search and BM25 for RAG",
+                "history": [
+                    {"role": "user", "content": "What is RAG?"},
+                    {"role": "assistant", "content": "RAG stands for retrieval-augmented generation..."},
+                ],
+                "brain_plan": {
+                    "configure": [{"kind": "detect_lang"}],
+                    "retrieval": {
+                        "default_config": {"kind": "retrieve", "preset": "hybrid", "top_k": 10, "rerank": True},
+                        "initial_expand": [
+                            {"kind": "hyde", "num_passages": 1},
+                            {"kind": "fact_queries", "max_queries": 2},
+                        ],
+                        "loop_check": [{"kind": "quality_check", "min_hits": 3, "min_score": 0.5}],
+                        "loop_expand": [{"kind": "two_pass", "min_unique_sources": 3}],
+                        "finalize": [{"kind": "stitch", "max_per_segment": 4}],
+                        "max_rounds": 2,
+                    },
+                    "generate": {"kind": "generate", "temperature": 0.2},
+                    "evaluate": [{"kind": "assess"}],
+                    "max_llm_calls": 12,
+                },
+                "include_sources": True,
+                "include_traces": True,
+            }
+        },
+    )
 
     project_id: str = Field(description="Project / collection to search")
     query: str = Field(min_length=1, max_length=2000, description="User question")
-    history: list[dict[str, str]] = Field(default_factory=list)
+    history: list[dict[str, str]] = Field(
+        default_factory=list,
+        description="Prior conversation turns as {role, content} dicts",
+    )
     brain_plan: BrainRound
     include_sources: bool = Field(default=True, description="Include source metadata")
     include_traces: bool = Field(default=True, description="Include execution traces")
