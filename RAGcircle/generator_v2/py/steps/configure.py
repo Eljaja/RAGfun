@@ -16,7 +16,7 @@ from llm import LLMClient, LLMParseError, LLMTransportError
 from models.plan import ConfigMeta
 from retrieval_contract import ExecutionPlan
 from models.steps import ConfigStep, DetectLangStep, PlanLLMStep
-from plan_builder import from_llm_plan, from_preset
+from retrieval_contract import from_llm_plan, from_preset
 from prompts import DETECT_LANG_SYSTEM, DETECT_LANG_USER, PLAN_SYSTEM, PLAN_USER
 from query_variants import is_factoid_question
 

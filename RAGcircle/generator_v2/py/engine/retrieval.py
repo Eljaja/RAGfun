@@ -33,7 +33,7 @@ from models.steps import (
     StitchStep,
     TwoPassStep,
 )
-from plan_builder import from_preset
+from retrieval_contract import from_preset
 from query_variants import (
     extract_hint_terms,
     keyword_query,

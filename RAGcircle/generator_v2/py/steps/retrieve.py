@@ -13,7 +13,7 @@ import httpx
 from config import Settings
 from context import merge_chunks
 from retrieval_contract import ChunkResult, ExecutionPlan
-from plan_builder import from_preset
+from retrieval_contract import from_preset
 from retrieval_client import RetrievalTransportError, retrieve as retrieval_call
 
 logger = logging.getLogger(__name__)

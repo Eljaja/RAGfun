@@ -22,6 +22,11 @@ from retrieval_contract.api import (
     RetrieveRequest,
     RetrieveResponse,
 )
+from retrieval_contract.plan_builder import (
+    DEFAULT_PLAN,
+    from_llm_plan,
+    from_preset,
+)
 
 __all__ = [
     "ChunkResult",
@@ -43,4 +48,7 @@ __all__ = [
     "ExecuteResponse",
     "RetrieveRequest",
     "RetrieveResponse",
+    "from_preset",
+    "from_llm_plan",
+    "DEFAULT_PLAN",
 ]

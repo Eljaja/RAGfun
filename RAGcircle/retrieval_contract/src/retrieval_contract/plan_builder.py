@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from models import (
+from retrieval_contract.steps import (
     AdaptiveKStep,
     BM25SearchStep,
     ExecutionPlan,
@@ -79,9 +79,9 @@ def from_llm_plan(
 ) -> ExecutionPlan:
     """Translate LLM planner JSON into a validated ExecutionPlan.
 
-    The LLM may request bm25/vector/hybrid modes, but retrieval_v2
-    doesn't support standalone bm25-only search, so we always use
-    hybrid with the LLM's top_k and rerank preferences.
+    The LLM may request bm25/vector/hybrid modes, but the retrieval
+    service doesn't support standalone bm25-only search, so we always
+    use hybrid with the LLM's top_k and rerank preferences.
     """
     raw_k = int(plan_dict.get("top_k") or 10)
     top_k = max(top_k_min, min(top_k_max, raw_k))
