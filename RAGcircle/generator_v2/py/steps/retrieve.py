@@ -12,8 +12,7 @@ import httpx
 
 from config import Settings
 from context import merge_chunks
-from models.chunks import ChunkResult
-from models.retrieval import ExecutionPlan
+from retrieval_contract import ChunkResult, ExecutionPlan
 from plan_builder import from_preset
 from retrieval_client import RetrievalTransportError, retrieve as retrieval_call
 

@@ -17,9 +17,9 @@ from config import Settings
 from context import merge_chunks, stitch_segments
 from engine.budget import BudgetCounter
 from llm import LLMClient
-from models.chunks import ChunkResult, ScoreSource
+from retrieval_contract import ChunkResult, ScoreSource
 from models.plan import ConfigMeta, RetrievalRequest, RetrievalResult
-from models.retrieval import ExecutionPlan
+from retrieval_contract import ExecutionPlan
 from models.steps import (
     BM25AnchorStep,
     FactoidExpandStep,

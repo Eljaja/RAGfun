@@ -13,7 +13,7 @@ from tenacity import (
     wait_exponential,
 )
 
-from models import ChunkResult, ExecutionPlan
+from retrieval_contract import ChunkResult, ExecuteRequest, ExecuteResponse, ExecutionPlan
 
 logger = logging.getLogger(__name__)
 
@@ -55,15 +55,13 @@ async def retrieve(
     query: str,
     plan: ExecutionPlan,
 ) -> list[ChunkResult]:
-    plan_data = _strip_empty_queries(plan.model_dump())
+    body = _strip_empty_queries(
+        ExecuteRequest(project_id=project_id, query=query, plan=plan).model_dump()
+    )
     try:
         resp = await client.post(
             f"{retrieval_url.rstrip('/')}/plan/retrieve",
-            json={
-                "project_id": project_id,
-                "query": query,
-                "plan": plan_data,
-            },
+            json=body,
         )
         resp.raise_for_status()
     except _RETRYABLE:
@@ -73,5 +71,4 @@ async def retrieve(
             f"{exc.response.status_code}: {exc.response.text[:200]}"
         ) from exc
 
-    data = resp.json()
-    return [ChunkResult(**c) for c in data.get("chunks", [])]
+    return ExecuteResponse.model_validate(resp.json()).chunks

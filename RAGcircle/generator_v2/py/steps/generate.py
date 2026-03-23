@@ -9,7 +9,7 @@ from typing import Any
 
 from context import build_context, history_as_messages
 from llm import LLMClient
-from models.chunks import ChunkResult
+from retrieval_contract import ChunkResult
 from models.steps import GenerateStep
 from prompts import ANSWER_SYSTEM, ANSWER_SYSTEM_WITH_TOOLS, ANSWER_USER
 from tools import TOOL_DEFINITIONS

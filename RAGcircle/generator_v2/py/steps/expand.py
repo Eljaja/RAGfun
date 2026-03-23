@@ -13,7 +13,7 @@ from typing import Any
 
 from engine.budget import BudgetCounter
 from llm import LLMClient, LLMParseError, LLMTransportError
-from models.retrieval import ExecutionPlan
+from retrieval_contract import ExecutionPlan
 from prompts import (
     FACT_QUERIES_SYSTEM,
     FACT_QUERIES_USER,

@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from models.chunks import ChunkResult, ScoreSource
-from models.retrieval import (
+from retrieval_contract import (
     AdaptiveKStep,
     BM25SearchStep,
+    ChunkResult,
     ExecutionPlan,
     FinalizeStep,
     FuseStep,
@@ -13,6 +13,7 @@ from models.retrieval import (
     RankStep,
     RerankStep,
     RetrievalStep,
+    ScoreSource,
     TrimStep,
     VectorSearchStep,
 )

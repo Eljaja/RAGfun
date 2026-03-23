@@ -13,7 +13,7 @@ from context import build_context
 from engine.budget import BudgetCounter
 from llm import LLMClient, LLMParseError, LLMTransportError
 from models.assessment import AssessmentResult, ReflectionResult
-from models.chunks import ChunkResult
+from retrieval_contract import ChunkResult
 from models.plan import Verdict
 from models.steps import (
     AssessStep,

@@ -14,7 +14,7 @@ from config import Settings
 from engine.budget import BudgetCounter
 from llm import LLMClient, LLMParseError, LLMTransportError
 from models.plan import ConfigMeta
-from models.retrieval import ExecutionPlan
+from retrieval_contract import ExecutionPlan
 from models.steps import ConfigStep, DetectLangStep, PlanLLMStep
 from plan_builder import from_llm_plan, from_preset
 from prompts import DETECT_LANG_SYSTEM, DETECT_LANG_USER, PLAN_SYSTEM, PLAN_USER

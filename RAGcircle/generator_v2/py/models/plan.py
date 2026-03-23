@@ -5,8 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from models.chunks import ChunkResult
-from models.retrieval import ExecutionPlan
+from retrieval_contract import ChunkResult, ExecutionPlan
 from models.steps import (
     BrainRetrieveStep,
     ConfigStep,
