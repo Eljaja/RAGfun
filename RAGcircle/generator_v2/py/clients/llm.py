@@ -36,8 +36,8 @@ from tenacity import (
     wait_exponential,
 )
 
-from shared import strip_fences, strip_thinking
-from tools import execute_tool
+from lib.shared import strip_fences, strip_thinking
+from lib.tools import execute_tool
 
 logger = logging.getLogger(__name__)
 

@@ -11,15 +11,15 @@ import logging
 import httpx
 
 from config import Settings
-from context import merge_chunks
+from lib.context import merge_chunks
 from retrieval_contract import ChunkResult, ExecutionPlan
 from retrieval_contract import from_preset
-from retrieval_client import RetrievalTransportError, retrieve as retrieval_call
+from clients.retrieval import RetrievalTransportError, retrieve as retrieval_call
 
 logger = logging.getLogger(__name__)
 
 
-async def _safe_retrieve(
+async def safe_retrieve(
     query: str, plan: ExecutionPlan, *,
     project_id: str, http_client: httpx.AsyncClient, settings: Settings,
 ) -> list[ChunkResult]:
@@ -49,13 +49,13 @@ async def retrieve_all(
 
     if len(queries) <= 1:
         query = queries[0] if queries else ""
-        return await _safe_retrieve(
+        return await safe_retrieve(
             query, resolved_plan,
             project_id=project_id, http_client=http_client, settings=settings,
         )
 
     results = await asyncio.gather(*(
-        _safe_retrieve(
+        safe_retrieve(
             sq, resolved_plan,
             project_id=project_id, http_client=http_client, settings=settings,
         )

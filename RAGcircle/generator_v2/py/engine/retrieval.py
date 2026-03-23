@@ -14,9 +14,9 @@ from typing import Any
 import httpx
 
 from config import Settings
-from context import merge_chunks, stitch_segments
+from lib.context import merge_chunks, stitch_segments
 from engine.budget import BudgetCounter
-from llm import LLMClient
+from clients.llm import LLMClient
 from retrieval_contract import ChunkResult, ScoreSource
 from models.plan import ConfigMeta, RetrievalRequest, RetrievalResult
 from retrieval_contract import ExecutionPlan
@@ -34,14 +34,14 @@ from models.steps import (
     TwoPassStep,
 )
 from retrieval_contract import from_preset
-from query_variants import (
+from lib.query_variants import (
     extract_hint_terms,
     keyword_query,
     query_variants as heuristic_variants,
     unique_source_count,
 )
-from steps.expand import _fact_queries, _hyde, _keywords
-from steps.retrieve import _safe_retrieve
+from steps.expand import fact_queries, hyde, keywords
+from steps.retrieve import safe_retrieve
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +158,7 @@ async def _initial_expand(
     for step in steps:
         match step:
             case HyDEStep(num_passages=num_passages):
-                hyde_queries, t = await _hyde(
+                hyde_queries, t = await hyde(
                     query=query, lang=meta.lang, budget=budget,
                     llm=llm, model=model, num_passages=num_passages,
                 )
@@ -166,7 +166,7 @@ async def _initial_expand(
                 traces.extend(t)
 
             case FactQueryStep(max_queries=max_q):
-                sub_queries, t = await _fact_queries(
+                sub_queries, t = await fact_queries(
                     query=query, history_text=history_text,
                     max_queries=max_q, budget=budget,
                     retrieval_plan=meta.retrieval_plan,
@@ -176,7 +176,7 @@ async def _initial_expand(
                 traces.extend(t)
 
             case KeywordStep():
-                kw_queries, t = await _keywords(
+                kw_queries, t = await keywords(
                     query=query, history_text=history_text,
                     budget=budget, retrieval_plan=meta.retrieval_plan,
                     llm=llm, model=model,
@@ -225,13 +225,13 @@ async def _fetch_all(
 
     if len(requests) == 1:
         req = requests[0]
-        return await _safe_retrieve(
+        return await safe_retrieve(
             req.query, req.plan_override or default_config,
             project_id=project_id, http_client=http_client, settings=settings,
         )
 
     results = await asyncio.gather(*(
-        _safe_retrieve(
+        safe_retrieve(
             req.query, req.plan_override or default_config,
             project_id=project_id, http_client=http_client, settings=settings,
         )

@@ -8,9 +8,9 @@ import uvicorn
 from fastapi import FastAPI
 
 from config import Settings
-from endpoints import agent_router, chat_router, execute_router
-from plan_endpoints import plan_router
-from llm import LLMClient
+from api.endpoints import agent_router, chat_router, execute_router
+from api.plan import plan_router
+from clients.llm import LLMClient
 
 logger = logging.getLogger(__name__)
 

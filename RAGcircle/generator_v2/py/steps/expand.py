@@ -12,9 +12,9 @@ import logging
 from typing import Any
 
 from engine.budget import BudgetCounter
-from llm import LLMClient, LLMParseError, LLMTransportError
+from clients.llm import LLMClient, LLMParseError, LLMTransportError
 from retrieval_contract import ExecutionPlan
-from prompts import (
+from lib.prompts import (
     FACT_QUERIES_SYSTEM,
     FACT_QUERIES_USER,
     HYDE_SYSTEM,
@@ -26,7 +26,7 @@ from prompts import (
 logger = logging.getLogger(__name__)
 
 
-async def _hyde(
+async def hyde(
     *, query: str, lang: str, budget: BudgetCounter,
     llm: LLMClient, model: str, num_passages: int = 1,
 ) -> tuple[list[str], list[dict[str, Any]]]:
@@ -80,7 +80,7 @@ async def _hyde(
     return passages, traces
 
 
-async def _fact_queries(
+async def fact_queries(
     *,
     query: str,
     history_text: str,
@@ -118,7 +118,7 @@ async def _fact_queries(
     return sub_queries[:max_queries], traces
 
 
-async def _keywords(
+async def keywords(
     *,
     query: str,
     history_text: str,

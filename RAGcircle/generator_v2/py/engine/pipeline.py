@@ -12,10 +12,10 @@ from typing import Any
 import httpx
 
 from config import Settings
-from context import extract_source_details, history_summary
+from lib.context import extract_source_details, history_summary
 from engine.budget import BudgetCounter
 from engine.retrieval import run_retrieval
-from llm import LLMClient
+from clients.llm import LLMClient
 from models.plan import BrainRound, PipelineResult
 from steps.configure import configure
 from steps.evaluate import evaluate

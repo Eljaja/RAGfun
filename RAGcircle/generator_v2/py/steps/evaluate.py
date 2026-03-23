@@ -9,9 +9,9 @@ import logging
 from typing import Any
 
 from config import Settings
-from context import build_context
+from lib.context import build_context
 from engine.budget import BudgetCounter
-from llm import LLMClient, LLMParseError, LLMTransportError
+from clients.llm import LLMClient, LLMParseError, LLMTransportError
 from models.assessment import AssessmentResult, ReflectionResult
 from retrieval_contract import ChunkResult
 from models.plan import Verdict
@@ -21,13 +21,13 @@ from models.steps import (
     GroundingCheckStep,
     ReflectStep,
 )
-from prompts import (
+from lib.prompts import (
     ASSESS_SYSTEM,
     ASSESS_USER,
     REFLECT_SYSTEM,
     REFLECT_USER,
 )
-from query_variants import answer_is_grounded
+from lib.query_variants import answer_is_grounded
 
 logger = logging.getLogger(__name__)
 
