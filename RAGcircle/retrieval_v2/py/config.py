@@ -8,19 +8,19 @@ class Settings(BaseSettings):
 
     # ── Embedding service (Infinity) ─────────────────────────
     embedder_url: str = "http://localhost:8902"
-    embedder_model: str = "intfloat/multilingual-e5-base"
+    embedder_model: str = "BAAI/bge-m3"
     embedder_timeout: float = 30.0
 
     # ── Qdrant (vector search) ───────────────────────────────
-    qdrant_url: str = "http://localhost:8903"
+    qdrant_url: str = "http://localhost:6335"
 
     # ── OpenSearch (BM25 search) ─────────────────────────────
-    opensearch_url: str = "http://localhost:8905"
+    opensearch_url: str = "http://localhost:9201"
 
     # ── Reranker ─────────────────────────────────────────────
-    reranker_url: str = "http://localhost:8904"
+    reranker_url: str = "http://172.18.0.6:7998"
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
 
     # ── Server ───────────────────────────────────────────────
-    port: int = 8920
+    port: int = 8921
     log_level: str = "INFO"

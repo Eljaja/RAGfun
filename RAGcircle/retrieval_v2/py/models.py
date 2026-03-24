@@ -1,17 +1,36 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+_MAX_QUERY_LEN = 2000
 
 
-class ChunkResult(BaseModel):
-    text: str
-    source_id: str
-    chunk_index: int
-    score: float
-    score_source: "ScoreSource" = "retrieval"
+def _validate_query_str(value: object, *, required: bool) -> str:
+    """Shared query validation.
+
+    required=True  -> null/empty is an error (request-level queries).
+    required=False -> null/empty is an error too, but with a hint to omit
+                      the field instead (step-level optional overrides).
+    """
+    if value is None:
+        if required:
+            raise ValueError("query cannot be null")
+        raise ValueError("query cannot be null; omit the field to use request query")
+    if not isinstance(value, str):
+        raise ValueError("query must be a string")
+    text = value.strip()
+    if not text:
+        if required:
+            raise ValueError("query cannot be empty")
+        raise ValueError("query cannot be empty; omit the field to use request query")
+    if len(text) > _MAX_QUERY_LEN:
+        raise ValueError(f"query is too long (max {_MAX_QUERY_LEN} chars)")
+    if any(ord(ch) < 32 and ch not in ("\t", "\n", "\r") for ch in text):
+        raise ValueError("query contains unsupported control characters")
+    return text
 
 
 class ScoreSource(StrEnum):
@@ -20,28 +39,53 @@ class ScoreSource(StrEnum):
     RERANK = "rerank"
 
 
-class RetrieveRequest(BaseModel):
-    project_id: str
-    query: str
-    top_k: int = Field(default=5, ge=1, le=50)
-    rerank: bool = True
-    rerank_top_n: int = Field(default=5, ge=1, le=50)
-    strategy: str = Field(default="hybrid", pattern="^(hybrid|vector|bm25)$")
+class ChunkResult(BaseModel):
+    text: str
+    source_id: str
+    chunk_index: int
+    score: float
+    score_source: ScoreSource = ScoreSource.RETRIEVAL
 
 
-class RetrieveResponse(BaseModel):
-    chunks: list[ChunkResult]
-    strategy: str
-    query: str
-    plan_used: "ExecutionPlan | None" = None
+class EmbeddingResponseData(BaseModel):
+    embedding: list[float]
+    index: int
+    object: Literal["embedding"] = Field(...)
+
+
+class EmbeddingResponse(BaseModel):
+    data: list[EmbeddingResponseData]
+    model: str
+    object: Literal["list"] = Field(...)
+    usage: dict[str, Any] | None = None
+
+
+# ── Step base classes ────────────────────────────────────
 
 
 class StepBase(BaseModel):
+    """Base for all plan steps."""
+
     model_config = ConfigDict(extra="forbid")
 
 
 class QueryStepBase(StepBase):
-    query: str = ""
+    """Base for steps that accept an optional per-step query override."""
+
+    query: str = Field(default="", max_length=_MAX_QUERY_LEN)
+
+    @field_validator("query", mode="before")
+    @classmethod
+    def _normalize_query(cls, v: object) -> str:
+        return _validate_query_str(v, required=False)
+
+
+# ── Step types ───────────────────────────────────────────
+
+# TODO: take embedding model from the project
+# TODO: allow model choice for reranker
+# TODO: will probably require router or smth (or infinity will be able to serve multiple)
+# TODO: will require some new methods
 
 
 class BM25SearchStep(QueryStepBase):
@@ -60,6 +104,7 @@ class FuseStep(StepBase):
     rrf_k: int = Field(default=60, ge=1, le=5000)
 
 
+# TODO: model choice -- right now it is rigid
 class RerankStep(QueryStepBase):
     kind: Literal["rerank"] = "rerank"
     top_n: int = Field(default=8, ge=1, le=1000)
@@ -88,6 +133,14 @@ FinalizeStep = Annotated[TrimStep, Field(discriminator="kind")]
 
 
 class PlanRound(BaseModel):
+    """One retrieval round with explicit phases.
+
+    Validates:
+    - retrieval comes first (bm25/vector only),
+    - optional fuse step after retrieval,
+    - ranking/post-processing next.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     retrieve: list[RetrievalStep] = Field(default_factory=list)
@@ -100,14 +153,34 @@ class PlanRound(BaseModel):
         if not self.retrieve:
             raise ValueError("plan round must include at least one retrieval step")
         if len(self.retrieve) >= 2 and self.combine is None:
-            raise ValueError("multiple retrieval steps require combine step")
+            raise ValueError(
+                "multiple retrieval steps require a combine (fuse) step "
+                "to produce comparable scores"
+            )
         if self.combine is not None and len(self.retrieve) < 2:
-            raise ValueError("combine step requires at least two retrieval steps")
+            raise ValueError("fuse step requires at least two retrieval steps in the round")
+
+        has_adaptive_k = any(s.kind == "adaptive_k" for s in self.rank)
+        if has_adaptive_k:
+            rerank_seen = False
+            for step in self.rank:
+                if step.kind == "rerank":
+                    rerank_seen = True
+                if step.kind == "adaptive_k" and not rerank_seen:
+                    raise ValueError(
+                        "adaptive_k requires a preceding rerank step "
+                        "to produce meaningful score gaps"
+                    )
+
+        trim_steps = [step for step in self.finalize if step.kind == "trim"]
+        if len(trim_steps) > 1:
+            raise ValueError("at most one trim step is allowed per round")
         return self
 
 
 class ExecutionPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
     round: PlanRound
 
     @classmethod
@@ -118,7 +191,7 @@ class ExecutionPlan(BaseModel):
         top_k: int,
         rerank: bool,
         rerank_top_n: int,
-    ) -> "ExecutionPlan":
+    ) -> ExecutionPlan:
         strategy = (strategy or "hybrid").lower().strip()
         top_k = max(1, int(top_k))
         rerank_top_n = max(1, int(rerank_top_n))
@@ -128,14 +201,14 @@ class ExecutionPlan(BaseModel):
                 round=PlanRound(
                     retrieve=[BM25SearchStep(top_k=top_k)],
                     finalize=[TrimStep(top_k=top_k)],
-                )
+                ),
             )
         if strategy == "vector":
             return cls(
                 round=PlanRound(
                     retrieve=[VectorSearchStep(top_k=top_k)],
                     finalize=[TrimStep(top_k=top_k)],
-                )
+                ),
             )
 
         fetch_k = max(top_k * 2, top_k)
@@ -149,13 +222,38 @@ class ExecutionPlan(BaseModel):
                 combine=FuseStep(rrf_k=60),
                 rank=rank_steps,
                 finalize=[TrimStep(top_k=top_k)],
-            )
+            ),
         )
 
 
-class ExecuteRequest(BaseModel):
+# ── Request / response models ────────────────────────────
+
+
+class _RequestBase(BaseModel):
     project_id: str
+    query: str = Field(min_length=1, max_length=_MAX_QUERY_LEN)
+
+    @field_validator("query", mode="before")
+    @classmethod
+    def _validate_query(cls, v: object) -> str:
+        return _validate_query_str(v, required=True)
+
+
+class RetrieveRequest(_RequestBase):
+    top_k: int = Field(default=5, ge=1, le=2000)
+    rerank: bool = True
+    rerank_top_n: int = Field(default=5, ge=1, le=2000)
+    strategy: str = Field(default="hybrid", pattern="^(hybrid|vector|bm25)$")
+
+
+class RetrieveResponse(BaseModel):
+    chunks: list[ChunkResult]
+    strategy: str
     query: str
+    plan_used: ExecutionPlan | None = None
+
+
+class ExecuteRequest(_RequestBase):
     plan: ExecutionPlan
 
 
