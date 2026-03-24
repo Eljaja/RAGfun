@@ -1,8 +1,7 @@
-"""Expand step implementations: LLM-based query expansion.
+"""Expand step implementations: query expansion (LLM-based and heuristic).
 
-These are the leaf functions called by engine/retrieval._initial_expand().
-Each takes (query, budget, llm, ...) and returns (list[str], traces).
-No I/O, no retrieval — pure LLM query generators.
+Leaf functions called by engine/retrieval's dispatch loops.
+Each returns (list[str] | list[RetrievalRequest], traces).
 """
 
 from __future__ import annotations
@@ -11,16 +10,24 @@ import asyncio
 import logging
 from typing import Any
 
-from engine.budget import BudgetCounter
+from engine.brain_budget import BudgetCounter
 from clients.llm import LLMClient, LLMParseError, LLMTransportError
-from retrieval_contract import ExecutionPlan
-from lib.prompts import (
+from models.plan import RetrievalRequest
+from retrieval_contract import ChunkResult, ExecutionPlan
+from retrieval_contract import from_preset
+from steps.prompts import (
     FACT_QUERIES_SYSTEM,
     FACT_QUERIES_USER,
     HYDE_SYSTEM,
     HYDE_USER,
     KEYWORD_QUERIES_SYSTEM,
     KEYWORD_QUERIES_USER,
+)
+from steps.query_heuristics import (
+    extract_hint_terms,
+    keyword_query,
+    query_variants as heuristic_variants,
+    unique_source_count,
 )
 
 logger = logging.getLogger(__name__)
@@ -153,3 +160,79 @@ async def keywords(
 
     kw = [str(q).strip() for q in (data.get("keywords") or []) if str(q).strip()]
     return kw[:4], traces
+
+
+# ── Heuristic expand steps ───────────────────────────────
+
+
+def query_variants_expand(
+    *, query: str,
+) -> tuple[list[RetrievalRequest], list[dict[str, Any]]]:
+    """Generate syntactic query variants (no LLM call)."""
+    variants = heuristic_variants(query)
+    if len(variants) <= 1:
+        return [], []
+    reqs = [RetrievalRequest(query=v) for v in variants[1:]]
+    traces: list[dict[str, Any]] = [{
+        "kind": "action", "label": "QueryVariants",
+        "content": f"Generated {len(variants)} variants",
+    }]
+    return reqs, traces
+
+
+def bm25_anchor_expand(
+    *, query: str, top_k: int,
+) -> tuple[list[RetrievalRequest], list[dict[str, Any]]]:
+    """Create a BM25-only anchor request from keyword extraction."""
+    kw = keyword_query(query)
+    if not kw:
+        return [], []
+    plan = from_preset("fast", top_k=top_k, rerank=False)
+    reqs = [RetrievalRequest(query=kw, plan_override=plan)]
+    traces: list[dict[str, Any]] = [{
+        "kind": "action", "label": "BM25Anchor",
+        "content": f"kw={kw[:60]}",
+    }]
+    return reqs, traces
+
+
+def two_pass_expand(
+    *,
+    query: str,
+    chunks: list[ChunkResult],
+    min_unique_sources: int,
+    retrieval_plan: ExecutionPlan | None,
+) -> tuple[list[RetrievalRequest], list[dict[str, Any]]]:
+    """Follow-up query when unique-source count is below threshold."""
+    n_unique = unique_source_count(chunks)
+    if n_unique >= min_unique_sources:
+        return [], []
+    hints = extract_hint_terms(chunks, max_terms=3)
+    if not hints:
+        return [], []
+    follow_up = f"{query} {' '.join(hints)}"
+    plan = retrieval_plan or from_preset("hybrid", top_k=10, rerank=True)
+    reqs = [RetrievalRequest(query=follow_up, plan_override=plan)]
+    traces: list[dict[str, Any]] = [{
+        "kind": "action", "label": "TwoPass",
+        "content": f"Only {n_unique} unique sources, follow-up query queued",
+    }]
+    return reqs, traces
+
+
+def factoid_expand(
+    *,
+    query: str,
+    chunks: list[ChunkResult],
+    is_factoid: bool,
+) -> tuple[list[RetrievalRequest], list[dict[str, Any]]]:
+    """Fast shallow expansion for factoid-type questions."""
+    if not is_factoid or not chunks:
+        return [], []
+    plan = from_preset("fast", top_k=5, rerank=False)
+    reqs = [RetrievalRequest(query=query, plan_override=plan)]
+    traces: list[dict[str, Any]] = [{
+        "kind": "action", "label": "FactoidExpand",
+        "content": "Expanding within top sources",
+    }]
+    return reqs, traces

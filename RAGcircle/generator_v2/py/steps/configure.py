@@ -11,14 +11,14 @@ import logging
 from typing import Any
 
 from config import Settings
-from engine.budget import BudgetCounter
+from engine.brain_budget import BudgetCounter
 from clients.llm import LLMClient, LLMParseError, LLMTransportError
 from models.plan import ConfigMeta
 from retrieval_contract import ExecutionPlan
 from models.steps import ConfigStep, DetectLangStep, PlanLLMStep
 from retrieval_contract import from_llm_plan, from_preset
-from lib.prompts import DETECT_LANG_SYSTEM, DETECT_LANG_USER, PLAN_SYSTEM, PLAN_USER
-from lib.query_variants import is_factoid_question
+from steps.prompts import DETECT_LANG_SYSTEM, DETECT_LANG_USER, PLAN_SYSTEM, PLAN_USER
+from steps.query_heuristics import is_factoid_question
 
 logger = logging.getLogger(__name__)
 

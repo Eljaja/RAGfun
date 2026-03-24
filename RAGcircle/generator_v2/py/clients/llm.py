@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, AsyncIterator, TypeVar
 
 import httpx
@@ -36,10 +37,28 @@ from tenacity import (
     wait_exponential,
 )
 
-from lib.shared import strip_fences, strip_thinking
-from lib.tools import execute_tool
+from clients.tools import execute_tool
 
 logger = logging.getLogger(__name__)
+
+_THINKING_RE = re.compile(r"<think>.*?</think>", flags=re.DOTALL | re.IGNORECASE)
+_FENCE_RE = re.compile(r"```(?:\w*)\n?(.*?)```", flags=re.DOTALL)
+
+
+def strip_thinking(text: str) -> str:
+    """Remove <think>...</think> blocks from LLM output."""
+    if not text or not text.strip():
+        return text
+    return _THINKING_RE.sub("", text).strip()
+
+
+def strip_fences(text: str) -> str:
+    """Extract content from markdown code fences if present."""
+    text = text.strip()
+    matches = _FENCE_RE.findall(text)
+    if len(matches) == 1:
+        return matches[0].strip()
+    return text
 
 _RETRYABLE = (httpx.TransportError, httpx.TimeoutException)
 

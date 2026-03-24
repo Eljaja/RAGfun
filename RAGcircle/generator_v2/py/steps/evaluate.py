@@ -10,7 +10,7 @@ from typing import Any
 
 from config import Settings
 from lib.context import build_context
-from engine.budget import BudgetCounter
+from engine.brain_budget import BudgetCounter
 from clients.llm import LLMClient, LLMParseError, LLMTransportError
 from models.assessment import AssessmentResult, ReflectionResult
 from retrieval_contract import ChunkResult
@@ -21,13 +21,13 @@ from models.steps import (
     GroundingCheckStep,
     ReflectStep,
 )
-from lib.prompts import (
+from steps.prompts import (
     ASSESS_SYSTEM,
     ASSESS_USER,
     REFLECT_SYSTEM,
     REFLECT_USER,
 )
-from lib.query_variants import answer_is_grounded
+from steps.query_heuristics import answer_is_grounded
 
 logger = logging.getLogger(__name__)
 

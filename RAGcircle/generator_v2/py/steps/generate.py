@@ -11,8 +11,8 @@ from lib.context import build_context, history_as_messages
 from clients.llm import LLMClient
 from retrieval_contract import ChunkResult
 from models.steps import GenerateStep
-from lib.prompts import ANSWER_SYSTEM, ANSWER_SYSTEM_WITH_TOOLS, ANSWER_USER
-from lib.tools import TOOL_DEFINITIONS
+from steps.prompts import ANSWER_SYSTEM, ANSWER_SYSTEM_WITH_TOOLS, ANSWER_USER
+from clients.tools import TOOL_DEFINITIONS
 
 
 async def generate(

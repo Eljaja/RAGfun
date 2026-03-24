@@ -7,7 +7,6 @@ and gets back RetrievalResult (chunks + traces).
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any
 
@@ -15,11 +14,11 @@ import httpx
 
 from config import Settings
 from lib.context import merge_chunks, stitch_segments
-from engine.budget import BudgetCounter
+from engine.brain_budget import BudgetCounter
 from clients.llm import LLMClient
-from retrieval_contract import ChunkResult, ScoreSource
+from retrieval_contract import ChunkResult, ExecutionPlan, ScoreSource
+from retrieval_contract import from_preset
 from models.plan import ConfigMeta, RetrievalRequest, RetrievalResult
-from retrieval_contract import ExecutionPlan
 from models.steps import (
     BM25AnchorStep,
     FactoidExpandStep,
@@ -33,15 +32,16 @@ from models.steps import (
     StitchStep,
     TwoPassStep,
 )
-from retrieval_contract import from_preset
-from lib.query_variants import (
-    extract_hint_terms,
-    keyword_query,
-    query_variants as heuristic_variants,
-    unique_source_count,
+from steps.expand import (
+    bm25_anchor_expand,
+    fact_queries,
+    factoid_expand,
+    hyde,
+    keywords,
+    query_variants_expand,
+    two_pass_expand,
 )
-from steps.expand import fact_queries, hyde, keywords
-from steps.retrieve import safe_retrieve
+from steps.retrieve import fetch_all
 
 logger = logging.getLogger(__name__)
 
@@ -90,9 +90,9 @@ async def run_retrieval(
     traces.extend(expand_traces)
 
     # -- First fetch
-    chunks = await _fetch_all(
+    chunks = await fetch_all(
         requests,
-        default_config=default_config,
+        default_plan=default_config,
         project_id=project_id,
         http_client=http_client,
         settings=settings,
@@ -118,9 +118,9 @@ async def run_retrieval(
         if not loop_reqs:
             break
 
-        extra = await _fetch_all(
+        extra = await fetch_all(
             loop_reqs,
-            default_config=default_config,
+            default_plan=default_config,
             project_id=project_id,
             http_client=http_client,
             settings=settings,
@@ -151,93 +151,50 @@ async def _initial_expand(
     llm: LLMClient,
     model: str,
 ) -> tuple[list[RetrievalRequest], list[dict[str, Any]]]:
-    """Run expand steps, produce retrieval requests (no I/O yet)."""
+    """Dispatch expand steps to leaf functions, collect retrieval requests."""
     requests: list[RetrievalRequest] = []
     traces: list[dict[str, Any]] = []
 
     for step in steps:
         match step:
             case HyDEStep(num_passages=num_passages):
-                hyde_queries, t = await hyde(
+                queries, t = await hyde(
                     query=query, lang=meta.lang, budget=budget,
                     llm=llm, model=model, num_passages=num_passages,
                 )
-                requests.extend(RetrievalRequest(query=q) for q in hyde_queries)
+                requests.extend(RetrievalRequest(query=q) for q in queries)
                 traces.extend(t)
 
             case FactQueryStep(max_queries=max_q):
-                sub_queries, t = await fact_queries(
+                queries, t = await fact_queries(
                     query=query, history_text=history_text,
                     max_queries=max_q, budget=budget,
                     retrieval_plan=meta.retrieval_plan,
                     llm=llm, model=model,
                 )
-                requests.extend(RetrievalRequest(query=q) for q in sub_queries)
+                requests.extend(RetrievalRequest(query=q) for q in queries)
                 traces.extend(t)
 
             case KeywordStep():
-                kw_queries, t = await keywords(
+                queries, t = await keywords(
                     query=query, history_text=history_text,
                     budget=budget, retrieval_plan=meta.retrieval_plan,
                     llm=llm, model=model,
                 )
-                requests.extend(RetrievalRequest(query=q) for q in kw_queries)
+                requests.extend(RetrievalRequest(query=q) for q in queries)
                 traces.extend(t)
 
             case QueryVariantsStep():
-                variants = heuristic_variants(query)
-                if len(variants) > 1:
-                    requests.extend(
-                        RetrievalRequest(query=v) for v in variants[1:]
-                    )
-                    traces.append({
-                        "kind": "action", "label": "QueryVariants",
-                        "content": f"Generated {len(variants)} variants",
-                    })
+                reqs, t = query_variants_expand(query=query)
+                requests.extend(reqs)
+                traces.extend(t)
 
             case BM25AnchorStep(top_k=anchor_k):
-                kw = keyword_query(query)
-                if kw:
-                    bm25_plan = from_preset("fast", top_k=anchor_k, rerank=False)
-                    requests.append(RetrievalRequest(query=kw, plan_override=bm25_plan))
-                    traces.append({
-                        "kind": "action", "label": "BM25Anchor",
-                        "content": f"kw={kw[:60]}",
-                    })
+                reqs, t = bm25_anchor_expand(query=query, top_k=anchor_k)
+                requests.extend(reqs)
+                traces.extend(t)
 
     return requests, traces
-
-
-# ── Fetch ────────────────────────────────────────────────
-
-
-async def _fetch_all(
-    requests: list[RetrievalRequest],
-    *,
-    default_config: ExecutionPlan,
-    project_id: str,
-    http_client: httpx.AsyncClient,
-    settings: Settings,
-) -> list[ChunkResult]:
-    """Fetch all retrieval requests in parallel, merge results."""
-    if not requests:
-        return []
-
-    if len(requests) == 1:
-        req = requests[0]
-        return await safe_retrieve(
-            req.query, req.plan_override or default_config,
-            project_id=project_id, http_client=http_client, settings=settings,
-        )
-
-    results = await asyncio.gather(*(
-        safe_retrieve(
-            req.query, req.plan_override or default_config,
-            project_id=project_id, http_client=http_client, settings=settings,
-        )
-        for req in requests
-    ))
-    return merge_chunks(list(results))
 
 
 # ── Loop helpers ─────────────────────────────────────────
@@ -268,33 +225,27 @@ def _loop_expand(
     is_factoid: bool,
     retrieval_plan: ExecutionPlan | None,
 ) -> tuple[list[RetrievalRequest], list[dict[str, Any]]]:
-    """Produce retrieval requests for the next loop iteration."""
+    """Dispatch loop-expand steps to leaf functions, collect requests."""
     requests: list[RetrievalRequest] = []
     traces: list[dict[str, Any]] = []
 
     for step in steps:
         match step:
             case TwoPassStep(min_unique_sources=min_src):
-                n_unique = unique_source_count(chunks)
-                if n_unique < min_src:
-                    hints = extract_hint_terms(chunks, max_terms=3)
-                    if hints:
-                        follow_up = f"{query} {' '.join(hints)}"
-                        plan = retrieval_plan or from_preset("hybrid", top_k=10, rerank=True)
-                        requests.append(RetrievalRequest(query=follow_up, plan_override=plan))
-                        traces.append({
-                            "kind": "action", "label": "TwoPass",
-                            "content": f"Only {n_unique} unique sources, follow-up query queued",
-                        })
+                reqs, t = two_pass_expand(
+                    query=query, chunks=chunks,
+                    min_unique_sources=min_src,
+                    retrieval_plan=retrieval_plan,
+                )
+                requests.extend(reqs)
+                traces.extend(t)
 
             case FactoidExpandStep():
-                if is_factoid and chunks:
-                    expand_plan = from_preset("fast", top_k=5, rerank=False)
-                    requests.append(RetrievalRequest(query=query, plan_override=expand_plan))
-                    traces.append({
-                        "kind": "action", "label": "FactoidExpand",
-                        "content": "Expanding within top sources",
-                    })
+                reqs, t = factoid_expand(
+                    query=query, chunks=chunks, is_factoid=is_factoid,
+                )
+                requests.extend(reqs)
+                traces.extend(t)
 
     return requests, traces
 

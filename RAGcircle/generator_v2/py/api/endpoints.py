@@ -20,7 +20,7 @@ from fastapi.responses import StreamingResponse
 
 from api.presets import AGENT_PRESET_BUILDERS, agent, retry_round, simple
 from config import Settings
-from engine.pipeline import run_pipeline
+from engine.brain_pipeline import run_pipeline
 from clients.llm import LLMClient
 from models import (
     AgentRequest,

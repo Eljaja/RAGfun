@@ -18,7 +18,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from engine.pipeline import run_pipeline
+from engine.brain_pipeline import run_pipeline
 from models import PipelineResult, PlanRunRequest, PlanRunResponse
 from models.events import DoneEvent, InitEvent, TokenEvent, TraceEvent
 
