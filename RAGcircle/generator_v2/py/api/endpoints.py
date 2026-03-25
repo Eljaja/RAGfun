@@ -11,14 +11,12 @@ import asyncio
 import dataclasses
 import json
 import logging
-import random
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
-import tiktoken
 
 from api.presets import AGENT_PRESET_BUILDERS, agent, retry_round, simple
 from config import Settings
@@ -49,7 +47,7 @@ def _event_to_dict(event: Event) -> dict[str, Any]:
 
 
 def _sse(payload: dict[str, Any]) -> str:
-    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    return f"data: {json.dumps(payload)}\n\n"
 
 
 def _pipeline_kwargs(request: Request) -> dict[str, Any]:
@@ -75,38 +73,21 @@ def _done_event(result: PipelineResult, *, trace_id: str = "") -> DoneEvent:
 
 
 def _stream_answer(
-    result: PipelineResult, *, trace_id: str, include_traces: bool = False,
+    result: PipelineResult, *, trace_id: str, chunk_size: int = 40,
 ) -> AsyncIterator[str]:
     """Stream traces, then the answer as token events, then a done event."""
     async def _generate() -> AsyncIterator[str]:
-        rng = random.Random(trace_id)
-        encoding = tiktoken.get_encoding("o200k_base")
-
         yield _sse(_event_to_dict(InitEvent(trace_id=trace_id)))
 
-        if include_traces:
-            for trace in result.traces:
-                ev = TraceEvent(**trace)
-                d = _event_to_dict(ev)
-                d["trace_id"] = trace_id
-                yield _sse(d)
+        for trace in result.traces:
+            ev = TraceEvent(**trace)
+            d = _event_to_dict(ev)
+            d["trace_id"] = trace_id
+            yield _sse(d)
 
-        token_ids = encoding.encode(result.answer)
-        i = 0
-        chunk_index = 0
-        while i < len(token_ids):
-            token_count = rng.choices([1, 2, 3, 4], weights=[0.2, 0.45, 0.25, 0.1], k=1)[0]
-            chunk = encoding.decode(token_ids[i : i + token_count])
-            i += token_count
-            chunk_index += 1
-
-            # Smooth token cadence with subtle punctuation pauses.
-            delay = rng.uniform(0.010, 0.026)
-            if chunk.rstrip().endswith((".", "!", "?")):
-                delay += rng.uniform(0.018, 0.055)
-            await asyncio.sleep(delay)
-
-            d = _event_to_dict(TokenEvent(content=chunk))
+        text = result.answer
+        for i in range(0, len(text), chunk_size):
+            d = _event_to_dict(TokenEvent(content=text[i:i + chunk_size]))
             d["trace_id"] = trace_id
             yield _sse(d)
 
@@ -195,7 +176,7 @@ async def chat_stream(body: ChatRequest, request: Request):
                 yield _sse({"type": "error", "error": "no_pipeline_result", "trace_id": trace_id})
                 return
 
-            async for chunk in _stream_answer(result, trace_id=trace_id, include_traces=False):
+            async for chunk in _stream_answer(result, trace_id=trace_id):
                 if await request.is_disconnected():
                     return
                 yield chunk
@@ -335,7 +316,7 @@ async def agent_stream(body: AgentRequest, request: Request):
                     timeout=60.0,
                 )
 
-            async for chunk in _stream_answer(result, trace_id=trace_id, include_traces=False):
+            async for chunk in _stream_answer(result, trace_id=trace_id):
                 if await request.is_disconnected():
                     return
                 yield chunk
@@ -380,7 +361,7 @@ async def execute_plan(body: ExecuteRequest, request: Request):
                 ),
                 timeout=120.0,
             )
-            async for chunk in _stream_answer(result, trace_id=trace_id, include_traces=True):
+            async for chunk in _stream_answer(result, trace_id=trace_id):
                 yield chunk
         except asyncio.TimeoutError:
             yield _sse({"type": "error", "error": "request_timeout", "trace_id": trace_id})
