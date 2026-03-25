@@ -13,8 +13,8 @@ class Settings(BaseSettings):
     #llm_base_url: str = "https://llm.c.singularitynet.io/v1"
     llm_base_url: str = "https://llm.k8s.naint.tech/v1"
     # llm_model: str = "openai/gpt-oss-120b"
-    #llm_api_key: str = "sk-FQ0o8MR5WWeLgqCTP_cZSxtpL8xbpopVCTFxSs5GQk0"
-    llm_api_key: str = "sk-CPiJH0s39hRf3jGuCR4rIZe-wavqT5ehVPfI5Q7GIbQ"
+    #llm_api_key: str = ""
+    llm_api_key: str = ""
     llm_model:str =  "qwen/qwen-coder-3b-instruct"
     llm_timeout: float = 60.0
 
