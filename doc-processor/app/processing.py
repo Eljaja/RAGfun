@@ -28,11 +28,15 @@ class FileProcessor(ABC):
         raise NotImplementedError
 
 
+class NonVLMProcessor(FileProcessor):
+    """Base class for processors that do not call the VLM endpoint."""
+
+
 # ---------------------------------------------------------------------------
 # Concrete strategies for the most common formats
 # ---------------------------------------------------------------------------
 
-class TextProcessor(FileProcessor):
+class TextProcessor(NonVLMProcessor):
     """Plain‑text (or UTF‑8) files.
 
     The raw bytes are decoded directly. If decoding fails we fall back to the
@@ -116,7 +120,7 @@ class DocxProcessor(FileProcessor):
         return await pdf_processor.to_text(pdf_bytes, filename, norm_ct)
 
 
-class XMLProcessor(FileProcessor):
+class XMLProcessor(NonVLMProcessor):
     """XML/HTML files – processed without the VLM.
     """
 
@@ -127,7 +131,7 @@ class XMLProcessor(FileProcessor):
         return ed.pages_text, ed.content_type or content_type
 
 
-class DefaultProcessor(FileProcessor):
+class DefaultProcessor(NonVLMProcessor):
     """Catch‑all fallback – uses the generic non‑VLM extractor.
     """
 

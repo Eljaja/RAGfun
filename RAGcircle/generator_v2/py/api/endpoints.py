@@ -1,4 +1,4 @@
-"""FastAPI routers for /chat, /agent, /agent/stream, /execute.
+"""FastAPI routers for /chat, /chat/stream, /agent, /agent/stream, /execute.
 
 The pipeline returns a PipelineResult. Endpoints own:
 - retry logic (calling run_pipeline again with a new plan)
@@ -137,6 +137,69 @@ async def chat(body: ChatRequest, request: Request):
         chunks_used=len(result.chunks),
         retries_used=retries_used,
         query=body.query,
+    )
+
+
+# ── /chat/stream (SSE) ───────────────────────────────────
+
+@chat_router.post("/chat/stream")
+async def chat_stream(body: ChatRequest, request: Request):
+    settings: Settings = request.app.state.settings
+    trace_id = uuid.uuid4().hex
+    plan = simple(
+        preset=body.preset,
+        top_k=body.top_k,
+        rerank=body.rerank,
+        reflection_enabled=body.reflection_enabled and settings.reflection_enabled,
+    )
+    kwargs = _pipeline_kwargs(request)
+
+    async def event_stream() -> AsyncIterator[str]:
+        try:
+            result: PipelineResult | None = None
+            retries_used = 0
+
+            for attempt in range(1 + body.max_retries):
+                result = await asyncio.wait_for(
+                    run_pipeline(
+                        plan,
+                        project_id=body.project_id, query=body.query,
+                        include_sources=True, **kwargs,
+                    ),
+                    timeout=120.0,
+                )
+                if not result.needs_retry or attempt >= body.max_retries:
+                    break
+                retries_used += 1
+
+            if result is None:
+                yield _sse({"type": "error", "error": "no_pipeline_result", "trace_id": trace_id})
+                return
+
+            async for chunk in _stream_answer(result, trace_id=trace_id):
+                if await request.is_disconnected():
+                    return
+                yield chunk
+
+        except asyncio.TimeoutError:
+            yield _sse({"type": "error", "error": "request_timeout", "trace_id": trace_id})
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.exception("Chat stream error")
+            try:
+                yield _sse({"type": "error", "error": str(exc), "trace_id": trace_id})
+            except Exception:
+                pass
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

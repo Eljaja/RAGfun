@@ -310,7 +310,7 @@ services:
   # vLLM (OpenAI-compatible) hosting Granite-Docling VLM. Single GPU: 0; multi-GPU: 0 or 1
   vllm-docling:
     image: vllm/vllm-openai:latest
-    command: ["--model", "ibm-granite/granite-docling-258M", "--port", "8123"]
+    command: ["--model", "ibm-granite/granite-docling-258M", "--port", "8123", "--gpu-memory-utilization", "${VLLM_DOCLING_GPU_UTIL:-0.82}", "--max-model-len", "${VLLM_DOCLING_MAX_MODEL_LEN:-4096}"]
     ports:
       - "8124:8123"
     volumes:
@@ -448,7 +448,7 @@ services:
       - GATE_RABBIT_URL=amqp://${RABBITMQ_DEFAULT_USER:-guest}:${RABBITMQ_DEFAULT_PASS:-guest}@rabbitmq:5672/
       - GATE_RABBIT_QUEUE=ingestion.tasks
       # LLM (OpenAI-compatible). Keep mock as default to avoid requiring a key by default.
-      - GATE_LLM_PROVIDER=${GATE_LLM_PROVIDER:-openai_compat}
+      - GATE_LLM_PROVIDER=${GATE_LLM_PROVIDER:-mock}
       - GATE_LLM_BASE_URL=${GATE_LLM_BASE_URL:-https://inference.asicloud.cudos.org/v1}
       - GATE_LLM_MODEL=${GATE_LLM_MODEL:-openai/gpt-oss-120bt}
       - GATE_LLM_API_KEY=${GATE_LLM_API_KEY:-}

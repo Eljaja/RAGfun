@@ -5,6 +5,8 @@ import sys
 
 from pythonjsonlogger import jsonlogger
 
+logger = logging.getLogger("processor")
+
 
 def setup_json_logging(level: str = "INFO") -> None:
     root = logging.getLogger()

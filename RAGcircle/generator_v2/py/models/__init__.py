@@ -49,15 +49,17 @@ from models.plan import (
     RetrievalResult,
     Verdict,
 )
-from models.api import (
+from generator_contract import (
     AgentRequest,
     AgentResponse,
     ChatRequest,
     ChatResponse,
+    SearchFilters,
+)
+from models.api import (
     ExecuteRequest,
     PlanRunRequest,
     PlanRunResponse,
-    SearchFilters,
 )
 from models.assessment import AssessmentResult, ReflectionResult
 from models.events import (

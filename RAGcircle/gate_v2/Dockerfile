@@ -9,14 +9,17 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 WORKDIR /app
 
+# Path dependencies required by pyproject.toml
+COPY retrieval_contract/ /retrieval_contract/
+COPY generator_contract/ /generator_contract/
+
 # --- Dependency layer (cached) ---
-# Copy only lock + manifest so this layer is rebuilt only when deps change
-COPY pyproject.toml uv.lock ./
+COPY gate_v2/pyproject.toml gate_v2/uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-install-project
 
 # --- Source layer ---
-COPY py/ .
+COPY gate_v2/py/ .
 
 EXPOSE 8912
 CMD ["uv", "run", "python", "main.py"]

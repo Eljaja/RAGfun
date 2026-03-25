@@ -28,6 +28,13 @@ from auth import UserCreds, authenticated
 from projects import authorize_project
 from settings import Constants
 
+from retrieval_contract import RetrieveRequest as RetrievalServiceRequest, RetrieveResponse
+from generator_contract import (
+    AgentRequest,
+    AgentResponse,
+    ChatRequest as SimpleChatRequest,
+    ChatResponse as SimpleChatResponse,
+)
 
 from ops_bucket import create_collection
 
@@ -558,79 +565,155 @@ async def get_document_info(
     return ev
 
 
-class RetrieveRequest(BaseModel):
-    query: str
-    top_k: int = 5
-    rerank: bool = True
-    strategy: str = "hybrid"
-
-
-class ChatRequestBody(BaseModel):
-    query: str
-    top_k: int = 5
-    rerank: bool = True
-    strategy: str = "hybrid"
-    max_retries: int = 1
-    reflection_enabled: bool = True
-
-
 @protected_router.post("/v1/projects/{project_id}/retrieve")
 async def retrieve_documents(
     project_id: str,
-    body: RetrieveRequest,
+    body: RetrievalServiceRequest,
     user: UserCreds = Depends(authenticated),
     project_db: ProjectDB = Depends(get_project_db),
     settings: Settings = Depends(get_settings),
     client: httpx.AsyncClient = Depends(get_http_client),
 ):
-    await authorize_project(project_db, project_id, user.user_id)
+    await authorize_project(user, project_id, project_db)
 
+    request = RetrievalServiceRequest(project_id=project_id, **body.model_dump(exclude={"project_id"}))
     resp = await client.post(
         f"{settings.retrieval_url}/retrieve",
-        json={
-            "project_id": project_id,
-            "query": body.query,
-            "top_k": body.top_k,
-            "rerank": body.rerank,
-            "strategy": body.strategy,
-        },
+        json=request.model_dump(),
     )
 
     if resp.status_code != 200:
         raise HTTPException(status_code=502, detail="Retrieval service error")
 
-    return resp.json()
+    return RetrieveResponse.model_validate(resp.json())
 
 
 @protected_router.post("/v1/projects/{project_id}/chat")
 async def chat_with_documents(
     project_id: str,
-    body: ChatRequestBody,
+    body: AgentRequest,
     user: UserCreds = Depends(authenticated),
     project_db: ProjectDB = Depends(get_project_db),
     settings: Settings = Depends(get_settings),
     client: httpx.AsyncClient = Depends(get_http_client),
 ):
-    await authorize_project(project_db, project_id, user.user_id)
+    """Full agent pipeline: plan, expand, retrieve, generate, evaluate."""
+    await authorize_project(user, project_id, project_db)
 
+    payload = body.model_dump(exclude={"project_id"})
+    payload["project_id"] = project_id
     resp = await client.post(
-        f"{settings.generator_url}/chat",
-        json={
-            "project_id": project_id,
-            "query": body.query,
-            "top_k": body.top_k,
-            "rerank": body.rerank,
-            "strategy": body.strategy,
-            "max_retries": body.max_retries,
-            "reflection_enabled": body.reflection_enabled,
-        },
+        f"{settings.generator_url}/agent",
+        json=payload,
     )
 
     if resp.status_code != 200:
         raise HTTPException(status_code=502, detail="Generator service error")
 
-    return resp.json()
+    return AgentResponse.model_validate(resp.json())
 
+
+@protected_router.post("/v1/projects/{project_id}/chat/stream")
+async def chat_stream(
+    project_id: str,
+    body: AgentRequest,
+    user: UserCreds = Depends(authenticated),
+    project_db: ProjectDB = Depends(get_project_db),
+    settings: Settings = Depends(get_settings),
+    client: httpx.AsyncClient = Depends(get_http_client),
+):
+    """Streaming agent pipeline via SSE passthrough."""
+    await authorize_project(user, project_id, project_db)
+
+    payload = body.model_dump(exclude={"project_id"})
+    payload["project_id"] = project_id
+
+    async def event_proxy():
+        async with client.stream(
+            "POST",
+            f"{settings.generator_url}/agent/stream",
+            json=payload,
+            timeout=120.0,
+        ) as upstream:
+            if upstream.status_code != 200:
+                yield f"data: {{\"type\": \"error\", \"error\": \"generator returned {upstream.status_code}\"}}\n\n"
+                return
+            async for line in upstream.aiter_lines():
+                yield line + "\n"
+
+    return StreamingResponse(
+        event_proxy(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@protected_router.post("/v1/projects/{project_id}/simple-chat")
+async def simple_chat(
+    project_id: str,
+    body: SimpleChatRequest,
+    user: UserCreds = Depends(authenticated),
+    project_db: ProjectDB = Depends(get_project_db),
+    settings: Settings = Depends(get_settings),
+    client: httpx.AsyncClient = Depends(get_http_client),
+):
+    """Simple chat: retrieve + generate, with optional reflection."""
+    await authorize_project(user, project_id, project_db)
+
+    payload = body.model_dump(exclude={"project_id"})
+    payload["project_id"] = project_id
+    resp = await client.post(
+        f"{settings.generator_url}/chat",
+        json=payload,
+    )
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail="Generator service error")
+
+    return SimpleChatResponse.model_validate(resp.json())
+
+
+@protected_router.post("/v1/projects/{project_id}/simple-chat/stream")
+async def simple_chat_stream(
+    project_id: str,
+    body: SimpleChatRequest,
+    user: UserCreds = Depends(authenticated),
+    project_db: ProjectDB = Depends(get_project_db),
+    settings: Settings = Depends(get_settings),
+    client: httpx.AsyncClient = Depends(get_http_client),
+):
+    """Streaming simple chat via SSE passthrough."""
+    await authorize_project(user, project_id, project_db)
+
+    payload = body.model_dump(exclude={"project_id"})
+    payload["project_id"] = project_id
+
+    async def event_proxy():
+        async with client.stream(
+            "POST",
+            f"{settings.generator_url}/chat/stream",
+            json=payload,
+            timeout=120.0,
+        ) as upstream:
+            if upstream.status_code != 200:
+                yield f"data: {{\"type\": \"error\", \"error\": \"generator returned {upstream.status_code}\"}}\n\n"
+                return
+            async for line in upstream.aiter_lines():
+                yield line + "\n"
+
+    return StreamingResponse(
+        event_proxy(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 
@@ -654,4 +737,4 @@ app.include_router(public_router)
 app.include_router(protected_router)
 
 
-uvicorn.run(app=app, port=8913, host="localhost")
+uvicorn.run(app=app, port=8917, host="localhost")
