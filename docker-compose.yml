@@ -311,10 +311,10 @@ services:
       - rag-network
       - presign_rustfs-net
 
-  # vLLM (OpenAI-compatible) hosting Qwen3-VL-8B-Instruct. Single GPU: 0; multi-GPU: 0 or 1
+  # vLLM (OpenAI-compatible) hosting Granite-Docling. Single GPU: 0; multi-GPU: 0 or 1
   vllm-docling:
     image: vllm/vllm-openai:latest
-    command: ["--model", "Qwen/Qwen3-VL-8B-Instruct", "--port", "8123", "--gpu-memory-utilization", "${VLLM_DOCLING_GPU_UTIL:-0.82}", "--max-model-len", "${VLLM_DOCLING_MAX_MODEL_LEN:-4096}"]
+    command: ["--model", "ibm-granite/granite-docling-258M", "--port", "8123"]
     ports:
       - "8124:8123"
     volumes:
@@ -332,7 +332,7 @@ services:
               device_ids: ["${NVIDIA_DEVICE_VLLM:-0}"]
               capabilities: [gpu]
 
-  # Document Processor Service (pulls files from document-storage, uses Qwen3-VL via vLLM, indexes into retrieval)
+  # Document Processor Service (pulls files from document-storage, prefers PDF text layers and falls back to OCR)
   doc-processor:
     build:
       context: ./doc-processor
@@ -352,7 +352,11 @@ services:
       - PROCESSOR_VLM_BASE_URL=http://vllm-docling:8123/v1
       # Optional auth (if your VLM endpoint needs it):
       # - PROCESSOR_VLM_API_KEY=...
-      - PROCESSOR_VLM_MODEL=Qwen/Qwen3-VL-8B-Instruct
+      - PROCESSOR_VLM_MODEL=ibm-granite/granite-docling-258M
+      - PROCESSOR_OCR_ENABLED=true
+      - PROCESSOR_OCR_LANG=en
+      - PROCESSOR_OCR_DEVICE=cpu
+      - PROCESSOR_PDF_TEXT_MIN_CHARS=80
       # Extraction quality knobs (QUALITY)
       - PROCESSOR_VLM_TIMEOUT_S=180
       - PROCESSOR_MAX_PAGES=35

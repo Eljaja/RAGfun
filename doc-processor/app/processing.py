@@ -4,11 +4,13 @@ import asyncio
 from abc import ABC, abstractmethod
 from typing import List, Tuple
 
-from app.clients import VLMClient
+from app.clients import OCRClient
 from app.extraction import (
+    count_meaningful_chars,
+    extract_pdf_text_layer,
     extract_text_non_vlm,
     normalize_to_pdf,
-    pdf_to_page_pngs,
+    pdf_pages_to_pngs,
 )
 from app.logging_setup import logger
 
@@ -56,68 +58,73 @@ class TextProcessor(NonVLMProcessor):
             return ed.pages_text, ed.content_type or content_type
 
 
-class PDFProcessor(FileProcessor):
-    """PDF files – processed via the VLM (OCR) path.
+class OCRPDFProcessor(FileProcessor):
+    """PDF-like documents processed with text-layer extraction first, OCR second."""
 
-    The raw bytes are already a PDF, so we skip the ``normalize_to_pdf`` step.
-    """
-
-    def __init__(self, vlm: VLMClient, settings):
-        self.vlm = vlm
+    def __init__(self, ocr: OCRClient | None, settings):
+        self.ocr = ocr
         self.settings = settings
+        self.last_path = "pdf_text"
+
+    async def _extract_pdf_pages(self, pdf_bytes: bytes) -> List[str]:
+        pages_text = extract_pdf_text_layer(pdf_bytes, max_pages=self.settings.max_pages)
+        if not pages_text:
+            return []
+
+        if self.ocr is None:
+            return pages_text
+
+        ocr_indices = [
+            i for i, text in enumerate(pages_text) if count_meaningful_chars(text) < self.settings.pdf_text_min_chars
+        ]
+        if not ocr_indices:
+            return pages_text
+
+        rendered_pages = pdf_pages_to_pngs(
+            pdf_bytes,
+            page_indices=ocr_indices,
+            max_side_px=self.settings.max_image_side_px,
+        )
+        sem = asyncio.Semaphore(1)
+
+        async def run_one(i: int, png_bytes: bytes) -> Tuple[int, str]:
+            async with sem:
+                text, _score = await asyncio.to_thread(self.ocr.page_to_text, png_bytes=png_bytes)
+                return i, text
+
+        results = await asyncio.gather(*(run_one(i, png) for i, png in rendered_pages), return_exceptions=True)
+        improved = False
+        for result in results:
+            if isinstance(result, Exception):
+                logger.warning("ocr_page_failed", extra={"extra": {"error": str(result)}})
+                continue
+            i, text = result
+            if count_meaningful_chars(text) > count_meaningful_chars(pages_text[i]):
+                pages_text[i] = text
+                improved = True
+        if improved:
+            self.last_path = "ocr"
+        return pages_text
 
     async def to_text(
         self, raw: bytes, filename: str, content_type: str | None
     ) -> Tuple[List[str], str | None]:
-        # Render PDF pages to PNGs.
-        pngs = pdf_to_page_pngs(
-            raw,
-            max_pages=self.settings.max_pages,
-            max_side_px=self.settings.max_image_side_px,
-        )
-        pages = len(pngs)
-        if pages == 0:
-            return [], content_type
-
-        async def one(i: int, b: bytes) -> Tuple[int, str]:
-            t = await self.vlm.page_to_text(png_bytes=b)
-            return i, t
-
-        sem = asyncio.Semaphore(4)
-
-        async def run_one(i: int, b: bytes):
-            async with sem:
-                return await one(i, b)
-
-        results = await asyncio.gather(
-            *(run_one(i, b) for i, b in enumerate(pngs)), return_exceptions=True
-        )
-        pages_text: List[str] = ["" for _ in range(pages)]
-        for r in results:
-            if isinstance(r, Exception):
-                raise r
-            i, t = r
-            if t:
-                pages_text[i] = t
+        pages_text = await self._extract_pdf_pages(raw)
         return pages_text, content_type or "application/pdf"
 
 
-class DocxProcessor(FileProcessor):
-    """DOC/DOCX (and similar office formats) – first converted to PDF, then VLM.
+class DocxProcessor(OCRPDFProcessor):
+    """DOC/DOCX (and similar office formats) – convert to PDF, then apply PDF routing.
     """
-
-    def __init__(self, vlm: VLMClient, settings):
-        self.vlm = vlm
-        self.settings = settings
 
     async def to_text(
         self, raw: bytes, filename: str, content_type: str | None
     ) -> Tuple[List[str], str | None]:
-        # Convert to PDF using the existing helper.
         pdf_bytes, norm_ct = normalize_to_pdf(raw, content_type, filename)
-        # Re‑use the PDFProcessor logic.
-        pdf_processor = PDFProcessor(self.vlm, self.settings)
-        return await pdf_processor.to_text(pdf_bytes, filename, norm_ct)
+        if not pdf_bytes:
+            return [], norm_ct or content_type
+        pages_text = await self._extract_pdf_pages(pdf_bytes)
+        return pages_text, norm_ct
 
 
 class XMLProcessor(NonVLMProcessor):
@@ -156,16 +163,10 @@ def get_processor(state, content_type: str | None, filename: str) -> FileProcess
     if ext in {"txt", "md", "csv", "log"}:
         return TextProcessor()
     if ext == "pdf":
-        return PDFProcessor(state.vlm, state.settings)
+        return OCRPDFProcessor(state.ocr, state.settings)
     if ext in {"doc", "docx", "odt", "rtf"}:
-        return DocxProcessor(state.vlm, state.settings)
+        return DocxProcessor(state.ocr, state.settings)
     if ext in {"xml", "html", "htm"}:
         return XMLProcessor()
-    # Anything else – try the VLM path if we can convert to PDF, otherwise fallback.
-    try:
-        _ = normalize_to_pdf(b"", content_type, filename)  # type: ignore[arg-type]
-        # If conversion is possible we use the generic VLM processor.
-        return PDFProcessor(state.vlm, state.settings)
-    except Exception:
-        return DefaultProcessor()
+    return DefaultProcessor()
 

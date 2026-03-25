@@ -220,6 +220,53 @@ def pdf_to_page_pngs(pdf_bytes: bytes, *, max_pages: int, max_side_px: int) -> l
     return out
 
 
+def pdf_pages_to_pngs(
+    pdf_bytes: bytes,
+    *,
+    page_indices: list[int],
+    max_side_px: int,
+) -> list[tuple[int, bytes]]:
+    """Render specific PDF pages to PNG bytes using PyMuPDF."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    out: list[tuple[int, bytes]] = []
+    for i in page_indices:
+        if i < 0 or i >= doc.page_count:
+            continue
+        page = doc.load_page(i)
+        rect = page.rect
+        max_side = max(rect.width, rect.height)
+        zoom = max_side_px / max_side if max_side > 0 else 1.0
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        out.append((i, pix.tobytes("png")))
+    return out
+
+
+def extract_pdf_text_layer(pdf_bytes: bytes, *, max_pages: int) -> list[str]:
+    """Extract an existing PDF text layer without OCR."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    out: list[str] = []
+    n = min(doc.page_count, max_pages)
+    for i in range(n):
+        page = doc.load_page(i)
+        text = (page.get_text("text") or "").strip()
+        if not text:
+            blocks = []
+            for block in page.get_text("blocks") or []:
+                if len(block) >= 5:
+                    value = str(block[4] or "").strip()
+                    if value:
+                        blocks.append(value)
+            text = "\n".join(blocks).strip()
+        out.append(text)
+    return out
+
+
+def count_meaningful_chars(text: str) -> int:
+    """Count alphanumeric characters to distinguish real text from sparse noise."""
+    return sum(1 for ch in text if ch.isalnum())
+
+
 def extract_text_non_vlm(raw: bytes, content_type: str | None, filename: str | None) -> ExtractedDocument:
     """
     Fast extraction for XML/plain text without VLM.

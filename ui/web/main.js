@@ -78,6 +78,10 @@ async function gateRequest(path, opts = {}) {
   return data;
 }
 
+async function getDocumentStatus(docId) {
+  return gateRequest(`/documents/${encodeURIComponent(docId)}/status`);
+}
+
 async function ensureProject(project_id) {
   const id = (project_id || "").trim() || "default";
   try {
@@ -432,7 +436,7 @@ function setUploadBusy(busy, text) {
   const statusEl = document.getElementById("upload_status");
   if (text) {
     statusEl.textContent = text;
-    statusEl.className = "status" + (text.includes("Error") ? " error" : text.includes("OK") ? " success" : "");
+    statusEl.className = "status" + (text.includes("Error") ? " error" : (text.includes("OK") || text.includes("Indexed")) ? " success" : "");
   } else {
     statusEl.textContent = "";
     statusEl.className = "status";
@@ -507,7 +511,16 @@ function renderDocuments(docs) {
 
   container.innerHTML = docs
     .map(
-      doc => `
+      doc => {
+        const ing = doc && doc.extra && doc.extra.ingestion ? doc.extra.ingestion : null;
+        const st = ing && ing.state ? String(ing.state) : "";
+        const result = ing && ing.result && typeof ing.result === "object" ? ing.result : null;
+        const processingPath = result && result.processing_path ? String(result.processing_path) : "";
+        const stage = ing && ing.stage ? String(ing.stage) : "";
+        const pages = result && typeof result.pages === "number" ? result.pages : null;
+        const chunks = result && typeof result.chunks === "number" ? result.chunks : null;
+        const degraded = result && Array.isArray(result.degraded) ? result.degraded.filter(Boolean) : [];
+        return `
     <div class="doc-item">
       <div class="doc-header">
         <div style="flex: 1;">
@@ -517,14 +530,13 @@ function renderDocuments(docs) {
         <div class="badges">
           ${doc.storage_id ? '<span class="badge stored">Stored</span>' : ""}
           ${(() => {
-            const ing = doc && doc.extra && doc.extra.ingestion ? doc.extra.ingestion : null;
-            const st = ing && ing.state ? String(ing.state) : "";
             if (st === "queued") return '<span class="badge queued">Queued</span>';
             if (st === "processing") return '<span class="badge processing">Processing</span>';
             if (st === "retrying") return '<span class="badge queued">Retrying</span>';
             if (st === "failed") return '<span class="badge failed">Error</span>';
             return doc.indexed ? '<span class="badge indexed">Indexed</span>' : '<span class="badge not-indexed">Not indexed</span>';
           })()}
+          ${processingPath ? `<span class="badge">${escapeHtml(processingPath)}</span>` : ""}
         </div>
       </div>
       <div class="doc-meta">
@@ -535,13 +547,47 @@ function renderDocuments(docs) {
         ${doc.stored_at ? `<span style="margin-left: 12px;">Uploaded: ${new Date(doc.stored_at).toLocaleString("en-US")}</span>` : ""}
       </div>
       ${doc.tags && doc.tags.length ? `<div class="doc-meta">Tags: ${doc.tags.map(t => escapeHtml(t)).join(", ")}</div>` : ""}
+      ${ing ? `
+        <div class="doc-meta">
+          Ingestion: ${escapeHtml(st || "unknown")}
+          ${stage ? ` | stage: ${escapeHtml(stage)}` : ""}
+          ${processingPath ? ` | path: ${escapeHtml(processingPath)}` : ""}
+          ${pages !== null ? ` | pages: ${pages}` : ""}
+          ${chunks !== null ? ` | chunks: ${chunks}` : ""}
+        </div>
+      ` : ""}
+      ${degraded.length ? `<div class="doc-meta">Degraded: ${degraded.map(v => escapeHtml(String(v))).join(", ")}</div>` : ""}
       <div class="doc-meta" style="margin-top: 10px;">
+        <button class="btn btn-secondary" data-action="check-status" data-doc-id="${escapeHtml(doc.doc_id)}">Check status</button>
         <button class="btn btn-danger" data-action="delete-doc" data-doc-id="${escapeHtml(doc.doc_id)}">Delete</button>
       </div>
     </div>
   `
+      }
     )
     .join("");
+
+  container.querySelectorAll('[data-action="check-status"]').forEach(btn => {
+    btn.addEventListener("click", async e => {
+      const docId = e.currentTarget.getAttribute("data-doc-id");
+      if (!docId) return;
+      try {
+        e.currentTarget.disabled = true;
+        const status = await getDocumentStatus(docId);
+        const meta = status && status.metadata ? status.metadata : null;
+        const matchIdx = docsState.items.findIndex(d => d && d.doc_id === docId);
+        if (matchIdx >= 0 && meta) {
+          docsState.items[matchIdx] = meta;
+          docsState.items[matchIdx].indexed = !!status.indexed;
+        }
+        renderDocuments(docsState.items);
+        updateDocsMeta();
+      } catch (err) {
+        e.currentTarget.disabled = false;
+        alert(`Status check failed: ${err.message}`);
+      }
+    });
+  });
 
   // Wire delete buttons (event delegation)
   container.querySelectorAll('[data-action="delete-doc"]').forEach(btn => {
@@ -563,6 +609,22 @@ function renderDocuments(docs) {
       }
     });
   });
+}
+
+async function pollDocumentStatus(docId, { timeoutMs = 180000, intervalMs = 3000 } = {}) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const status = await getDocumentStatus(docId);
+    const ing = status && status.ingestion ? status.ingestion : null;
+    const state = ing && ing.state ? String(ing.state) : "";
+    const stage = ing && ing.stage ? String(ing.stage) : "";
+    const result = ing && ing.result && typeof ing.result === "object" ? ing.result : null;
+    const path = result && result.processing_path ? String(result.processing_path) : "";
+    if (state === "done") return { state, stage, path, status };
+    if (state === "failed") return { state, stage, path, status };
+    await new Promise(resolve => setTimeout(resolve, intervalMs));
+  }
+  throw new Error("status_poll_timeout");
 }
 
 function formatStatsPairs(items, maxItems) {
@@ -1189,6 +1251,15 @@ if (uploadBtn) uploadBtn.addEventListener("click", async () => {
     // Show the actually used doc_id (useful when input was empty and we auto-generated it)
     if (data && data.accepted && data.task_id) {
       setUploadBusy(false, `Queued | task_id=${data.task_id} | doc_id=${doc_id}`);
+      try {
+        const polled = await pollDocumentStatus(doc_id);
+        const extras = [];
+        if (polled.path) extras.push(`path=${polled.path}`);
+        if (polled.stage) extras.push(`stage=${polled.stage}`);
+        setUploadBusy(false, `Indexed | doc_id=${doc_id}${extras.length ? ` | ${extras.join(" | ")}` : ""}`);
+      } catch (pollErr) {
+        setUploadBusy(false, `Queued | task_id=${data.task_id} | doc_id=${doc_id} | refresh docs to inspect progress`);
+      }
     } else {
       setUploadBusy(false, `OK | doc_id=${doc_id}`);
     }
@@ -1196,8 +1267,10 @@ if (uploadBtn) uploadBtn.addEventListener("click", async () => {
     if (docIdEl) docIdEl.value = randId();
     // Optional UX: clear file input so the next upload is explicit
     if (fileEl) fileEl.value = "";
-    // Refresh document list
-    loadDocuments();
+    // Refresh document list from the first page so the new status is visible.
+    docsState.offset = 0;
+    docsState.hasMore = true;
+    await loadDocuments();
     // Refresh collections list (new collection might appear)
     loadCollections();
   } catch (e) {

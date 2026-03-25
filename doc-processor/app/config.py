@@ -19,11 +19,17 @@ class Settings(BaseSettings):
     retrieval_url: AnyHttpUrl = Field(default="http://retrieval:8080")
     retrieval_timeout_s: float = 60.0
 
-    # VLM (vLLM OpenAI-compatible)
+    # VLM (kept for compatibility while OCR-first ingestion is rolled out)
     vlm_base_url: AnyHttpUrl = Field(default="http://vllm-docling:8123/v1")
     vlm_api_key: SecretStr | None = None
-    vlm_model: str = "Qwen/Qwen3-VL-8B-Instruct"
+    vlm_model: str = "ibm-granite/granite-docling-258M"
     vlm_timeout_s: float = 120.0
+
+    # OCR
+    ocr_enabled: bool = True
+    ocr_lang: str = "en"
+    ocr_device: str = "cpu"
+    pdf_text_min_chars: int = 80
 
     # Limits
     max_pages: int = 25
@@ -44,6 +50,12 @@ class Settings(BaseSettings):
                 "model": self.vlm_model,
                 "api_key_set": self.vlm_api_key is not None,
                 "timeout_s": self.vlm_timeout_s,
+            },
+            "ocr": {
+                "enabled": self.ocr_enabled,
+                "lang": self.ocr_lang,
+                "device": self.ocr_device,
+                "pdf_text_min_chars": self.pdf_text_min_chars,
             },
             "limits": {
                 "max_pages": self.max_pages,

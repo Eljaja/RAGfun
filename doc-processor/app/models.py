@@ -51,6 +51,7 @@ class ProcessResponse(BaseModel):
     ok: bool
     doc_id: str
     content_type: str | None = None
+    processing_path: str | None = None
     pages: int | None = None
     extracted_chars: int | None = None
     chunks: int | None = None

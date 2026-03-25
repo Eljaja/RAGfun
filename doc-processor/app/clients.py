@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import tempfile
 from typing import Any
 from urllib.parse import quote
 
@@ -109,6 +110,57 @@ class VLMClient:
         except Exception:
             logger.error("vlm_unexpected_response", extra={"extra": {"keys": list(j.keys())}})
             raise RuntimeError("vlm_unexpected_response")
+
+
+class OCRClient:
+    """Thin wrapper around PaddleOCR's general OCR pipeline."""
+
+    def __init__(self, *, lang: str, device: str) -> None:
+        try:
+            from paddleocr import PaddleOCR  # type: ignore
+        except Exception as exc:  # pragma: no cover - depends on optional runtime install
+            raise RuntimeError("paddleocr_not_installed") from exc
+
+        kwargs = {
+            "lang": lang,
+            "device": device,
+            "use_doc_orientation_classify": False,
+            "use_doc_unwarping": False,
+            "use_textline_orientation": False,
+        }
+        if str(device).startswith("cpu"):
+            # PaddleOCR 3.4 + PaddlePaddle 3.3 on CPU currently behaves more reliably
+            # with the conservative backend settings below.
+            kwargs["enable_hpi"] = False
+            kwargs["enable_mkldnn"] = False
+            kwargs["cpu_threads"] = 4
+
+        self._engine = PaddleOCR(**kwargs)
+
+    def page_to_text(self, *, png_bytes: bytes) -> tuple[str, float | None]:
+        with tempfile.NamedTemporaryFile(suffix=".png") as tmp:
+            tmp.write(png_bytes)
+            tmp.flush()
+            results = self._engine.predict(tmp.name)
+
+        texts: list[str] = []
+        scores: list[float] = []
+        for item in results or []:
+            payload = getattr(item, "json", item)
+            if not isinstance(payload, dict):
+                continue
+            res = payload.get("res") if isinstance(payload.get("res"), dict) else payload
+            rec_texts = res.get("rec_texts") or []
+            rec_scores = res.get("rec_scores") or []
+            texts.extend(str(t).strip() for t in rec_texts if str(t).strip())
+            for score in rec_scores:
+                try:
+                    scores.append(float(score))
+                except Exception:
+                    continue
+
+        avg_score = (sum(scores) / len(scores)) if scores else None
+        return ("\n".join(texts).strip(), avg_score)
 
 
 

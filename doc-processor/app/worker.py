@@ -133,6 +133,7 @@ async def handle_index(
             "updated_at": now,
             "stage": "skipped",
             "result": {
+                "processing_path": resp.get("processing_path"),
                 "pages": resp.get("pages"),
                 "chunks": resp.get("chunks"),
                 "partial": resp.get("partial"),
@@ -161,7 +162,13 @@ async def handle_index(
         "attempt": attempt,
         "updated_at": now,
         "stage": "indexed",
-        "result": {"pages": resp.get("pages"), "chunks": resp.get("chunks"), "partial": resp.get("partial"), "degraded": resp.get("degraded")},
+        "result": {
+            "processing_path": resp.get("processing_path"),
+            "pages": resp.get("pages"),
+            "chunks": resp.get("chunks"),
+            "partial": resp.get("partial"),
+            "degraded": resp.get("degraded"),
+        },
     }
     await _patch_ingestion(storage, doc_id=doc_id, ingestion=ingestion)
 

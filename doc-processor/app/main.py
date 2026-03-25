@@ -8,11 +8,11 @@ from fastapi import FastAPI, Request, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
 from app.chunking import chunk_by_strategy
-from app.clients import RetrievalClient, StorageClient, VLMClient
+from app.clients import OCRClient, RetrievalClient, StorageClient
 from app.config import Settings, load_settings
 from app.logging_setup import setup_json_logging
 from app.models import ChunkMeta, Locator, ProcessRequest, ProcessResponse
-from app.processing import get_processor, NonVLMProcessor
+from app.processing import NonVLMProcessor, get_processor
 
 logger = logging.getLogger("processor")
 
@@ -54,7 +54,7 @@ PROCESSOR_EXTRACTED_CHARS = Histogram(
 )
 
 # Pre-create common label series so Grafana panels show 0 instead of "No data" right after startup.
-for _p in ("vlm", "non_vlm", "skipped_duplicate"):
+for _p in ("pdf_text", "ocr", "non_vlm", "duplicate_detected"):
     PROCESSOR_PATH.labels(_p).inc(0)
 PROCESSOR_PARTIAL.labels(endpoint="/v1/process").inc(0)
 
@@ -63,7 +63,7 @@ class AppState:
     config_error: str | None = None
     storage: StorageClient | None = None
     retrieval: RetrievalClient | None = None
-    vlm: VLMClient | None = None
+    ocr: OCRClient | None = None
 
 
 state = AppState()
@@ -83,12 +83,12 @@ async def lifespan(app: FastAPI):
     setup_json_logging(state.settings.log_level)
     state.storage = StorageClient(base_url=str(state.settings.storage_url), timeout_s=state.settings.storage_timeout_s)
     state.retrieval = RetrievalClient(base_url=str(state.settings.retrieval_url), timeout_s=state.settings.retrieval_timeout_s)
-    state.vlm = VLMClient(
-        base_url=str(state.settings.vlm_base_url),
-        api_key=state.settings.vlm_api_key.get_secret_value() if state.settings.vlm_api_key else None,
-        model=state.settings.vlm_model,
-        timeout_s=state.settings.vlm_timeout_s,
-    )
+    if state.settings.ocr_enabled:
+        try:
+            state.ocr = OCRClient(lang=state.settings.ocr_lang, device=state.settings.ocr_device)
+        except Exception as exc:
+            state.ocr = None
+            logger.warning("ocr_init_failed", extra={"extra": {"error": str(exc)}})
     yield
 
 
@@ -143,7 +143,7 @@ async def readyz(response: Response):
     if state.config_error:
         response.status_code = 503
         return {"ready": False, "config_error": state.config_error}
-    ready = state.storage is not None and state.retrieval is not None and state.vlm is not None
+    ready = state.storage is not None and state.retrieval is not None
     if not ready:
         response.status_code = 503
     return {"ready": ready}
@@ -170,8 +170,6 @@ async def process(req: ProcessRequest):
     assert state.settings is not None
     assert state.storage is not None
     assert state.retrieval is not None
-    assert state.vlm is not None
-
     doc_id = req.document.doc_id
 
     degraded: list[str] = []
@@ -207,6 +205,7 @@ async def process(req: ProcessRequest):
 
     # Choose processing strategy based on file type
     processor = get_processor(state, content_type, filename)
+    processing_path = "non_vlm" if isinstance(processor, NonVLMProcessor) else getattr(processor, "last_path", "pdf_text")
     try:
         pages_text, norm_ct = await processor.to_text(raw, filename, content_type)
         # Update content_type with any normalization performed
@@ -214,10 +213,13 @@ async def process(req: ProcessRequest):
         pages = len(pages_text) if pages_text is not None else None
         # Record which path was taken for metrics
         if isinstance(processor, NonVLMProcessor):
-            degraded.append("vlm_skipped")
             PROCESSOR_PATH.labels("non_vlm").inc()
         else:
-            PROCESSOR_PATH.labels("vlm").inc()
+            path = getattr(processor, "last_path", "pdf_text")
+            processing_path = path
+            PROCESSOR_PATH.labels(path).inc()
+            if path == "ocr":
+                degraded.append("ocr_used")
         # If no text was extracted, return an error similar to the original behaviour
         if not pages_text or all(not t.strip() for t in pages_text):
             REQS.labels(endpoint="/v1/process", status="400").inc()
@@ -225,6 +227,7 @@ async def process(req: ProcessRequest):
                 ok=False,
                 doc_id=doc_id,
                 content_type=norm_ct,
+                processing_path=processing_path,
                 pages=pages,
                 error="empty_text",
                 detail="No text extracted from document",
@@ -232,17 +235,18 @@ async def process(req: ProcessRequest):
                 degraded=degraded,
             )
     except Exception as e:
-        # Any exception during VLM processing is considered a degradation.
-        degraded.append("vlm_page_failed")
-        partial = True
         logger.warning("processing_failed", extra={"extra": {"doc_id": doc_id, "error": str(e)}})
-        # Fallback to non‑VLM processor
-        fallback = NonVLMProcessor()
-        pages_text, norm_ct = await fallback.to_text(raw, filename, content_type)
-        content_type = norm_ct or content_type
-        pages = len(pages_text) if pages_text else None
-        degraded.append("vlm_skipped")
-        PROCESSOR_PATH.labels("non_vlm").inc()
+        REQS.labels(endpoint="/v1/process", status="500").inc()
+        return ProcessResponse(
+            ok=False,
+            doc_id=doc_id,
+            content_type=content_type,
+            processing_path=processing_path,
+            error="processing_failed",
+            detail=str(e),
+            partial=partial,
+            degraded=degraded,
+        )
 
     # Build chunks (preserve page in locator when we have pages)
     chunks: list[ChunkMeta] = []
@@ -280,6 +284,7 @@ async def process(req: ProcessRequest):
             ok=True,
             doc_id=doc_id,
             content_type=content_type,
+            processing_path=processing_path,
             pages=pages,
             extracted_chars=extracted_chars,
             chunks=0,
@@ -312,6 +317,7 @@ async def process(req: ProcessRequest):
             ok=False,
             doc_id=doc_id,
             content_type=content_type,
+            processing_path=processing_path,
             pages=pages,
             extracted_chars=extracted_chars,
             chunks=len(chunks),
@@ -336,6 +342,7 @@ async def process(req: ProcessRequest):
         ok=True,
         doc_id=doc_id,
         content_type=content_type,
+        processing_path=processing_path,
         pages=pages,
         extracted_chars=extracted_chars,
         chunks=len(chunks),
