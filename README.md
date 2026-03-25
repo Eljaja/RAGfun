@@ -7,7 +7,7 @@ An experimental multi-service RAG (Retrieval-Augmented Generation) stack for exp
 This repository implements a full-featured RAG system with:
 
 - **Hybrid Retrieval**: Combines BM25 (sparse) and dense vector search with Reciprocal Rank Fusion (RRF)
-- **VLM-Powered Document Processing**: Uses Vision-Language Models (Granite-Docling) for accurate document-to-text extraction
+- **VLM-Powered Document Processing**: Uses Vision-Language Models (Qwen3-VL-8B-Instruct) for accurate document-to-text extraction
 - **Stateless Microservices**: Horizontally scalable services with clear separation of concerns
 - **Agent-Search**: LLM-driven retrieval (plan, HyDE, fact queries, retry)
 - **Full ODS Tenant Isolation**: API key based tenant enforcement in Gate, agent-search, deep-research, and UI
@@ -137,7 +137,7 @@ The system consists of **8 microservices** organized into application, ML, and i
 #### ML/Embedding Services
 - **infinity** (`:7997`) - BAAI/bge-m3 multilingual embeddings (1024-dim, 100+ languages)
 - **infinity-rerank** (`:7998`) - BAAI/bge-reranker-v2-m3 cross-encoder reranking
-- **vllm-docling** (`:8123`) - IBM Granite-Docling-258M VLM for document extraction
+- **vllm-docling** (`:8123`) - Qwen3-VL-8B-Instruct VLM for document extraction
 - **vllm-ministral-router** (`:8112`) - Optional query router for auto-tuning retrieval
 
 #### Infrastructure
@@ -191,7 +191,7 @@ See **[docs/AGENT_SEARCH.md](./docs/AGENT_SEARCH.md)** for API reference and con
 ## Current Direction
 
 - Hybrid retrieval (BM25 + vectors) with RRF fusion
-- VLM-based document extraction (Granite-Docling)
+- VLM-based document extraction (Qwen3-VL-8B-Instruct)
 - SOTA: semantic chunking, contextual headers, local reranker
 - Multi-query, two-pass retrieval, reranking
 - Observability: Prometheus, Grafana, structured logging
@@ -486,7 +486,7 @@ Services that scale horizontally:
 | Dense Retrieval | Qdrant (HNSW) |
 | Embeddings | BAAI/bge-m3 (1024-dim, multilingual) |
 | Reranking | BAAI/bge-reranker-v2-m3 |
-| VLM (OCR) | IBM Granite-Docling-258M |
+| VLM (OCR) | Qwen/Qwen3-VL-8B-Instruct |
 | Database | Postgres 16 |
 | Object Storage | RustFS (S3-compatible) |
 | Message Queue | RabbitMQ |
@@ -547,7 +547,7 @@ This is primarily a research and experimentation project. If you're interested i
 Built with:
 - [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) - Multilingual embeddings
 - [BAAI/bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3) - Reranking model
-- [IBM Granite-Docling](https://huggingface.co/ibm-granite/granite-docling) - Document VLM
+- [Qwen3-VL-8B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct) - Document VLM
 - [OpenSearch](https://opensearch.org/) - Search and analytics
 - [Qdrant](https://qdrant.tech/) - Vector database
 - [FastAPI](https://fastapi.tiangolo.com/) - Modern Python web framework

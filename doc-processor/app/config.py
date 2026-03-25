@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     # VLM (vLLM OpenAI-compatible)
     vlm_base_url: AnyHttpUrl = Field(default="http://vllm-docling:8123/v1")
     vlm_api_key: SecretStr | None = None
-    vlm_model: str = "ibm-granite/granite-docling-258M"
+    vlm_model: str = "Qwen/Qwen3-VL-8B-Instruct"
     vlm_timeout_s: float = 120.0
 
     # Limits

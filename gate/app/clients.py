@@ -265,7 +265,7 @@ class LLMClient:
         assert self._base_url is not None
         assert self._api_key is not None
         headers = {"Authorization": f"Bearer {self._api_key}"}
-        payload = {"model": self._model, "messages": messages, "temperature": 0.2}
+        payload = {"model": self._model, "messages": messages, "temperature": 0.0}
         async with httpx.AsyncClient(timeout=self._timeout_s) as client:
             r = await client.post(f"{self._base_url}/chat/completions", json=payload, headers=headers)
             r.raise_for_status()
@@ -287,7 +287,7 @@ class LLMClient:
         assert self._api_key is not None
 
         headers = {"Authorization": f"Bearer {self._api_key}"}
-        payload = {"model": self._model, "messages": messages, "temperature": 0.2, "stream": True}
+        payload = {"model": self._model, "messages": messages, "temperature": 0.0, "stream": True}
         async with httpx.AsyncClient(timeout=self._timeout_s) as client:
             async with client.stream("POST", f"{self._base_url}/chat/completions", json=payload, headers=headers) as r:
                 r.raise_for_status()

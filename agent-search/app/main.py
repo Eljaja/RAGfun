@@ -897,16 +897,34 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient, *, gate_h
 
     if _can_llm():
         AGENT_LLM_CALLS.labels(stage="assess").inc()
-        assessment = await _assess_answer_completeness(
-            client,
-            llm_base,
-            llm_model,
-            llm_key,
-            payload.query,
-            full_answer,
-            timeout_s=llm_timeout,
-            history=hist,
-        )
+        try:
+            assessment = await _assess_answer_completeness(
+                client,
+                llm_base,
+                llm_model,
+                llm_key,
+                payload.query,
+                full_answer,
+                timeout_s=llm_timeout,
+                history=hist,
+            )
+        except (asyncio.TimeoutError, httpx.TimeoutException):
+            # Assessment is optional; keep the answer and skip retry logic if it times out.
+            assessment = {"incomplete": False, "missing_terms": [], "reason": "assess_timeout"}
+            yield {
+                "type": "trace",
+                "kind": "thought",
+                "label": "Assess",
+                "content": "Completeness check timed out. Returning current answer.",
+            }
+        except Exception as exc:
+            assessment = {"incomplete": False, "missing_terms": [], "reason": f"assess_error:{type(exc).__name__}"}
+            yield {
+                "type": "trace",
+                "kind": "thought",
+                "label": "Assess",
+                "content": "Completeness check failed. Returning current answer.",
+            }
     else:
         assessment = {"incomplete": False, "missing_terms": [], "reason": "max_llm_calls"}
 
@@ -1215,17 +1233,19 @@ async def agent_stream(request: Request, payload: AgentRequest):
                     stream_error = "request_timeout"
                     yield f"data: {json.dumps(_with_trace_id({'type': 'error', 'error': 'request_timeout'}, trace_id))}\n\n"
                 except Exception as exc:
-                    stream_error = str(exc)
+                    msg = str(exc).strip() or f"{type(exc).__name__}"
+                    stream_error = msg
                     logger.exception("agent stream error")
-                    yield f"data: {json.dumps(_with_trace_id({'type': 'error', 'error': str(exc)}, trace_id))}\n\n"
+                    yield f"data: {json.dumps(_with_trace_id({'type': 'error', 'error': msg}, trace_id))}\n\n"
         except asyncio.CancelledError:
             stream_error = "client_disconnected"
         except Exception as exc:
             # Catch-all: ensure stream doesn't silently close (UI would spin forever)
-            stream_error = str(exc)
+            msg = str(exc).strip() or f"{type(exc).__name__}"
+            stream_error = msg
             logger.exception("agent stream fatal error")
             try:
-                yield f"data: {json.dumps(_with_trace_id({'type': 'error', 'error': str(exc)}, trace_id))}\n\n"
+                yield f"data: {json.dumps(_with_trace_id({'type': 'error', 'error': msg}, trace_id))}\n\n"
             except Exception:
                 # If we can't write to the client (already disconnected), just exit.
                 pass

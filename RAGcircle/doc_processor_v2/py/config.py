@@ -39,7 +39,7 @@ class AppConfig(BaseSettings):
     # ── VLM ──────────────────────────────────────────────────────────────
     vlm_base_url: str = "http://localhost:8123"
     vlm_api_key: str | None = None
-    vlm_model: str = "ibm-granite/granite-docling-258M"
+    vlm_model: str = "Qwen/Qwen3-VL-8B-Instruct"
     vlm_timeout: float = 120.0
 
     # ── Processing ───────────────────────────────────────────────────────

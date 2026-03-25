@@ -39,6 +39,7 @@ function initOdsApiKeyUI() {
 }
 
 const STORAGE_API_PREFIX = "/storage-api/api/v1";
+const GATE_API_PREFIX = "/api/v1";
 
 function getPrimaryProjectId() {
   const selected = getSelectedValues("files_collections");
@@ -58,6 +59,17 @@ function getChatProjectId() {
 
 async function storageRequest(path, opts = {}) {
   const r = await fetch(`${STORAGE_API_PREFIX}${path}`, opts);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const msg = (data && (data.detail || data.error || data.message)) || `HTTP ${r.status}`;
+    throw new Error(msg);
+  }
+  return data;
+}
+
+async function gateRequest(path, opts = {}) {
+  const headers = { ...buildOdsAuthHeaders(), ...(opts.headers || {}) };
+  const r = await fetch(`${GATE_API_PREFIX}${path}`, { ...opts, headers });
   const data = await r.json().catch(() => ({}));
   if (!r.ok) {
     const msg = (data && (data.detail || data.error || data.message)) || `HTTP ${r.status}`;
@@ -291,61 +303,30 @@ async function uploadDoc({ file, doc_id, title, uri, source, lang, tags, project
   if (source) fd.append("source", source);
   if (lang) fd.append("lang", lang);
   if (tags) fd.append("tags", tags);
+  if (project_id) fd.append("project_id", project_id);
   fd.append("refresh", "false");
-  const pid = (project_id || "").trim() || "default";
-  await ensureProject(pid);
-  return storageRequest(`/projects/${encodeURIComponent(pid)}/upload`, { method: "POST", body: fd });
+  return gateRequest("/documents/upload", { method: "POST", body: fd });
 }
 
 async function listDocuments() {
   const limit = docsState.limit;
   const offset = docsState.offset;
-  const pid = getPrimaryProjectId();
+  const filters = buildChatFilters();
   const q = new URLSearchParams();
   q.set("limit", String(limit));
   q.set("offset", String(offset));
-  return storageRequest(`/projects/${encodeURIComponent(pid)}/documents?${q.toString()}`);
+  if (filters && Array.isArray(filters.project_ids) && filters.project_ids.length) {
+    q.set("project_ids", filters.project_ids.join(","));
+  }
+  return gateRequest(`/documents?${q.toString()}`);
 }
 
 async function fetchDocumentStats() {
-  const limit = 1000;
-  let offset = 0;
-  let all = [];
-  const pid = getPrimaryProjectId();
-  while (all.length < limit) {
-    const batch = await storageRequest(`/projects/${encodeURIComponent(pid)}/documents?limit=100&offset=${offset}`);
-    const docs = (batch && batch.documents) || [];
-    all = all.concat(docs);
-    if (docs.length < 100) break;
-    offset += docs.length;
-  }
-  const by_source = {};
-  const by_lang = {};
-  let bytes = 0;
-  for (const d of all) {
-    const src = d && d.source ? String(d.source) : "unknown";
-    by_source[src] = (by_source[src] || 0) + 1;
-    const lg = d && d.lang ? String(d.lang) : "unknown";
-    by_lang[lg] = (by_lang[lg] || 0) + 1;
-    bytes += Number(d && d.size ? d.size : 0) || 0;
-  }
-  return {
-    ok: true,
-    total: all.length,
-    bytes,
-    indexed_available: false,
-    indexed: 0,
-    not_indexed: 0,
-    ingestion: { queued: 0, processing: 0, retrying: 0, failed: 0, completed: 0, unknown: all.length },
-    by_content_type: {},
-    by_source,
-    by_lang,
-    by_collection: { [pid]: all.length },
-  };
+  return gateRequest("/documents/stats");
 }
 
 async function deleteDoc(doc_id) {
-  return storageRequest(`/documents/${encodeURIComponent(doc_id)}`, { method: "DELETE" });
+  return gateRequest(`/documents/${encodeURIComponent(doc_id)}`, { method: "DELETE" });
 }
 
 async function deleteAllDocs() {

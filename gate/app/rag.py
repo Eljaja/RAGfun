@@ -144,8 +144,10 @@ def build_messages(
     sys = {
         "role": "system",
         "content": (
-            "You are a RAG assistant. Always answer in the same language as the question. "
-            "Use the provided context, and if it is insufficient, say so plainly. "
+            "You are a precise RAG assistant. Always answer in the same language as the question. "
+            "Use only the provided context and prioritize extractive answers (facts directly present in context). "
+            "Be concrete and concise, avoid hedging. "
+            "If context is insufficient, explicitly say which key fact is missing and ask for a more specific question. "
             "Do not fabricate facts."
         ),
     }
