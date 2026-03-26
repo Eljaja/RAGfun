@@ -71,9 +71,15 @@ async def run_retrieval(
 ) -> RetrievalResult:
     """Run the full retrieval pipeline, return chunks + traces."""
     traces: list[dict[str, Any]] = []
-    default_config = meta.retrieval_plan or from_preset(
+
+    # TODO: think about this one 
+    # I think we should be able to merge plans if they are the same 
+    # ah shi
+    if not meta.retrieval_plan:
+        meta.retrieval_plan = from_preset(
         default_preset, top_k=default_top_k, rerank=default_rerank,
     )
+    default_config = meta.retrieval_plan
 
     # -- Initial expand: original query + expand-step queries
     requests = [RetrievalRequest(query=query)]
@@ -172,6 +178,7 @@ async def _initial_expand(
                     retrieval_plan=meta.retrieval_plan,
                     llm=llm, model=model,
                 )
+                logger.warning(f" this is a raw JSON SEemingly {queries} {t}")
                 requests.extend(RetrievalRequest(query=q) for q in queries)
                 traces.extend(t)
 

@@ -122,7 +122,9 @@ services:
       rustfs:
         condition: service_started
     restart: unless-stopped
-
+#
+#deploy:
+#  replicas: 3
   doc-processor:
     build:
       context: ./doc_processor_v2
@@ -207,6 +209,34 @@ services:
   #     - infinity-cache:/app/.cache
   #   profiles: [inference]
   #   restart: unless-stopped
+
+  vllm-docling:
+    image: vllm/vllm-openai:latest
+    command:
+      - "--model"
+      - "ibm-granite/granite-docling-258M"
+      - "--port"
+      - "8123"
+      - "--gpu-memory-utilization"
+      - "${VLLM_DOCLING_GPU_UTIL:-0.82}"
+      - "--max-model-len"
+      - "${VLLM_DOCLING_MAX_MODEL_LEN:-4096}"
+    ports:
+      - "127.0.0.1:8124:8123"
+    environment:
+      - HF_HOME=/root/.cache/huggingface
+      - NVIDIA_VISIBLE_DEVICES=0
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    profiles: [inference]
+    restart: unless-stopped
 
 volumes:
   pgdata:

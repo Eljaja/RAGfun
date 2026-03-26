@@ -86,6 +86,7 @@ def from_llm_plan(
     raw_k = int(plan_dict.get("top_k") or 10)
     top_k = max(top_k_min, min(top_k_max, raw_k))
     rerank = bool(plan_dict.get("rerank", True))
+    # TODO: change the misleading method cause this is very bad actually
     return from_preset("hybrid", top_k=top_k, rerank=rerank)
 
 

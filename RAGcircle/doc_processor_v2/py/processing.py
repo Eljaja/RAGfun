@@ -140,6 +140,9 @@ class PDFDocument:
                 text = await self.vlm.page_to_text(png_bytes=png_bytes)
                 return (idx, text)
 
+        # now this is a thing for guard or some other limiter for requests 
+        # this way we risk to overload the poor vllm engine 
+        # need to think about smol scaling pipeline 
         tasks = [extract_one(i, png) for i, png in enumerate(pngs)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 

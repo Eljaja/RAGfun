@@ -40,7 +40,7 @@ class BrainRound(BaseModel):
     retrieval: RetrievalPlan = Field(default_factory=RetrievalPlan)
     generate: GenerateStep = Field(default_factory=GenerateStep)
     evaluate: list[EvalStep] = Field(default_factory=list)
-    max_llm_calls: int = Field(default=12, ge=1, le=100)
+    max_llm_calls: int = Field(default=20, ge=1, le=100)
 
     @model_validator(mode="after")
     def _validate_structure(self):

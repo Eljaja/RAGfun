@@ -299,6 +299,7 @@ class LLMClient:
             model, messages,
             temperature=temperature, response_format=response_format,
         )
+        
         return parse_json(raw)
 
     async def complete_model(

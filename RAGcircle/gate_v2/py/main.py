@@ -185,6 +185,31 @@ async def health_check():
 # ----------------------------
 # Project Endpoints
 # ----------------------------
+"""
+## Bug: Project-level chunk_size never reaches doc_processor
+
+### Problem
+The `ProjectCreate` API accepts `chunk_size` and `chunk_overlap`, and they are stored in the DB.
+However, the `Project` dataclass in `gate_v2/py/database_ops.py` does not include these fields.
+`to_dict()` therefore never serializes them, so they are never written into S3 object metadata.
+
+In `doc_processor_v2/py/pipeline.py:38`:
+    chunk_size = int(project.get("chunk_size", settings.chunk_size_chars))
+
+`project.get("chunk_size")` is always None, so it always falls back to `settings.chunk_size_chars`,
+which comes from the .env `CHUNK_SIZE_CHARS` (currently 5000).
+
+### Fix
+1. Add chunk_size, chunk_overlap, embedding_model, language, llm_model to:
+   - Project dataclass fields (database_ops.py)
+   - Project.from_row()
+   - Project.to_dict()
+2. Set CHUNK_SIZE_CHARS in doc_processor .env to a sensible fallback (e.g. 1024 or 1500).
+
+### Impact
+All documents processed so far used chunk_size=5000 regardless of project settings.
+Re-indexing may be needed after the fix.
+"""
 
 @protected_router.post("/v1/projects")
 async def create_project(
@@ -384,7 +409,7 @@ async def upload(
         bucket=settings.bucket_name,
         request_stream=file_stream(),
         content_type=content_type,
-        max_bytes=1 * 1024 * 1024,
+        max_bytes=10 * 1024 * 1024, # TODO add an .env var
         storage_prefix=storage_prefix,
         doc_id=doc_id,
         # TODO: fix mixed up pydantic and dataclasses
