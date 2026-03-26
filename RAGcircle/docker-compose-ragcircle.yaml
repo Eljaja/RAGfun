@@ -122,7 +122,9 @@ services:
       rustfs:
         condition: service_started
     restart: unless-stopped
-
+#
+#deploy:
+#  replicas: 3
   doc-processor:
     build:
       context: ./doc_processor_v2

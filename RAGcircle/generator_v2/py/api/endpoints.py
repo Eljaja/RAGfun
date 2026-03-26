@@ -47,7 +47,7 @@ def _event_to_dict(event: Event) -> dict[str, Any]:
 
 
 def _sse(payload: dict[str, Any]) -> str:
-    return f"data: {json.dumps(payload)}\n\n"
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
 def _pipeline_kwargs(request: Request) -> dict[str, Any]:
