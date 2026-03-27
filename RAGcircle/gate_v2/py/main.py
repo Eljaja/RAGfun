@@ -49,12 +49,16 @@ class ProjectCreate(BaseModel):
     name: str
     description: str | None = None
     # Immutable after creation — changing these requires re-indexing all docs
-    embedding_model: str = "intfloat/multilingual-e5-base"
+    embedding_model: str = "BAAI/bge-m3"
     chunk_size: int = 512
     chunk_overlap: int = 64
     language: str = "ru"
     # Mutable — can be changed freely
-    llm_model: str = "gemma-3-12b"
+    llm_model: str = "openai/gpt-oss-120b"
+
+class ProjectCreateTemp(BaseModel):
+    name: str
+    description: str | None = None
 
 
 class ProjectUpdate(BaseModel):
@@ -258,13 +262,15 @@ Re-indexing may be needed after the fix.
 
 @protected_router.post("/v1/projects")
 async def create_project(
-    payload: ProjectCreate,
+    payload: ProjectCreateTemp,
     user: UserCreds = Depends(authenticated),
     settings: Settings = Depends(get_settings),
     project_db: ProjectDB = Depends(get_project_db),
     qdrant: QdrantStore = Depends(get_qdrant),
     opensearch: BM25Store = Depends(get_opensearch)
 ):
+
+    payload = ProjectCreate(**payload.model_dump())
     """Create a new project (enforces max limit per user)."""
     if settings.stub_auth_enabled:
         project = await project_db.ensure_project(
@@ -506,7 +512,7 @@ async def upload(
         bucket=settings.bucket_name,
         request_stream=file_stream(),
         content_type=content_type,
-        max_bytes=10 * 1024 * 1024, # TODO add an .env var
+        max_bytes=20 * 1024 * 1024, # TODO add an .env var
         storage_prefix=storage_prefix,
         doc_id=doc_id,
         # TODO: fix mixed up pydantic and dataclasses
@@ -687,32 +693,31 @@ async def get_document_info(
     return ev
 
 
-@protected_router.post("/v1/projects/{project_id}/retrieve")
-async def retrieve_documents(
-    project_id: str,
-    body: RetrievalServiceRequest,
-    user: UserCreds = Depends(authenticated),
-    settings: Settings = Depends(get_settings),
-    project_db: ProjectDB = Depends(get_project_db),
-    client: httpx.AsyncClient = Depends(get_http_client),
-):
-    await authorize_project(user, project_id, project_db)
+# @protected_router.post("/v1/projects/{project_id}/retrieve")
+# async def retrieve_documents(
+#     project_id: str,
+#     body: RetrievalServiceRequest,
+#     user: UserCreds = Depends(authenticated),
+#     project_db: ProjectDB = Depends(get_project_db),
+#     settings: Settings = Depends(get_settings),
+#     client: httpx.AsyncClient = Depends(get_http_client),
+# ):
+#     await authorize_project(user, project_id, project_db)
 
-    request = RetrievalServiceRequest(project_id=project_id, **body.model_dump(exclude={"project_id"}))
-    resp = await client.post(
-        f"{settings.retrieval_url}/retrieve",
-        json=request.model_dump(),
-    )
+#     request = RetrievalServiceRequest(project_id=project_id, **body.model_dump(exclude={"project_id"}))
+#     resp = await client.post(
+#         f"{settings.retrieval_url}/retrieve",
+#         json=request.model_dump(),
+#     )
 
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail="Retrieval service error")
+#     if resp.status_code != 200:
+#         raise HTTPException(status_code=502, detail="Retrieval service error")
 
-    return RetrieveResponse.model_validate(resp.json())
+#     return RetrieveResponse.model_validate(resp.json())
 
 
-@protected_router.post("/v1/projects/{project_id}/chat")
+@protected_router.post("/v1/chat")
 async def chat_with_documents(
-    project_id: str,
     body: AgentRequest,
     user: UserCreds = Depends(authenticated),
     settings: Settings = Depends(get_settings),
@@ -720,10 +725,9 @@ async def chat_with_documents(
     client: httpx.AsyncClient = Depends(get_http_client),
 ):
     """Full agent pipeline: plan, expand, retrieve, generate, evaluate."""
-    await authorize_project(user, project_id, project_db)
+    await authorize_project(user, body.project_id, project_db)
 
-    payload = body.model_dump(exclude={"project_id"})
-    payload["project_id"] = project_id
+    payload = body.model_dump()
     resp = await client.post(
         f"{settings.generator_url}/agent",
         json=payload,
@@ -735,9 +739,8 @@ async def chat_with_documents(
     return AgentResponse.model_validate(resp.json())
 
 
-@protected_router.post("/v1/projects/{project_id}/chat/stream")
+@protected_router.post("/v1/chat/stream")
 async def chat_stream(
-    project_id: str,
     body: AgentRequest,
     user: UserCreds = Depends(authenticated),
     project_db: ProjectDB = Depends(get_project_db),
@@ -745,11 +748,9 @@ async def chat_stream(
     client: httpx.AsyncClient = Depends(get_http_client),
 ):
     """Streaming agent pipeline via SSE passthrough."""
-    await authorize_project(user, project_id, project_db)
+    await authorize_project(user, body.project_id, project_db)
 
-    payload = body.model_dump(exclude={"project_id"})
-    payload["project_id"] = project_id
-
+    payload = body.model_dump()
     async def event_proxy():
         async with client.stream(
             "POST",
@@ -774,9 +775,8 @@ async def chat_stream(
     )
 
 
-@protected_router.post("/v1/projects/{project_id}/simple-chat")
+@protected_router.post("/v1/simple-chat")
 async def simple_chat(
-    project_id: str,
     body: SimpleChatRequest,
     user: UserCreds = Depends(authenticated),
     project_db: ProjectDB = Depends(get_project_db),
@@ -784,10 +784,9 @@ async def simple_chat(
     client: httpx.AsyncClient = Depends(get_http_client),
 ):
     """Simple chat: retrieve + generate, with optional reflection."""
-    await authorize_project(user, project_id, project_db)
+    await authorize_project(user, body.project_id, project_db)
 
-    payload = body.model_dump(exclude={"project_id"})
-    payload["project_id"] = project_id
+    payload = body.model_dump()
     resp = await client.post(
         f"{settings.generator_url}/chat",
         json=payload,
@@ -799,9 +798,9 @@ async def simple_chat(
     return SimpleChatResponse.model_validate(resp.json())
 
 
-@protected_router.post("/v1/projects/{project_id}/simple-chat/stream")
+@protected_router.post("/v1/simple-chat/stream")
 async def simple_chat_stream(
-    project_id: str,
+    # project_id: str,
     body: SimpleChatRequest,
     user: UserCreds = Depends(authenticated),
     project_db: ProjectDB = Depends(get_project_db),
@@ -809,10 +808,9 @@ async def simple_chat_stream(
     client: httpx.AsyncClient = Depends(get_http_client),
 ):
     """Streaming simple chat via SSE passthrough."""
-    await authorize_project(user, project_id, project_db)
+    await authorize_project(user, body.project_id, project_db)
 
-    payload = body.model_dump(exclude={"project_id"})
-    payload["project_id"] = project_id
+    payload = body.model_dump()
 
     async def event_proxy():
         async with client.stream(
