@@ -33,6 +33,10 @@ _DEFAULT_PLAN_DICT: dict[str, Any] = {
 _FALLBACK = ("hybrid", from_preset("hybrid", top_k=10, rerank=True))
 
 
+# TODO 
+# method is too opinionated in fact
+# so what would be nice is to secure the structure of dsl more and make some steps 
+# compulsory 
 async def configure(
     steps: list[ConfigStep],
     *,

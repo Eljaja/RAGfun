@@ -206,7 +206,10 @@ async def _initial_expand(
 
 # ── Loop helpers ─────────────────────────────────────────
 
-
+# TODO
+# implement actual methods that would work here 
+# and do the outline on the paper pls 
+# what steps we have and how do they connect 
 def _should_continue(
     checks: list[QualityCheckStep],
     *,
