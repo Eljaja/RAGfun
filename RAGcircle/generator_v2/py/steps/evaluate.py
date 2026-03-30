@@ -107,7 +107,7 @@ async def _reflect(
         chunks,
         max_chars=settings.max_context_chars,
         max_chunk_chars=settings.max_chunk_chars,
-        source_meta=source_meta,
+        # source_meta=source_meta,
     )
 
     try:

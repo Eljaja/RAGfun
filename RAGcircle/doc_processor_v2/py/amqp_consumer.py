@@ -178,7 +178,13 @@ async def handle_incoming_message(
     # Main pipeline
     logger.debug("Processing event: %s/%s", info.bucket, info.key)
     try:
-        await handle_s3_event(info=info, s3_client=s3_client, deps=deps)
+        await handle_s3_event(
+            info=info,
+            s3_client=s3_client,
+            deps=deps,
+            attempt=retry_count,
+            max_attempts=len(retry_levels),
+        )
         await message.ack()
         return
     except NonRetryableError as e:

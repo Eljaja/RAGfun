@@ -75,7 +75,7 @@ def _done_event(result: PipelineResult, *, trace_id: str = "") -> DoneEvent:
 
 
 def _stream_answer(
-    result: PipelineResult, *, trace_id: str,
+    result: PipelineResult, *, trace_id: str, include_traces: bool = False,
 ) -> AsyncIterator[str]:
     """Stream traces, then the answer as token events, then a done event."""
     async def _generate() -> AsyncIterator[str]:
@@ -84,11 +84,12 @@ def _stream_answer(
 
         yield _sse(_event_to_dict(InitEvent(trace_id=trace_id)))
 
-        for trace in result.traces:
-            ev = TraceEvent(**trace)
-            d = _event_to_dict(ev)
-            d["trace_id"] = trace_id
-            yield _sse(d)
+        if include_traces:
+            for trace in result.traces:
+                ev = TraceEvent(**trace)
+                d = _event_to_dict(ev)
+                d["trace_id"] = trace_id
+                yield _sse(d)
 
         token_ids = encoding.encode(result.answer)
         i = 0
@@ -194,7 +195,7 @@ async def chat_stream(body: ChatRequest, request: Request):
                 yield _sse({"type": "error", "error": "no_pipeline_result", "trace_id": trace_id})
                 return
 
-            async for chunk in _stream_answer(result, trace_id=trace_id):
+            async for chunk in _stream_answer(result, trace_id=trace_id, include_traces=False):
                 if await request.is_disconnected():
                     return
                 yield chunk
@@ -334,7 +335,7 @@ async def agent_stream(body: AgentRequest, request: Request):
                     timeout=60.0,
                 )
 
-            async for chunk in _stream_answer(result, trace_id=trace_id):
+            async for chunk in _stream_answer(result, trace_id=trace_id, include_traces=False):
                 if await request.is_disconnected():
                     return
                 yield chunk
@@ -379,7 +380,7 @@ async def execute_plan(body: ExecuteRequest, request: Request):
                 ),
                 timeout=120.0,
             )
-            async for chunk in _stream_answer(result, trace_id=trace_id):
+            async for chunk in _stream_answer(result, trace_id=trace_id, include_traces=True):
                 yield chunk
         except asyncio.TimeoutError:
             yield _sse({"type": "error", "error": "request_timeout", "trace_id": trace_id})
