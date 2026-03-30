@@ -22,6 +22,7 @@ from exceptions import register_exception_handlers
 from fastapi import UploadFile, File, Form, HTTPException, Query
 from inspect import Parameter, Signature
 from pydantic import BaseModel
+from returns.result import Failure, Success
 
 
 from database_ops import (
@@ -32,7 +33,13 @@ from database_ops import (
     ProjectDB,
     DocumentDB,
 )
-from auth import UserCreds, authenticated
+from auth import (
+    ADMIN_SECRET_TOKEN,
+    AUTH_SERVER,
+    UserCreds,
+    authenticated,
+    parse_token_functional,
+)
 from projects import authorize_project
 from settings import Constants
 
@@ -73,6 +80,10 @@ class ProjectUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
     llm_model: str | None = None
+
+
+class TokenCheckRequest(BaseModel):
+    token: str
 
 
 EMBEDDING_DIMENSIONS: dict[str, int] = {
@@ -192,6 +203,43 @@ protected_router = APIRouter(prefix="/api", tags=["protected"])
 async def health_check():
     """Health check endpoint"""
     return {"status": "ok"}
+
+
+@public_router.post("/token-check")
+async def token_check(
+    body: TokenCheckRequest,
+    client: httpx.AsyncClient = Depends(get_http_client),
+):
+    """Validate an API token and return whether it is usable."""
+    token_result = parse_token_functional(f"Bearer {body.token}")
+    match token_result:
+        case Failure(error):
+            return {"valid": False, "reason": error}
+        case Success(token):
+            pass
+
+    try:
+        resp = await client.get(
+            f"{AUTH_SERVER}/verify-token",
+            params={"token": token},
+            headers={"X-Cudo-Admin": f"Bearer {ADMIN_SECRET_TOKEN}"},
+        )
+    except Exception:
+        return {"valid": False, "reason": "auth_service_unreachable"}
+
+    if resp.status_code != 200:
+        return {"valid": False, "reason": f"auth_service_status_{resp.status_code}"}
+
+    try:
+        data = resp.json()
+    except Exception:
+        return {"valid": False, "reason": "auth_service_invalid_response"}
+
+    return {
+        "valid": True,
+        "user_id": data.get("user_id", ""),
+        "limits": data.get("limits", {}),
+    }
 
 
 # ----------------------------
