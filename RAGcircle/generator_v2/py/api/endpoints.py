@@ -11,12 +11,14 @@ import asyncio
 import dataclasses
 import json
 import logging
+import random
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
+import tiktoken
 
 from api.presets import AGENT_PRESET_BUILDERS, agent, retry_round, simple
 from config import Settings
@@ -73,10 +75,13 @@ def _done_event(result: PipelineResult, *, trace_id: str = "") -> DoneEvent:
 
 
 def _stream_answer(
-    result: PipelineResult, *, trace_id: str, chunk_size: int = 40,
+    result: PipelineResult, *, trace_id: str,
 ) -> AsyncIterator[str]:
     """Stream traces, then the answer as token events, then a done event."""
     async def _generate() -> AsyncIterator[str]:
+        rng = random.Random(trace_id)
+        encoding = tiktoken.get_encoding("o200k_base")
+
         yield _sse(_event_to_dict(InitEvent(trace_id=trace_id)))
 
         for trace in result.traces:
@@ -85,9 +90,22 @@ def _stream_answer(
             d["trace_id"] = trace_id
             yield _sse(d)
 
-        text = result.answer
-        for i in range(0, len(text), chunk_size):
-            d = _event_to_dict(TokenEvent(content=text[i:i + chunk_size]))
+        token_ids = encoding.encode(result.answer)
+        i = 0
+        chunk_index = 0
+        while i < len(token_ids):
+            token_count = rng.choices([1, 2, 3, 4], weights=[0.2, 0.45, 0.25, 0.1], k=1)[0]
+            chunk = encoding.decode(token_ids[i : i + token_count])
+            i += token_count
+            chunk_index += 1
+
+            # Smooth token cadence with subtle punctuation pauses.
+            delay = rng.uniform(0.010, 0.026)
+            if chunk.rstrip().endswith((".", "!", "?")):
+                delay += rng.uniform(0.018, 0.055)
+            await asyncio.sleep(delay)
+
+            d = _event_to_dict(TokenEvent(content=chunk))
             d["trace_id"] = trace_id
             yield _sse(d)
 
