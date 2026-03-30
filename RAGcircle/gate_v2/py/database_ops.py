@@ -304,6 +304,7 @@ from datetime import datetime
 
 
 class DocumentEventType(str, Enum):
+    UPLOADED = "uploaded"
     INGESTED = "ingested"
     DELETED = "deleted" 
     PROCESSED = "processed"
