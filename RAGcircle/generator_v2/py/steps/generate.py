@@ -36,7 +36,7 @@ async def generate(
         chunks,
         max_chars=max_context_chars,
         max_chunk_chars=max_chunk_chars,
-        source_meta=source_meta,
+        # source_meta=source_meta,
     )
 
     if step.use_tools:

@@ -3,6 +3,7 @@ import uvicorn
 import uuid
 import re
 import httpx
+from datetime import datetime
 from storage import UploadMeta, upload_with_content_addressing, detect_content_type, download_from_s3
 from collectors import QdrantStore, BM25Store
 from collectors import BM25Store, QdrantStore, create_bm25_store, create_qdrant_store
@@ -23,7 +24,14 @@ from inspect import Parameter, Signature
 from pydantic import BaseModel
 
 
-from database_ops import DocumentEventDB, create_db, ProjectDB, DocumentDB
+from database_ops import (
+    DocumentEvent,
+    DocumentEventDB,
+    DocumentEventType,
+    create_db,
+    ProjectDB,
+    DocumentDB,
+)
 from auth import UserCreds, authenticated
 from projects import authorize_project
 from settings import Constants
@@ -377,6 +385,7 @@ async def upload(
     s3_client=Depends(get_s3),
     project_db: ProjectDB = Depends(get_project_db),
     document_db: DocumentDB = Depends(get_document_db),
+    event_db: DocumentEventDB = Depends(get_event_db),
     settings: Settings = Depends(get_settings),
 ):
     doc_id = uuid.uuid4().hex
@@ -422,7 +431,10 @@ async def upload(
         doc_attrs = all_attrs, 
     )
     if upload_result.duplicate:
-        raise HTTPException(status_code=409)
+        raise HTTPException(
+            status_code=409,
+            detail="duplicate_upload_attempted",
+        )
 
     # Do I like that option?
     # Not really but we can merge results and hide info about doc contents in a way
@@ -432,6 +444,13 @@ async def upload(
     # whatever, we do not handle millions of docs, maybe we will scale later
     
     await document_db.persist_document(doc_id, project_id, upload_result, meta)
+    await event_db.log_event(
+        doc_id=upload_result.storage_id,
+        project_id=project_id,
+        event_type=DocumentEventType.UPLOADED,
+        service_name="gateway",
+        metadata={"external_doc_id": doc_id},
+    )
 
     return {
         "doc_id": doc_id,
@@ -551,7 +570,7 @@ async def get_document_info(
 
 
 @protected_router.get("/v1/documents/{doc_id}/status")
-async def get_document_info(
+async def get_document_status(
     # project_id: str,
     doc_id: str,
     user: UserCreds = Depends(authenticated),
@@ -561,7 +580,7 @@ async def get_document_info(
     # settings=Depends(get_settings),
     event_db=Depends(get_event_db),
 ):
-    """Delete a document (with ownership check via project)."""
+    """Return latest document status event (with ownership check via project)."""
     # Get document to find its project
     doc = await document_db.get(doc_id)
     if not doc:
@@ -574,24 +593,23 @@ async def get_document_info(
     storage_id = doc_obj.get("storage_id")
 
     ev = await event_db.get_latest_event(doc_id=storage_id, project_id=doc_obj.get("project_id"))
-    
-    # this is truly meh on large scale 
-    # blaaaaaaaaat 
-    # blaaaaaaaaat
-    # this is really bad 
-    # nonononoo
-    # nonononononono
-    # shit 
-    # no nono nonononono
-    # what is the point? 
-    # this is bad you cannot ship this 
-    # no no no no no no no
-    # 
 
-    # well here is another idea -> we track prev event for all of the methods except ingestion
-    # is this shit? 
-    # maybe
-    if getattr(ev, "doc_id"): 
+    if ev is None:
+        return DocumentEvent(
+            event_id=f"synthetic-uploaded-{doc_id}-{uuid.uuid4().hex}",
+            doc_id=doc_id,
+            project_id=doc_obj["project_id"],
+            event_type=DocumentEventType.UPLOADED,
+            service_name="gateway",
+            metadata={
+                "source": "status_fallback",
+                "external_doc_id": doc_id,
+                "storage_id": storage_id,
+            },
+            created_at=datetime.utcnow(),
+        )
+
+    if ev.doc_id == storage_id:
         ev.doc_id = doc_id
     return ev
 
@@ -754,7 +772,7 @@ async def simple_chat_stream(
 # App Initialization
 # ----------------------------
 
-app = FastAPI(lifespan=lifecycle, title="S3 Presign API")
+app = FastAPI(lifespan=lifecycle, title="RAGcircle Gateway")
 # register_exception_handlers(app)
 app.include_router(public_router)
 app.include_router(protected_router)
