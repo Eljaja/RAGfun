@@ -85,7 +85,13 @@ async def lifespan(app: FastAPI):
     state.retrieval = RetrievalClient(base_url=str(state.settings.retrieval_url), timeout_s=state.settings.retrieval_timeout_s)
     if state.settings.ocr_enabled:
         try:
-            state.ocr = OCRClient(lang=state.settings.ocr_lang, device=state.settings.ocr_device)
+            state.ocr = OCRClient(
+                lang=state.settings.ocr_lang,
+                device=state.settings.ocr_device,
+                use_doc_orientation_classify=state.settings.ocr_use_doc_orientation_classify,
+                use_doc_unwarping=state.settings.ocr_use_doc_unwarping,
+                use_textline_orientation=state.settings.ocr_use_textline_orientation,
+            )
         except Exception as exc:
             state.ocr = None
             logger.warning("ocr_init_failed", extra={"extra": {"error": str(exc)}})

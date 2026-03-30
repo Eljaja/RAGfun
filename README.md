@@ -111,6 +111,50 @@ curl -X POST http://localhost:8092/v1/chat \
   -d '{"query": "What is this document about?", "stream": false}'
 ```
 
+## SDK for Gateway v2 (`localhost:8917`)
+
+This repo includes a dedicated Python SDK for the Gateway v2 API.
+
+- SDK path: `client/`
+- Target API: `http://localhost:8917`
+- Auth: `Authorization: Bearer sk-...`
+
+Install:
+
+```bash
+pip install -r client/requirements.txt
+```
+
+Minimal usage:
+
+```python
+from client import ClientAuth, RAGOpenAIClient
+
+client = RAGOpenAIClient(
+    base_url="http://localhost:8917",
+    auth=ClientAuth(api_key="sk-..."),
+)
+
+project = client.projects.ensure(name="my-project")
+resp = client.chat.completions.create(
+    project_id=project["project_id"],
+    messages=[{"role": "user", "content": "Summarize project docs"}],
+)
+print(resp["choices"][0]["message"]["content"])
+client.close()
+```
+
+Example script:
+
+```bash
+export RAG_API_KEY="sk-..."
+python client/examples/create_project_and_chat.py
+```
+
+Compatibility note:
+- This SDK is intentionally scoped to the `gate_v2` API flow (`projects.*`, `chat.completions.*`, upload helper).
+- It does not require copying local runtime artifacts (virtualenv files, caches, local env files).
+
 ## Architecture
 
 ### System Components
@@ -271,6 +315,35 @@ Results: `results/bright_chunk_tune_summary.json` and table in stdout. Default i
 python eval/run_rag_baseline.py --gate-url http://localhost:8092 --dataset data/beir/fiqa/queries.jsonl --format beir --output results.json
 python eval/run_rag_ir_metrics.py --results results.json --qrels data/beir/fiqa/qrels_test.tsv --output metrics.json
 ```
+
+### OCR Benchmark (Paddle vs Qwen3-VL-8B)
+
+Latest rerun artifacts (10 pages, exact + semantic QA sets):
+- `ocr_eval_rerun_extended_metrics_en.json`
+- `ocr_eval_rerun_extended_metrics_en.md`
+- `ocr_eval_paddle_texts_rerun.json`
+- `ocr_eval_qwen3vl8b_texts_rerun.json`
+
+Print a ready-to-share summary table with one command:
+```bash
+python scripts/print_ocr_eval_summary.py
+```
+
+Latest summary (PaddleOCR vs Qwen3-VL-8B):
+
+| Metric | Exact EN (Paddle / Qwen) | Semantic EN (Paddle / Qwen) |
+|---|---:|---:|
+| raw_exact % | 100.0 / 87.0 | 61.0 / 87.0 |
+| norm_word_boundary % | 100.0 / 92.0 | 62.0 / 86.0 |
+| hit@0.80 % | 100.0 / 96.0 | 70.0 / 89.0 |
+| WER avg (lower better) | 0.0 / 0.0443 | 0.2601 / 0.1153 |
+| CER avg (lower better) | 0.0 / 0.0262 | 0.1893 / 0.0721 |
+
+| Aggregated Profile | Paddle | Qwen | Winner |
+|---|---:|---:|---|
+| balanced | 84.91 | 91.52 | qwen |
+| ocr_first | 94.35 | 93.65 | paddle |
+| semantic_first | 76.21 | 90.05 | qwen |
 
 ### Monitoring & Debugging
 

@@ -5,13 +5,14 @@ Collects answers and produces evaluation report.
 Progress: tail -f eval_progress.txt
 """
 import json
+import os
 import re
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
-API_KEY = "0QSjzjXQJUSzcmOK0EVlGJttvz0BI9ZtcItuSAAFOAo"
+API_KEY = os.getenv("ODS_API_KEY", "")
 PROGRESS_FILE = Path(__file__).parent / "eval_progress.txt"
 BASE = "http://localhost:8092"
 AGENT_BASE = "http://localhost:8093"
@@ -138,6 +139,8 @@ def write_progress(msg: str, append: bool = True):
 
 
 def main():
+    if not API_KEY:
+        raise SystemExit("Set ODS_API_KEY before running eval_docs/run_eval.py")
     total = len(QUESTIONS) * 3  # chat, agent, deep per question
     done = 0
     write_progress(f"START: {len(QUESTIONS)} questions × 3 modes = {total} calls", append=False)

@@ -1,8 +1,11 @@
-FROM python:3.11-slim
+FROM python:3.10-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
+
+ARG PADDLE_GPU_INDEX_URL=https://www.paddlepaddle.org.cn/packages/stable/cu118/
+ARG PADDLE_GPU_PACKAGE=paddlepaddle-gpu==3.3.1
 
 WORKDIR /app
 
@@ -22,6 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN pip install --no-cache-dir --index-url ${PADDLE_GPU_INDEX_URL} ${PADDLE_GPU_PACKAGE}
 
 COPY app /app/app
 

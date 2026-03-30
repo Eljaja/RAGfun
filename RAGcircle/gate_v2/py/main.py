@@ -380,12 +380,6 @@ async def list_project_documents(
 # ----------------------------
 
 
-# what could be improved
-# user permissions/max_file_size
-#
-
-# another topic to look into
-# well well well
 class DocAttributes(BaseModel):
     title: str
     description: str | None = None
@@ -484,13 +478,6 @@ async def upload(
     if upload_result.duplicate:
         raise HTTPException(status_code=409)
 
-    # Do I like that option?
-    # Not really but we can merge results and hide info about doc contents in a way
-    # well shi
-    # shi x2
-    # shi x3
-    # whatever, we do not handle millions of docs, maybe we will scale later
-    
     await document_db.persist_document(doc_id, effective_project_id, upload_result, meta)
 
     return {
@@ -543,20 +530,6 @@ async def download_document(
             "Content-Length": str(doc.get("size", 0)),
         },
     )
-
-
-# TOTHINK
-# should I somehow combine info about a project into uuid + filesha256
-# NONONONONO
-# as Opus said
-# requiring project_id is
-# good practice even if doc_id is
-# globally unique. It acts as a scoping guard
-# (prevents accidentally deleting a doc
-# from the wrong project) and
-# makes authorization
-# checks straightforward.
-# I need
 
 
 @protected_router.delete("/v1/documents/{doc_id}")
@@ -635,22 +608,6 @@ async def get_document_info(
 
     ev = await event_db.get_latest_event(doc_id=storage_id, project_id=doc_obj.get("project_id"))
     
-    # this is truly meh on large scale 
-    # blaaaaaaaaat 
-    # blaaaaaaaaat
-    # this is really bad 
-    # nonononoo
-    # nonononononono
-    # shit 
-    # no nono nonononono
-    # what is the point? 
-    # this is bad you cannot ship this 
-    # no no no no no no no
-    # 
-
-    # well here is another idea -> we track prev event for all of the methods except ingestion
-    # is this shit? 
-    # maybe
     if getattr(ev, "doc_id"): 
         ev.doc_id = doc_id
     return ev

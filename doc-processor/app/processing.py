@@ -85,7 +85,7 @@ class OCRPDFProcessor(FileProcessor):
             page_indices=ocr_indices,
             max_side_px=self.settings.max_image_side_px,
         )
-        sem = asyncio.Semaphore(1)
+        sem = asyncio.Semaphore(max(1, int(self.settings.ocr_max_concurrency)))
 
         async def run_one(i: int, png_bytes: bytes) -> Tuple[int, str]:
             async with sem:

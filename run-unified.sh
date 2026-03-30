@@ -29,7 +29,7 @@ export GATE_REQUIRE_TENANT_AUTH="${GATE_REQUIRE_TENANT_AUTH:-false}"
 export GATE_LLM_PROVIDER="${GATE_LLM_PROVIDER:-openai_compat}"
 export GATE_LLM_BASE_URL="${GATE_LLM_BASE_URL:-https://llm.c.singularitynet.io/v1}"
 export GATE_LLM_MODEL="${GATE_LLM_MODEL:-minimax/minimax-m2.1}"
-export GATE_LLM_API_KEY="${GATE_LLM_API_KEY:-sk-FQ0o8MR5WWeLgqCTP_cZSxtpL8xbpopVCTFxSs5GQk0}"
+export GATE_LLM_API_KEY="${GATE_LLM_API_KEY:-}"
 
 # Embedder model for RAGcircle's Infinity service (phase 2).
 export EMBEDDING_MODEL="${EMBEDDING_MODEL:-BAAI/bge-m3}"

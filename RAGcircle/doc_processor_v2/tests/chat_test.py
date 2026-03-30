@@ -1,5 +1,6 @@
 # services/retriever.py
 import asyncio
+import os
 from store import BM25Store
 import httpx
 from dataclasses import dataclass
@@ -33,11 +34,13 @@ class ChatGenerator:
 
     async def generate(self, query: str, chunks: list) -> Answer:
         context = "\n\n".join(f"[{i}] {c.text}" for i, c in enumerate(chunks))
+        api_key = os.getenv("GATE_LLM_API_KEY", "")
+        if not api_key:
+            raise RuntimeError("Set GATE_LLM_API_KEY for chat_test.py")
 
         resp = await self.client.post(self.url,
-                                      # headers = {"Authorization": "Bearer sk-4bTqr1ZrEYW-Vk6CtcaZjz74cml7wSgtQneRgqj7cpY"},
                                       headers={
-                                          "Authorization": "Bearer sk-FQ0o8MR5WWeLgqCTP_cZSxtpL8xbpopVCTFxSs5GQk0"},
+                                          "Authorization": f"Bearer {api_key}"},
                                       json={
                                           "model": self.model,
 
@@ -104,13 +107,13 @@ class Reflector:
 
     async def evaluate(self, query: str, chunks: list, answer: str) -> ReflectionResult:
         context = "\n".join(c.text for c in chunks)
+        api_key = os.getenv("GATE_LLM_API_KEY", "")
+        if not api_key:
+            raise RuntimeError("Set GATE_LLM_API_KEY for chat_test.py")
 
         resp = await self.client.post(self.url,
-
-                                      # headers = {"Authorization": "Bearer sk-4bTqr1ZrEYW-Vk6CtcaZjz74cml7wSgtQneRgqj7cpY"},
-                                      # "Authorization: Bearer sk-sVxGci3uT8natU0U0xfSYuniSLrGLKu8KWkDxIKa82o"
                                       headers={
-                                          "Authorization": "Bearer sk-FQ0o8MR5WWeLgqCTP_cZSxtpL8xbpopVCTFxSs5GQk0"},
+                                          "Authorization": f"Bearer {api_key}"},
                                       json={
                                           "model": self.model,
                                           "messages": [
@@ -264,12 +267,15 @@ def one_pass_agent_closure(client: httpx.AsyncClient, chat_endpoint: str, header
 async def main():
 
     https_client = httpx.AsyncClient(timeout=30.0)
+    api_key = os.getenv("GATE_LLM_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("Set GATE_LLM_API_KEY for chat_test.py")
 
     one_pass_agent = one_pass_agent_closure(
         https_client,
         "https://llm.c.singularitynet.io/v1/chat/completions",
         headers={
-            "Authorization": "Bearer sk-FQ0o8MR5WWeLgqCTP_cZSxtpL8xbpopVCTFxSs5GQk0"},)
+            "Authorization": f"Bearer {api_key}"},)
 
     query = "lalal"
     context = "ahaha"

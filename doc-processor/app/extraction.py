@@ -242,22 +242,80 @@ def pdf_pages_to_pngs(
     return out
 
 
+def _table_to_markdown(rows: list[list[str]]) -> str:
+    clean_rows = [[str(c or "").strip().replace("|", r"\|") for c in row] for row in rows]
+    clean_rows = [r for r in clean_rows if any(x for x in r)]
+    if not clean_rows:
+        return ""
+    width = max(len(r) for r in clean_rows)
+    clean_rows = [r + [""] * (width - len(r)) for r in clean_rows]
+    header = clean_rows[0]
+    sep = ["---"] * width
+    body = clean_rows[1:]
+    lines = [
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join(sep) + " |",
+    ]
+    lines.extend("| " + " | ".join(row) + " |" for row in body)
+    return "\n".join(lines).strip()
+
+
+def _extract_page_layout_text(page: fitz.Page) -> str:
+    """
+    Layout-aware page extraction:
+    - preserve text blocks in reading order;
+    - extract tables as markdown blocks when detectable.
+    """
+    parts: list[str] = []
+
+    # 1) Text blocks by geometry (layout-preserving fallback for reading order).
+    try:
+        blocks = page.get_text("blocks") or []
+        # (x0, y0, x1, y1, text, block_no, block_type)
+        blocks = sorted(blocks, key=lambda b: (float(b[1]), float(b[0])))
+        for b in blocks:
+            if len(b) >= 5:
+                txt = str(b[4] or "").strip()
+                if txt:
+                    parts.append(txt)
+    except Exception:
+        pass
+
+    # 2) Table extraction via PyMuPDF table detector.
+    table_parts: list[str] = []
+    try:
+        finder = page.find_tables()
+        tables = list(getattr(finder, "tables", []) or [])
+        for i, tbl in enumerate(tables):
+            try:
+                rows = tbl.extract() or []
+                md = _table_to_markdown(rows)
+                if md:
+                    table_parts.append(f"### Table {i + 1}\n{md}")
+            except Exception:
+                continue
+    except Exception:
+        # keep extraction resilient when table detection is unavailable
+        pass
+
+    merged = "\n\n".join([p for p in parts if p]).strip()
+    if table_parts:
+        if merged:
+            merged += "\n\n"
+        merged += "\n\n".join(table_parts)
+    return merged.strip()
+
+
 def extract_pdf_text_layer(pdf_bytes: bytes, *, max_pages: int) -> list[str]:
-    """Extract an existing PDF text layer without OCR."""
+    """Extract PDF text layer with layout/table enrichment before chunking."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     out: list[str] = []
     n = min(doc.page_count, max_pages)
     for i in range(n):
         page = doc.load_page(i)
-        text = (page.get_text("text") or "").strip()
+        text = _extract_page_layout_text(page)
         if not text:
-            blocks = []
-            for block in page.get_text("blocks") or []:
-                if len(block) >= 5:
-                    value = str(block[4] or "").strip()
-                    if value:
-                        blocks.append(value)
-            text = "\n".join(blocks).strip()
+            text = (page.get_text("text") or "").strip()
         out.append(text)
     return out
 

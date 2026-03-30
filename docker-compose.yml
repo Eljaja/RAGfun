@@ -345,6 +345,7 @@ services:
       - PROCESSOR_SERVICE_NAME=doc-processor
       - PROCESSOR_ENVIRONMENT=dev
       - PROCESSOR_LOG_LEVEL=INFO
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_DEVICE_DOC_PROCESSOR:-0}
       - PROCESSOR_STORAGE_URL=http://document-storage:8081
       - PROCESSOR_STORAGE_TIMEOUT_S=60
       - PROCESSOR_RETRIEVAL_URL=http://retrieval:8080
@@ -354,9 +355,13 @@ services:
       # - PROCESSOR_VLM_API_KEY=...
       - PROCESSOR_VLM_MODEL=ibm-granite/granite-docling-258M
       - PROCESSOR_OCR_ENABLED=true
-      - PROCESSOR_OCR_LANG=en
-      - PROCESSOR_OCR_DEVICE=cpu
+      - PROCESSOR_OCR_LANG=${PROCESSOR_OCR_LANG:-ru,en}
+      - PROCESSOR_OCR_DEVICE=${PROCESSOR_OCR_DEVICE:-gpu:0}
+      - PROCESSOR_OCR_USE_DOC_ORIENTATION_CLASSIFY=${PROCESSOR_OCR_USE_DOC_ORIENTATION_CLASSIFY:-true}
+      - PROCESSOR_OCR_USE_DOC_UNWARPING=${PROCESSOR_OCR_USE_DOC_UNWARPING:-true}
+      - PROCESSOR_OCR_USE_TEXTLINE_ORIENTATION=${PROCESSOR_OCR_USE_TEXTLINE_ORIENTATION:-true}
       - PROCESSOR_PDF_TEXT_MIN_CHARS=80
+      - PROCESSOR_OCR_MAX_CONCURRENCY=4
       # Extraction quality knobs (QUALITY)
       - PROCESSOR_VLM_TIMEOUT_S=180
       - PROCESSOR_MAX_PAGES=35
@@ -375,6 +380,13 @@ services:
       #   condition: service_started
     networks:
       - rag-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${NVIDIA_DEVICE_DOC_PROCESSOR:-0}"]
+              capabilities: [gpu]
 
   ingestion-worker:
     build:

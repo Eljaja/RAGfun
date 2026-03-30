@@ -27,9 +27,13 @@ class Settings(BaseSettings):
 
     # OCR
     ocr_enabled: bool = True
-    ocr_lang: str = "en"
+    ocr_lang: str = "ru,en"
     ocr_device: str = "cpu"
+    ocr_use_doc_orientation_classify: bool = True
+    ocr_use_doc_unwarping: bool = True
+    ocr_use_textline_orientation: bool = True
     pdf_text_min_chars: int = 80
+    ocr_max_concurrency: int = 4
 
     # Limits
     max_pages: int = 25
@@ -55,7 +59,11 @@ class Settings(BaseSettings):
                 "enabled": self.ocr_enabled,
                 "lang": self.ocr_lang,
                 "device": self.ocr_device,
+                "use_doc_orientation_classify": self.ocr_use_doc_orientation_classify,
+                "use_doc_unwarping": self.ocr_use_doc_unwarping,
+                "use_textline_orientation": self.ocr_use_textline_orientation,
                 "pdf_text_min_chars": self.pdf_text_min_chars,
+                "max_concurrency": self.ocr_max_concurrency,
             },
             "limits": {
                 "max_pages": self.max_pages,
