@@ -65,6 +65,8 @@ class Settings(BaseSettings):
     retrieval_url: str = "http://localhost:8920"
     generator_url: str = "http://localhost:8930"
 
+    max_file_size_bytes: int = 209_715_200 # 200mb
+
 
 # can we automate this?
 # 2026 and I am still not good at metaprogramming

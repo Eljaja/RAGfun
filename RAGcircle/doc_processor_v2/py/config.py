@@ -43,7 +43,7 @@ class AppConfig(BaseSettings):
     vlm_timeout: float = 120.0
 
     # ── Processing ───────────────────────────────────────────────────────
-    proc_max_pages: int = 50
+    proc_max_pages: int = 2000
     proc_max_px: int = 2048
     proc_vlm_concurrency: int = 4
     chunk_size_chars: int = 1500

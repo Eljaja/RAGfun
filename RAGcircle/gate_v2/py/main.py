@@ -472,7 +472,7 @@ async def upload(
         bucket=settings.bucket_name,
         request_stream=file_stream(),
         content_type=content_type,
-        max_bytes=20 * 1024 * 1024, # TODO add an .env var
+        max_bytes=settings.max_file_size_bytes, # TODO add an .env var
         storage_prefix=storage_prefix,
         doc_id=doc_id,
         # TODO: fix mixed up pydantic and dataclasses
