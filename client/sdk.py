@@ -193,6 +193,44 @@ class _ChatAPI:
     def __init__(self, client: "RAGOpenAIClient"):
         self.completions = _ChatCompletionsAPI(client)
 
+    def create(
+        self,
+        *,
+        project_id: str,
+        messages: List[Dict[str, str]],
+        stream: bool = False,
+        include_sources: bool = True,
+        mode: str | None = None,
+        top_k: int | None = None,
+        max_llm_calls: int | None = None,
+        max_fact_queries: int | None = None,
+        use_hyde: bool | None = None,
+        use_fact_queries: bool | None = None,
+        use_retry: bool | None = None,
+        use_tools: bool | None = None,
+        filters: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any] | Iterator[Dict[str, Any]]:
+        """
+        Preferred chat entrypoint for SDK users.
+
+        This delegates to chat-completions compatibility layer internally.
+        """
+        return self.completions.create(
+            project_id=project_id,
+            messages=messages,
+            stream=stream,
+            include_sources=include_sources,
+            mode=mode,
+            top_k=top_k,
+            max_llm_calls=max_llm_calls,
+            max_fact_queries=max_fact_queries,
+            use_hyde=use_hyde,
+            use_fact_queries=use_fact_queries,
+            use_retry=use_retry,
+            use_tools=use_tools,
+            filters=filters,
+        )
+
 
 class RAGOpenAIClient:
     """

@@ -15,13 +15,12 @@ def main() -> None:
     if not file_path.exists():
         raise SystemExit(f"File not found: {file_path}")
 
-    base_url = os.getenv("RAG_GATEWAY_URL", "http://localhost:8917")
+    base_url = os.environ["RAG_GATEWAY_URL"]
     api_key = os.environ["RAG_API_KEY"]
 
     with RAGOpenAIClient(base_url=base_url, auth=ClientAuth(api_key=api_key)) as client:
         project = client.projects.ensure(
             name="sdk-demo-upload",
-            description="Upload and chat demo project",
         )
         project_id = project["project_id"]
         print("project_id:", project_id)
@@ -34,9 +33,9 @@ def main() -> None:
         )
         print("uploaded:", uploaded.get("document_id") or uploaded)
 
-        completion = client.chat.completions.create(
+        completion = client.chat.create(
             project_id=project_id,
-            messages=[{"role": "user", "content": "Кратко перескажи содержимое загруженного документа"}],
+            messages=[{"role": "user", "content": "Summarize the uploaded document briefly."}],
             include_sources=True,
         )
         print("answer:", completion["choices"][0]["message"]["content"])

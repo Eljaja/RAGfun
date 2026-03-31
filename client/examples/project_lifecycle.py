@@ -7,7 +7,7 @@ from client import ClientAuth, RAGOpenAIClient
 
 
 def main() -> None:
-    base_url = os.getenv("RAG_GATEWAY_URL", "http://localhost:8917")
+    base_url = os.environ["RAG_GATEWAY_URL"]
     api_key = os.environ["RAG_API_KEY"]
     project_name = f"sdk-demo-lifecycle-{uuid.uuid4().hex[:8]}"
 

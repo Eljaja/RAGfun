@@ -6,20 +6,19 @@ from client import ClientAuth, RAGOpenAIClient
 
 
 def main() -> None:
-    base_url = os.getenv("RAG_GATEWAY_URL", "http://localhost:8917")
+    base_url = os.environ["RAG_GATEWAY_URL"]
     api_key = os.environ["RAG_API_KEY"]
 
     with RAGOpenAIClient(base_url=base_url, auth=ClientAuth(api_key=api_key)) as client:
         project = client.projects.ensure(
             name="sdk-demo-stream",
-            description="Streaming demo project",
         )
         project_id = project["project_id"]
         print("project_id:", project_id)
 
-        events = client.chat.completions.create(
+        events = client.chat.create(
             project_id=project_id,
-            messages=[{"role": "user", "content": "Сформулируй 3 ключевых тезиса по проекту"}],
+            messages=[{"role": "user", "content": "Provide 3 key takeaways from the project content."}],
             stream=True,
         )
 
