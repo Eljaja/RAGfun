@@ -5,6 +5,8 @@ import logging
 from dataclasses import dataclass
 from urllib.parse import unquote
 
+from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential, retry_if_not_exception_type, before_sleep_log
+
 from chunker import chunk_text_chars
 from embed_caller import Embedder
 from errors import NonRetryableError
@@ -16,6 +18,14 @@ from store import QdrantStore, BM25Store
 from db_ops import DocumentEventDB, DocumentEventType
 
 logger = logging.getLogger("data.processing.pipeline")
+
+_INGEST_RETRY = dict(
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=2, min=2, max=30),
+    retry=retry_if_not_exception_type(NonRetryableError),
+    reraise=True,
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+)
 
 
 def generate_doc_id(bucket: str, key: str) -> str:
@@ -290,13 +300,15 @@ async def _extract_chunk_ingest_simple(
         raise
 
     try:
-        await ingest_chunks(
-            chunks=chunks, embedder=deps.embedder,
-            qdrant=deps.qdrant, opensearch=deps.opensearch,
-            qdrant_collection=project_id, opensearch_index=project_id,
-            embed_batch_size=deps.embed_batch_size,
-            model=dl.meta.project.get("embedding_model"),
-        )
+        async for retry in AsyncRetrying(**_INGEST_RETRY):
+            with retry:
+                await ingest_chunks(
+                    chunks=chunks, embedder=deps.embedder,
+                    qdrant=deps.qdrant, opensearch=deps.opensearch,
+                    qdrant_collection=project_id, opensearch_index=project_id,
+                    embed_batch_size=deps.embed_batch_size,
+                    model=dl.meta.project.get("embedding_model"),
+                )
     except Exception as e:
         await _log_user_facing_error(deps=deps, doc_id=doc_id, project_id=project_id,
                                      stage="index", exc=e, attempt=attempt, max_attempts=max_attempts)
@@ -344,13 +356,15 @@ async def _extract_chunk_ingest_windowed(
                 continue
 
             try:
-                await ingest_chunks(
-                    chunks=chunks, embedder=deps.embedder,
-                    qdrant=deps.qdrant, opensearch=deps.opensearch,
-                    qdrant_collection=project_id, opensearch_index=project_id,
-                    embed_batch_size=deps.embed_batch_size,
-                    model=dl.meta.project.get("embedding_model"),
-                )
+                async for retry in AsyncRetrying(**_INGEST_RETRY):
+                    with retry:
+                        await ingest_chunks(
+                            chunks=chunks, embedder=deps.embedder,
+                            qdrant=deps.qdrant, opensearch=deps.opensearch,
+                            qdrant_collection=project_id, opensearch_index=project_id,
+                            embed_batch_size=deps.embed_batch_size,
+                            model=dl.meta.project.get("embedding_model"),
+                        )
             except Exception as e:
                 logged_stage = "index"
                 await _log_user_facing_error(deps=deps, doc_id=doc_id, project_id=project_id,
