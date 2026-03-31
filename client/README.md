@@ -29,11 +29,7 @@ project = client.projects.ensure(
     description="SDK-created project",
 )
 
-resp = client.chat.completions.create(
-    project_id=project["project_id"],
-    messages=[{"role": "user", "content": "Summarize project docs"}],
-)
-print(resp["choices"][0]["message"]["content"])
+# See practical chat scenarios in the "Examples" section below.
 client.close()
 ```
 
