@@ -42,6 +42,8 @@ client.close()
 - `client.chat.completions.create(...)` uses chat-completions style
 - input uses `messages=[{role, content}, ...]`
 - output includes `choices[0].message.content`
+- currently **only chat-completions flow is supported**
+- classic `completions` (prompt-based `/v1/completions`) is **not implemented yet**
 
 Additionally, the response includes `rag` block with original gateway data:
 - `sources`, `context`, `partial`, `degraded`, `raw`
@@ -72,11 +74,116 @@ for chunk in events:
 
 `client.upload_document(project_id=..., file_path=..., title=..., description=...)`
 
-## Example script
+## Examples
 
-```bash
-export RAG_API_KEY="sk-..."
-python client/examples/create_project_and_chat.py
+All snippets below assume:
+
+```python
+import os
+from client import ClientAuth, RAGOpenAIClient
+
+base_url = os.getenv("RAG_GATEWAY_URL", "http://localhost:8917")
+api_key = os.environ["RAG_API_KEY"]
+```
+
+### 1) Create project and ask one question
+
+```python
+with RAGOpenAIClient(base_url=base_url, auth=ClientAuth(api_key=api_key)) as client:
+    project = client.projects.ensure(
+        name="sdk-demo-project",
+        description="Project created from SDK",
+    )
+    completion = client.chat.completions.create(
+        project_id=project["project_id"],
+        messages=[{"role": "user", "content": "Что загружено в проект?"}],
+    )
+    print(completion["choices"][0]["message"]["content"])
+```
+
+### 2) Streaming response
+
+```python
+with RAGOpenAIClient(base_url=base_url, auth=ClientAuth(api_key=api_key)) as client:
+    project = client.projects.ensure(name="sdk-demo-stream")
+    events = client.chat.completions.create(
+        project_id=project["project_id"],
+        messages=[{"role": "user", "content": "Сформулируй 3 ключевых тезиса"}],
+        stream=True,
+    )
+    for chunk in events:
+        delta = chunk["choices"][0]["delta"].get("content", "")
+        if delta:
+            print(delta, end="", flush=True)
+    print()
+```
+
+### 3) Upload a document and ask about it
+
+```python
+from pathlib import Path
+
+file_path = Path("/path/to/doc.pdf")
+
+with RAGOpenAIClient(base_url=base_url, auth=ClientAuth(api_key=api_key)) as client:
+    project = client.projects.ensure(name="sdk-demo-upload")
+    client.upload_document(
+        project_id=project["project_id"],
+        file_path=file_path,
+        title=file_path.name,
+        description="Uploaded from SDK example",
+    )
+    completion = client.chat.completions.create(
+        project_id=project["project_id"],
+        messages=[{"role": "user", "content": "Кратко перескажи документ"}],
+        include_sources=True,
+    )
+    print(completion["choices"][0]["message"]["content"])
+    print("sources:", len(completion["rag"]["sources"]))
+```
+
+### 4) Multi-turn chat with retrieval options
+
+```python
+messages = [
+    {"role": "system", "content": "Отвечай лаконично и по делу."},
+    {"role": "user", "content": "Какие документы есть в проекте?"},
+    {"role": "assistant", "content": "Могу опереться на найденный контекст и источники."},
+    {"role": "user", "content": "Сделай короткую сводку с фокусом на архитектуру."},
+]
+
+with RAGOpenAIClient(base_url=base_url, auth=ClientAuth(api_key=api_key)) as client:
+    project = client.projects.ensure(name="sdk-demo-multiturn")
+    completion = client.chat.completions.create(
+        project_id=project["project_id"],
+        messages=messages,
+        mode="hybrid",
+        top_k=5,
+        use_hyde=True,
+        use_fact_queries=True,
+        include_sources=True,
+        filters={"tags": ["architecture"]},
+    )
+    print(completion["choices"][0]["message"]["content"])
+```
+
+### 5) Project lifecycle (create/list/get/delete)
+
+```python
+import uuid
+
+with RAGOpenAIClient(base_url=base_url, auth=ClientAuth(api_key=api_key)) as client:
+    name = f"sdk-demo-lifecycle-{uuid.uuid4().hex[:8]}"
+    created = client.projects.create(name=name, description="Lifecycle demo")
+    project_id = created["project_id"]
+
+    fetched = client.projects.get(project_id)
+    projects = client.projects.list()
+    deleted = client.projects.delete(project_id)
+
+    print("fetched:", fetched["name"])
+    print("total_projects:", len(projects))
+    print("deleted:", deleted)
 ```
 
 ## Diagrams
