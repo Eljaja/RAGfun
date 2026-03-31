@@ -7,7 +7,14 @@ from typing import Protocol
 
 import httpx
 
-from extraction import pdf_to_page_pngs, _convert_office_to_pdf, _html_to_text, _xml_to_text, _xlsx_to_markdown
+from extraction import (
+    get_pdf_page_count,
+    pdf_to_page_pngs,
+    _convert_office_to_pdf,
+    _html_to_text,
+    _xml_to_text,
+    _xlsx_to_markdown,
+)
 
 # ─────────────────────────────────────────────────────────────
 # Constants
@@ -23,7 +30,7 @@ XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 @dataclass
 class Settings:
     """Processing settings for document conversion and chunking."""
-    max_pages: int = 50
+    page_window: int = 50
     max_px: int = 2048
     vlm_concurrency: int = 4
     chunk_size_chars: int = 1500
@@ -114,14 +121,27 @@ class PDFDocument:
     async def to_text(self) -> list[str]:
         """
         Render PDF pages as images and extract text via VLM.
+        Processes in windows of `settings.page_window` pages to handle
+        arbitrarily large PDFs without hitting a hard page cap.
         Returns a list of strings, one per page.
         """
-        pngs = pdf_to_page_pngs(
-            self.raw,
-            max_pages=self.settings.max_pages,
-            max_side_px=self.settings.max_px,
-        )
-        return await self._vlm_extract_pages(pngs)
+        total = get_pdf_page_count(self.raw)
+        window = self.settings.page_window
+        all_texts: list[str] = []
+
+        for start in range(0, total, window):
+            first = start + 1                       # pdf2image is 1-indexed
+            last = min(start + window, total)
+            pngs = pdf_to_page_pngs(
+                self.raw,
+                first_page=first,
+                last_page=last,
+                max_side_px=self.settings.max_px,
+            )
+            window_texts = await self._vlm_extract_pages(pngs)
+            all_texts.extend(window_texts)
+
+        return all_texts
 
     async def _vlm_extract_pages(self, pngs: list[bytes]) -> list[str]:
         """

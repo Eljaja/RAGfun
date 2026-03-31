@@ -61,7 +61,7 @@ async def main() -> None:
     )
 
     settings = Settings(
-        max_pages=cfg.proc_max_pages,
+        page_window=cfg.proc_page_window,
         max_px=cfg.proc_max_px,
         vlm_concurrency=cfg.proc_vlm_concurrency,
         chunk_size_chars=cfg.chunk_size_chars,
