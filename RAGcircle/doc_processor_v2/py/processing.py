@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -99,10 +100,16 @@ class VLMClient:
 
 
 class ToText(Protocol):
-    """Anything that can become text"""
+    """Anything that can become text."""
 
     def to_text(self) -> list[str]:
-        """Returns list of text segments (pages, sections, etc.)"""
+        ...
+
+
+class WindowedExtractor(Protocol):
+    """Document types that support windowed extract -> chunk -> ingest."""
+
+    def to_text_windowed(self) -> AsyncIterator[tuple[int, list[str]]]:
         ...
 
 # ─────────────────────────────────────────────────────────────
@@ -118,16 +125,16 @@ class PDFDocument:
         self.vlm = vlm
         self.settings = settings
 
-    async def to_text(self) -> list[str]:
+    async def to_text_windowed(self) -> AsyncIterator[tuple[int, list[str]]]:
         """
-        Render PDF pages as images and extract text via VLM.
-        Processes in windows of `settings.page_window` pages to handle
-        arbitrarily large PDFs without hitting a hard page cap.
-        Returns a list of strings, one per page.
+        Yield ``(page_offset, texts)`` for each window of pages.
+
+        ``page_offset`` is the 0-based index of the first page in the window
+        so the caller can compute correct global page numbers.
+        Each ``texts`` list contains one string per page in that window.
         """
         total = get_pdf_page_count(self.raw)
         window = self.settings.page_window
-        all_texts: list[str] = []
 
         for start in range(0, total, window):
             first = start + 1                       # pdf2image is 1-indexed
@@ -138,9 +145,14 @@ class PDFDocument:
                 last_page=last,
                 max_side_px=self.settings.max_px,
             )
-            window_texts = await self._vlm_extract_pages(pngs)
-            all_texts.extend(window_texts)
+            texts = await self._vlm_extract_pages(pngs)
+            yield start, texts
 
+    async def to_text(self) -> list[str]:
+        """Convenience wrapper: collect all windows into one flat list."""
+        all_texts: list[str] = []
+        async for _offset, texts in self.to_text_windowed():
+            all_texts.extend(texts)
         return all_texts
 
     async def _vlm_extract_pages(self, pngs: list[bytes]) -> list[str]:
@@ -160,15 +172,11 @@ class PDFDocument:
                 text = await self.vlm.page_to_text(png_bytes=png_bytes)
                 return (idx, text)
 
-        # now this is a thing for guard or some other limiter for requests 
-        # this way we risk to overload the poor vllm engine 
-        # need to think about smol scaling pipeline 
         tasks = [extract_one(i, png) for i, png in enumerate(pngs)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         for r in results:
             if isinstance(r, Exception):
-                # Log and continue - partial extraction is better than nothing
                 continue
             idx, text = r
             if text:
@@ -178,15 +186,24 @@ class PDFDocument:
 
 
 class OfficeDocument:
+    """Office docs are converted to PDF first, then processed identically."""
+
     def __init__(self, raw: bytes, ext: str, vlm: VLMClient, settings: Settings):
         self.raw = raw
         self.ext = ext
         self.vlm = vlm
         self.settings = settings
 
+    def _as_pdf(self) -> PDFDocument:
+        pdf_bytes = _convert_office_to_pdf(self.raw, self.ext)
+        return PDFDocument(pdf_bytes, self.vlm, self.settings)
+
+    async def to_text_windowed(self) -> AsyncIterator[tuple[int, list[str]]]:
+        async for item in self._as_pdf().to_text_windowed():
+            yield item
+
     async def to_text(self) -> list[str]:
-        pdf = _convert_office_to_pdf(self.raw, self.ext)
-        return await PDFDocument(pdf, self.vlm, self.settings).to_text()
+        return await self._as_pdf().to_text()
 
 
 class HTMLDocument:
@@ -262,8 +279,13 @@ def document_from_bytes(
 
 
 # ─────────────────────────────────────────────────────────────
-# Main processing entry point
+# Main processing entry points
 # ─────────────────────────────────────────────────────────────
+
+def is_windowed(doc: ToText) -> bool:
+    """True when the document supports windowed extract-chunk-ingest."""
+    return hasattr(doc, "to_text_windowed")
+
 
 async def file_to_texts(
     raw: bytes,
@@ -273,25 +295,11 @@ async def file_to_texts(
     settings: Settings | None = None,
 ) -> list[str]:
     """
-    Convert file bytes to a list of text segments (pages/sections).
-
-    This is the main entry point for document processing.
-    Routes to the appropriate converter based on content type/filename,
-    then extracts text.
-
-    Args:
-        raw: File content as bytes
-        content_type: MIME type (e.g., "application/pdf")
-        filename: Original filename (used for format detection)
-        vlm: VLM client for image-based extraction
-        settings: Processing settings (uses defaults if None)
-
-    Returns:
-        List of text strings (one per page for PDFs, single item for others)
+    Simple entry point: convert file bytes to a flat list of text segments.
+    For windowed pipeline use, call ``document_from_bytes`` + ``is_windowed`` instead.
     """
     if settings is None:
         settings = Settings()
 
     document = document_from_bytes(raw, content_type, filename, vlm, settings)
-    # print(type(document))
     return await document.to_text()

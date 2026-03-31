@@ -11,7 +11,7 @@ from errors import NonRetryableError
 from s3_events import S3EventInfo
 from ingestion import ingest_chunks
 from models import ChunkMeta, Locator
-from processing import Settings, file_to_texts, VLMClient
+from processing import Settings, VLMClient, document_from_bytes, is_windowed
 from store import QdrantStore, BM25Store
 from db_ops import DocumentEventDB, DocumentEventType
 
@@ -30,25 +30,42 @@ def create_chunks_from_texts(
     texts: list[str],
     settings: Settings,
     meta: S3ObjectMeta,
+    *,
+    page_offset: int = 0,
+    start_chunk_idx: int = 0,
+    has_pages: bool | None = None,
 ) -> list[ChunkMeta]:
-    doc = meta.doc
+    """Turn page texts into indexable chunks.
+
+    ``page_offset``
+        0-based offset of the first page in *texts* within the full document.
+        Used so that windowed calls produce correct global page numbers.
+    ``start_chunk_idx``
+        Chunk counter carried across windows so chunk_id / chunk_index stay
+        unique and monotonically increasing for the whole document.
+    ``has_pages``
+        Explicit override; when ``None`` we infer from ``len(texts) > 1``.
+    """
+    doc_meta = meta.doc
     project = meta.project
 
-    # Prefer project-level chunk settings, fall back to pipeline defaults
     chunk_size = int(project.get("chunk_size", settings.chunk_size_chars))
     chunk_overlap = int(project.get("chunk_overlap", settings.chunk_overlap_chars))
 
-    # Parse comma-separated fields into lists
-    tags = [t.strip() for t in doc.get("tags", "").split(",") if t.strip()]
-    acl = [a.strip() for a in doc.get("acl", "").split(",") if a.strip()]
+    tags = [t.strip() for t in doc_meta.get("tags", "").split(",") if t.strip()]
+    acl = [a.strip() for a in doc_meta.get("acl", "").split(",") if a.strip()]
+
+    if has_pages is None:
+        has_pages = len(texts) > 1
 
     chunks: list[ChunkMeta] = []
-    global_idx = 0
-    has_pages = len(texts) > 1
+    global_idx = start_chunk_idx
 
-    for page_idx, page_text in enumerate(texts):
+    for local_idx, page_text in enumerate(texts):
         if not page_text or not page_text.strip():
             continue
+
+        page_num = page_offset + local_idx + 1      # 1-based for display
 
         for part in chunk_text_chars(
             page_text,
@@ -62,18 +79,20 @@ def create_chunks_from_texts(
                     doc_id=doc_id,
                     chunk_index=global_idx,
                     text=part,
-                    locator=Locator(page=page_idx + 1) if has_pages else None,
-                    title=doc.get("title"),
-                    source=doc.get("source"),
-                    uri=doc.get("uri"),
-                    lang=doc.get("lang") or project.get("language"),
+                    locator=Locator(page=page_num) if has_pages else None,
+                    title=doc_meta.get("title"),
+                    source=doc_meta.get("source"),
+                    uri=doc_meta.get("uri"),
+                    lang=doc_meta.get("lang") or project.get("language"),
                     tags=tags,
                     acl=acl,
                     project_id=project.get("project_id"),
                 )
             )
             global_idx += 1
-    logger.info(f"Created {chunks[0]}")
+
+    if chunks:
+        logger.info(f"Created {len(chunks)} chunks (first: {chunks[0].chunk_id})")
     return chunks
 
 
@@ -241,6 +260,118 @@ def _parse_filename(key: str) -> tuple[str, str]:
     return project_id, doc_id
 
 
+async def _extract_chunk_ingest_simple(
+    *,
+    doc: object,
+    dl: S3Download,
+    doc_id: str,
+    project_id: str,
+    deps: PipelineDeps,
+    attempt: int | None,
+    max_attempts: int | None,
+) -> int:
+    """Non-windowed path (HTML, XML, XLSX, plain text).
+    Returns total chunks indexed."""
+    try:
+        texts = await doc.to_text()
+    except Exception as e:
+        await _log_user_facing_error(deps=deps, doc_id=doc_id, project_id=project_id,
+                                     stage="extract", exc=e, attempt=attempt, max_attempts=max_attempts)
+        raise
+
+    try:
+        chunks = create_chunks_from_texts(
+            db_id=dl.meta.extra.get("doc-id"), doc_id=doc_id,
+            texts=texts, settings=deps.settings, meta=dl.meta,
+        )
+    except Exception as e:
+        await _log_user_facing_error(deps=deps, doc_id=doc_id, project_id=project_id,
+                                     stage="chunk", exc=e, attempt=attempt, max_attempts=max_attempts)
+        raise
+
+    try:
+        await ingest_chunks(
+            chunks=chunks, embedder=deps.embedder,
+            qdrant=deps.qdrant, opensearch=deps.opensearch,
+            qdrant_collection=project_id, opensearch_index=project_id,
+            embed_batch_size=deps.embed_batch_size,
+            model=dl.meta.project.get("embedding_model"),
+        )
+    except Exception as e:
+        await _log_user_facing_error(deps=deps, doc_id=doc_id, project_id=project_id,
+                                     stage="index", exc=e, attempt=attempt, max_attempts=max_attempts)
+        raise
+
+    return len(chunks)
+
+
+async def _extract_chunk_ingest_windowed(
+    *,
+    doc: object,
+    dl: S3Download,
+    doc_id: str,
+    project_id: str,
+    deps: PipelineDeps,
+    attempt: int | None,
+    max_attempts: int | None,
+) -> int:
+    """Windowed path for PDFs / Office docs.
+
+    Each window: VLM extract -> chunk -> embed+ingest, keeping memory and
+    indexer load bounded by ``settings.page_window`` pages at a time.
+    Returns total chunks indexed.
+    """
+    total_chunks = 0
+    chunk_idx = 0
+    logged_stage: str | None = None
+
+    try:
+        async for page_offset, texts in doc.to_text_windowed():
+            try:
+                chunks = create_chunks_from_texts(
+                    db_id=dl.meta.extra.get("doc-id"), doc_id=doc_id,
+                    texts=texts, settings=deps.settings, meta=dl.meta,
+                    page_offset=page_offset, start_chunk_idx=chunk_idx,
+                    has_pages=True,
+                )
+            except Exception as e:
+                logged_stage = "chunk"
+                await _log_user_facing_error(deps=deps, doc_id=doc_id, project_id=project_id,
+                                             stage="chunk", exc=e, attempt=attempt, max_attempts=max_attempts)
+                raise
+
+            if not chunks:
+                continue
+
+            try:
+                await ingest_chunks(
+                    chunks=chunks, embedder=deps.embedder,
+                    qdrant=deps.qdrant, opensearch=deps.opensearch,
+                    qdrant_collection=project_id, opensearch_index=project_id,
+                    embed_batch_size=deps.embed_batch_size,
+                    model=dl.meta.project.get("embedding_model"),
+                )
+            except Exception as e:
+                logged_stage = "index"
+                await _log_user_facing_error(deps=deps, doc_id=doc_id, project_id=project_id,
+                                             stage="index", exc=e, attempt=attempt, max_attempts=max_attempts)
+                raise
+
+            chunk_idx += len(chunks)
+            total_chunks += len(chunks)
+            logger.info(
+                "window_done page_offset=%d chunks=%d total_so_far=%d",
+                page_offset, len(chunks), total_chunks,
+            )
+    except Exception as e:
+        if logged_stage is None:
+            await _log_user_facing_error(deps=deps, doc_id=doc_id, project_id=project_id,
+                                         stage="extract", exc=e, attempt=attempt, max_attempts=max_attempts)
+        raise
+
+    return total_chunks
+
+
 async def handle_object_created(
     *,
     info: S3EventInfo,
@@ -264,88 +395,33 @@ async def handle_object_created(
         dl = await download_from_s3(bucket=info.bucket, key=info.key, s3_client=s3_client)
     except Exception as e:
         await _log_user_facing_error(
-            deps=deps,
-            doc_id=doc_id,
-            project_id=project_id,
-            stage="download",
-            exc=e,
-            attempt=attempt,
-            max_attempts=max_attempts,
+            deps=deps, doc_id=doc_id, project_id=project_id,
+            stage="download", exc=e, attempt=attempt, max_attempts=max_attempts,
         )
         raise
 
-    # Extract
-    try:
-        texts = await file_to_texts(
-            raw=dl.file_bytes,
-            content_type=dl.content_type,
-            filename=dl.filename,
-            vlm=deps.vlm,
-            settings=deps.settings,
-        )
-    except Exception as e:
-        await _log_user_facing_error(
-            deps=deps,
-            doc_id=doc_id,
-            project_id=project_id,
-            stage="extract",
-            exc=e,
-            attempt=attempt,
-            max_attempts=max_attempts,
-        )
-        raise
+    doc = document_from_bytes(
+        dl.file_bytes, dl.content_type, dl.filename,
+        deps.vlm, deps.settings,
+    )
 
-    # Chunk
-    try:
-        chunks = create_chunks_from_texts(
-            db_id=dl.meta.extra.get("doc-id"),
-            doc_id=doc_id,
-            texts=texts,
-            settings=deps.settings,
-            meta=dl.meta,
+    if is_windowed(doc):
+        total_chunks = await _extract_chunk_ingest_windowed(
+            doc=doc, dl=dl, doc_id=doc_id, project_id=project_id,
+            deps=deps, attempt=attempt, max_attempts=max_attempts,
         )
-    except Exception as e:
-        await _log_user_facing_error(
-            deps=deps,
-            doc_id=doc_id,
-            project_id=project_id,
-            stage="chunk",
-            exc=e,
-            attempt=attempt,
-            max_attempts=max_attempts,
+    else:
+        total_chunks = await _extract_chunk_ingest_simple(
+            doc=doc, dl=dl, doc_id=doc_id, project_id=project_id,
+            deps=deps, attempt=attempt, max_attempts=max_attempts,
         )
-        raise
-
-    # Index
-    try:
-        await ingest_chunks(
-            chunks=chunks,
-            embedder=deps.embedder,
-            qdrant=deps.qdrant,
-            opensearch=deps.opensearch,
-            qdrant_collection=project_id,
-            opensearch_index=project_id,
-            embed_batch_size=deps.embed_batch_size,
-            model=dl.meta.project.get("embedding_model"),
-        )
-    except Exception as e:
-        await _log_user_facing_error(
-            deps=deps,
-            doc_id=doc_id,
-            project_id=project_id,
-            stage="index",
-            exc=e,
-            attempt=attempt,
-            max_attempts=max_attempts,
-        )
-        raise
 
     await deps.event_db_docs.log_event(
         doc_id=doc_id,
         project_id=project_id,
         event_type=DocumentEventType.INDEXED,
         service_name="doc_processor_v2",
-        metadata={"chunks_indexed": len(chunks)},
+        metadata={"chunks_indexed": total_chunks},
     )
 
     elapsed_ms = int((asyncio.get_running_loop().time() - started_at) * 1000)
@@ -353,7 +429,7 @@ async def handle_object_created(
         doc_id=doc_id,
         project_id=project_id,
         processing_time_ms=elapsed_ms,
-        chunks_count=len(chunks),
+        chunks_count=total_chunks,
     )
 
 
