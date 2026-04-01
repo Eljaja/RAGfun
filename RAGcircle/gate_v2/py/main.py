@@ -2,8 +2,8 @@ from __future__ import annotations
 import uvicorn
 import uuid
 import re
-import json
 import httpx
+from datetime import datetime
 from storage import UploadMeta, upload_with_content_addressing, detect_content_type, download_from_s3
 from collectors import QdrantStore, BM25Store
 from collectors import BM25Store, QdrantStore, create_bm25_store, create_qdrant_store
@@ -21,14 +21,35 @@ from exceptions import register_exception_handlers
 
 from fastapi import UploadFile, File, Form, HTTPException, Query
 from inspect import Parameter, Signature
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+from returns.result import Failure, Success
 
 
-from database_ops import DocumentEventDB, create_db, ProjectDB, DocumentDB
-from auth import UserCreds, authenticated
+from database_ops import (
+    DocumentEvent,
+    DocumentEventDB,
+    DocumentEventType,
+    create_db,
+    ProjectDB,
+    DocumentDB,
+)
+from auth import (
+    ADMIN_SECRET_TOKEN,
+    AUTH_SERVER,
+    UserCreds,
+    authenticated,
+    parse_token_functional,
+)
 from projects import authorize_project
 from settings import Constants
 
+from retrieval_contract import RetrieveRequest as RetrievalServiceRequest, RetrieveResponse
+from generator_contract import (
+    AgentRequest,
+    AgentResponse,
+    ChatRequest as SimpleChatRequest,
+    ChatResponse as SimpleChatResponse,
+)
 
 from ops_bucket import create_collection
 
@@ -43,18 +64,26 @@ class ProjectCreate(BaseModel):
     name: str
     description: str | None = None
     # Immutable after creation — changing these requires re-indexing all docs
-    embedding_model: str = "intfloat/multilingual-e5-base"
+    embedding_model: str = "BAAI/bge-m3"
     chunk_size: int = 512
     chunk_overlap: int = 64
     language: str = "ru"
     # Mutable — can be changed freely
-    llm_model: str = "gemma-3-12b"
+    llm_model: str = "openai/gpt-oss-120b"
+
+class ProjectCreateTemp(BaseModel):
+    name: str
+    description: str | None = None
 
 
 class ProjectUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
     llm_model: str | None = None
+
+
+class TokenCheckRequest(BaseModel):
+    token: str
 
 
 EMBEDDING_DIMENSIONS: dict[str, int] = {
@@ -108,36 +137,6 @@ def get_http_client(request: Request) -> httpx.AsyncClient:
     return request.app.state.http_client
 
 
-def _effective_project_id(requested_project_id: str, settings: Settings) -> str:
-    """Force a single project in stub compatibility mode."""
-    if settings.stub_auth_enabled:
-        return settings.stub_project_id
-    return requested_project_id
-
-
-async def _resolve_project(
-    *,
-    user: UserCreds,
-    requested_project_id: str,
-    settings: Settings,
-    project_db: ProjectDB,
-) -> object:
-    """Return the effective project object, enforcing stub mode when enabled."""
-    effective_project_id = _effective_project_id(requested_project_id, settings)
-    if settings.stub_auth_enabled:
-        return await project_db.ensure_project(
-            project_id=effective_project_id,
-            user_id=settings.stub_user_id,
-            name=settings.stub_project_name,
-            embedding_model=settings.stub_project_embedding_model,
-            chunk_size=settings.stub_project_chunk_size,
-            chunk_overlap=settings.stub_project_chunk_overlap,
-            language=settings.stub_project_language,
-            llm_model=settings.stub_project_llm_model,
-        )
-    return await authorize_project(user, effective_project_id, project_db)
-
-
 # ----------------------------
 # Lifespan
 # ----------------------------
@@ -171,21 +170,6 @@ async def lifecycle(app: FastAPI):
 
         qdrant: QdrantStore = await stack.enter_async_context(create_qdrant_store(settings.qdrant_url))
         opensearch: BM25Store = await stack.enter_async_context(create_bm25_store(settings.opensearch_url))
-
-        if settings.stub_auth_enabled:
-            stub_dim = EMBEDDING_DIMENSIONS.get(settings.stub_project_embedding_model, 768)
-            await project_db.ensure_project(
-                project_id=settings.stub_project_id,
-                user_id=settings.stub_user_id,
-                name=settings.stub_project_name,
-                embedding_model=settings.stub_project_embedding_model,
-                chunk_size=settings.stub_project_chunk_size,
-                chunk_overlap=settings.stub_project_chunk_overlap,
-                language=settings.stub_project_language,
-                llm_model=settings.stub_project_llm_model,
-            )
-            await qdrant.ensure_collection(settings.stub_project_id, dimension=stub_dim)
-            await opensearch.ensure_index(settings.stub_project_id)
 
         http_client = httpx.AsyncClient(timeout=120.0)
 
@@ -221,33 +205,83 @@ async def health_check():
     return {"status": "ok"}
 
 
+@public_router.post("/token-check")
+async def token_check(
+    body: TokenCheckRequest,
+    client: httpx.AsyncClient = Depends(get_http_client),
+):
+    """Validate an API token and return whether it is usable."""
+    token_result = parse_token_functional(f"Bearer {body.token}")
+    match token_result:
+        case Failure(error):
+            return {"valid": False, "reason": error}
+        case Success(token):
+            pass
+
+    try:
+        resp = await client.get(
+            f"{AUTH_SERVER}/verify-token",
+            params={"token": token},
+            headers={"X-Cudo-Admin": f"Bearer {ADMIN_SECRET_TOKEN}"},
+        )
+    except Exception:
+        return {"valid": False, "reason": "auth_service_unreachable"}
+
+    if resp.status_code != 200:
+        return {"valid": False, "reason": f"auth_service_status_{resp.status_code}"}
+
+    try:
+        data = resp.json()
+    except Exception:
+        return {"valid": False, "reason": "auth_service_invalid_response"}
+
+    return {
+        "valid": True,
+        "user_id": data.get("user_id", ""),
+        "limits": data.get("limits", {}),
+    }
+
+
 # ----------------------------
 # Project Endpoints
 # ----------------------------
+"""
+## Bug: Project-level chunk_size never reaches doc_processor
+
+### Problem
+The `ProjectCreate` API accepts `chunk_size` and `chunk_overlap`, and they are stored in the DB.
+However, the `Project` dataclass in `gate_v2/py/database_ops.py` does not include these fields.
+`to_dict()` therefore never serializes them, so they are never written into S3 object metadata.
+
+In `doc_processor_v2/py/pipeline.py:38`:
+    chunk_size = int(project.get("chunk_size", settings.chunk_size_chars))
+
+`project.get("chunk_size")` is always None, so it always falls back to `settings.chunk_size_chars`,
+which comes from the .env `CHUNK_SIZE_CHARS` (currently 5000).
+
+### Fix
+1. Add chunk_size, chunk_overlap, embedding_model, language, llm_model to:
+   - Project dataclass fields (database_ops.py)
+   - Project.from_row()
+   - Project.to_dict()
+2. Set CHUNK_SIZE_CHARS in doc_processor .env to a sensible fallback (e.g. 1024 or 1500).
+
+### Impact
+All documents processed so far used chunk_size=5000 regardless of project settings.
+Re-indexing may be needed after the fix.
+"""
 
 @protected_router.post("/v1/projects")
 async def create_project(
-    payload: ProjectCreate,
+    payload: ProjectCreateTemp,
     user: UserCreds = Depends(authenticated),
-    settings: Settings = Depends(get_settings),
     project_db: ProjectDB = Depends(get_project_db),
     qdrant: QdrantStore = Depends(get_qdrant),
     opensearch: BM25Store = Depends(get_opensearch)
 ):
-    """Create a new project (enforces max limit per user)."""
-    if settings.stub_auth_enabled:
-        project = await project_db.ensure_project(
-            project_id=settings.stub_project_id,
-            user_id=settings.stub_user_id,
-            name=settings.stub_project_name,
-            embedding_model=settings.stub_project_embedding_model,
-            chunk_size=settings.stub_project_chunk_size,
-            chunk_overlap=settings.stub_project_chunk_overlap,
-            language=settings.stub_project_language,
-            llm_model=settings.stub_project_llm_model,
-        )
-        return {"project": project.to_dict()}
 
+    payload = ProjectCreate(**payload.model_dump())
+    """Create a new project (enforces max limit per user)."""
     project = await project_db.create(
         user_id=user.user_id,
         name=payload.name,
@@ -268,23 +302,9 @@ async def create_project(
 @protected_router.get("/v1/projects")
 async def list_projects(
     user: UserCreds = Depends(authenticated),
-    settings: Settings = Depends(get_settings),
     project_db: ProjectDB = Depends(get_project_db),
 ):
     """List all projects owned by the authenticated user."""
-    if settings.stub_auth_enabled:
-        project = await project_db.ensure_project(
-            project_id=settings.stub_project_id,
-            user_id=settings.stub_user_id,
-            name=settings.stub_project_name,
-            embedding_model=settings.stub_project_embedding_model,
-            chunk_size=settings.stub_project_chunk_size,
-            chunk_overlap=settings.stub_project_chunk_overlap,
-            language=settings.stub_project_language,
-            llm_model=settings.stub_project_llm_model,
-        )
-        return {"projects": [project.to_dict()]}
-
     projects = await project_db.list_for_user(user.user_id)
     return {"projects": [p.to_dict() for p in projects]}
 
@@ -293,16 +313,10 @@ async def list_projects(
 async def get_project(
     project_id: str,
     user: UserCreds = Depends(authenticated),
-    settings: Settings = Depends(get_settings),
     project_db: ProjectDB = Depends(get_project_db),
 ):
     """Get a single project (with ownership check)."""
-    project = await _resolve_project(
-        user=user,
-        requested_project_id=project_id,
-        settings=settings,
-        project_db=project_db,
-    )
+    project = await authorize_project(user, project_id, project_db)
     return {"project": project.to_dict()}
 
 
@@ -310,7 +324,6 @@ async def get_project(
 async def delete_project(
     project_id: str,
     user: UserCreds = Depends(authenticated),
-    settings: Settings = Depends(get_settings),
     project_db: ProjectDB = Depends(get_project_db),
     document_db: DocumentDB = Depends(get_document_db),
     s3=Depends(get_s3),
@@ -321,28 +334,24 @@ async def delete_project(
     Delete a project (soft delete).
     Also deletes all documents associated with the project.
     """
-    if settings.stub_auth_enabled:
-        raise HTTPException(status_code=409, detail="stub_project_is_fixed")
-
-    effective_project_id = _effective_project_id(project_id, settings)
     # Verify ownership first
-    await authorize_project(user, effective_project_id, project_db)
+    await authorize_project(user, project_id, project_db)
 
-    await qdrant.delete_collection(effective_project_id)
-    await opensearch.delete_index(effective_project_id)
+    await qdrant.delete_collection(project_id)
+    await opensearch.delete_index(project_id)
 
-    documents, _ = await document_db.list_by_project(effective_project_id, limit=10_000)
+    documents, _ = await document_db.list_by_project(project_id, limit=10_000)
     for doc in documents:
         # probably is fine
-        await s3.delete_object(Bucket="ragfun", Key=effective_project_id + "_" + doc.get("storage_id"))
+        await s3.delete_object(Bucket="ragfun", Key=project_id + "_" + doc.get("storage_id"))
 
     # Delete all documents for this project first
-    await document_db.delete_by_project(effective_project_id)
+    await document_db.delete_by_project(project_id)
 
     # Soft-delete the project
-    deleted = await project_db.delete(effective_project_id, user.user_id)
+    deleted = await project_db.delete(project_id, user.user_id)
 
-    return {"project_id": effective_project_id}
+    return {"project_id": project_id}
 
 
 @protected_router.get("/v1/projects/{project_id}/documents")
@@ -351,21 +360,14 @@ async def list_project_documents(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     user: UserCreds = Depends(authenticated),
-    settings: Settings = Depends(get_settings),
     project_db: ProjectDB = Depends(get_project_db),
     document_db: DocumentDB = Depends(get_document_db),
 ):
     """List documents in a project with pagination."""
-    effective_project_id = _effective_project_id(project_id, settings)
-    await _resolve_project(
-        user=user,
-        requested_project_id=effective_project_id,
-        settings=settings,
-        project_db=project_db,
-    )
+    await authorize_project(user, project_id, project_db)
 
     documents, total = await document_db.list_by_project(
-        effective_project_id, limit=limit, offset=offset
+        project_id, limit=limit, offset=offset
     )
     return {
         "documents": documents,
@@ -380,6 +382,12 @@ async def list_project_documents(
 # ----------------------------
 
 
+# what could be improved
+# user permissions/max_file_size
+#
+
+# another topic to look into
+# well well well
 class DocAttributes(BaseModel):
     title: str
     description: str | None = None
@@ -425,17 +433,12 @@ async def upload(
     s3_client=Depends(get_s3),
     project_db: ProjectDB = Depends(get_project_db),
     document_db: DocumentDB = Depends(get_document_db),
+    event_db: DocumentEventDB = Depends(get_event_db),
     settings: Settings = Depends(get_settings),
 ):
     doc_id = uuid.uuid4().hex
-    effective_project_id = _effective_project_id(project_id, settings)
     # Verify user owns the project
-    project = await _resolve_project(
-        user=user,
-        requested_project_id=effective_project_id,
-        settings=settings,
-        project_db=project_db,
-    )
+    project = await authorize_project(user, project_id, project_db)
 
     content_type = await detect_content_type(file)
     meta = UploadMeta(title=attrs.title, description=attrs.description)
@@ -457,7 +460,7 @@ async def upload(
             yield chunk
 
     # Use project_id as storage prefix for S3 organization
-    storage_prefix = f"{effective_project_id}_"
+    storage_prefix = f"{project_id}_"
 
 
     all_attrs = {
@@ -469,20 +472,37 @@ async def upload(
         bucket=settings.bucket_name,
         request_stream=file_stream(),
         content_type=content_type,
-        max_bytes=1 * 1024 * 1024,
+        max_bytes=settings.max_file_size_bytes, # TODO add an .env var
         storage_prefix=storage_prefix,
         doc_id=doc_id,
         # TODO: fix mixed up pydantic and dataclasses
         doc_attrs = all_attrs, 
     )
     if upload_result.duplicate:
-        raise HTTPException(status_code=409)
+        raise HTTPException(
+            status_code=409,
+            detail="duplicate_upload_attempted",
+        )
 
-    await document_db.persist_document(doc_id, effective_project_id, upload_result, meta)
+    # Do I like that option?
+    # Not really but we can merge results and hide info about doc contents in a way
+    # well shi
+    # shi x2
+    # shi x3
+    # whatever, we do not handle millions of docs, maybe we will scale later
+    
+    await document_db.persist_document(doc_id, project_id, upload_result, meta)
+    await event_db.log_event(
+        doc_id=upload_result.storage_id,
+        project_id=project_id,
+        event_type=DocumentEventType.UPLOADED,
+        service_name="gateway",
+        metadata={"external_doc_id": doc_id},
+    )
 
     return {
         "doc_id": doc_id,
-        "project_id": effective_project_id,
+        "project_id": project_id,
         "size": upload_result.size,
     }
 
@@ -530,6 +550,20 @@ async def download_document(
             "Content-Length": str(doc.get("size", 0)),
         },
     )
+
+
+# TOTHINK
+# should I somehow combine info about a project into uuid + filesha256
+# NONONONONO
+# as Opus said
+# requiring project_id is
+# good practice even if doc_id is
+# globally unique. It acts as a scoping guard
+# (prevents accidentally deleting a doc
+# from the wrong project) and
+# makes authorization
+# checks straightforward.
+# I need
 
 
 @protected_router.delete("/v1/documents/{doc_id}")
@@ -584,7 +618,7 @@ async def get_document_info(
 
 
 @protected_router.get("/v1/documents/{doc_id}/status")
-async def get_document_info(
+async def get_document_status(
     # project_id: str,
     doc_id: str,
     user: UserCreds = Depends(authenticated),
@@ -594,7 +628,7 @@ async def get_document_info(
     # settings=Depends(get_settings),
     event_db=Depends(get_event_db),
 ):
-    """Delete a document (with ownership check via project)."""
+    """Return latest document status event (with ownership check via project)."""
     # Get document to find its project
     doc = await document_db.get(doc_id)
     if not doc:
@@ -607,180 +641,100 @@ async def get_document_info(
     storage_id = doc_obj.get("storage_id")
 
     ev = await event_db.get_latest_event(doc_id=storage_id, project_id=doc_obj.get("project_id"))
-    
-    if getattr(ev, "doc_id"): 
+
+    if ev is None:
+        return DocumentEvent(
+            event_id=f"synthetic-uploaded-{doc_id}-{uuid.uuid4().hex}",
+            doc_id=doc_id,
+            project_id=doc_obj["project_id"],
+            event_type=DocumentEventType.UPLOADED,
+            service_name="gateway",
+            metadata={
+                "source": "status_fallback",
+                "external_doc_id": doc_id,
+                "storage_id": storage_id,
+            },
+            created_at=datetime.utcnow(),
+        )
+
+    if ev.doc_id == storage_id:
         ev.doc_id = doc_id
     return ev
 
 
-class RetrieveRequest(BaseModel):
-    query: str
-    top_k: int = 5
-    rerank: bool = True
-    strategy: str = "hybrid"
+# @protected_router.post("/v1/projects/{project_id}/retrieve")
+# async def retrieve_documents(
+#     project_id: str,
+#     body: RetrievalServiceRequest,
+#     user: UserCreds = Depends(authenticated),
+#     project_db: ProjectDB = Depends(get_project_db),
+#     settings: Settings = Depends(get_settings),
+#     client: httpx.AsyncClient = Depends(get_http_client),
+# ):
+#     await authorize_project(user, project_id, project_db)
+
+#     request = RetrievalServiceRequest(project_id=project_id, **body.model_dump(exclude={"project_id"}))
+#     resp = await client.post(
+#         f"{settings.retrieval_url}/retrieve",
+#         json=request.model_dump(),
+#     )
+
+#     if resp.status_code != 200:
+#         raise HTTPException(status_code=502, detail="Retrieval service error")
+
+#     return RetrieveResponse.model_validate(resp.json())
 
 
-class ChatRequestBody(BaseModel):
-    query: str
-    top_k: int = 5
-    rerank: bool = True
-    strategy: str = "hybrid"
-    max_retries: int = 1
-    reflection_enabled: bool = True
-
-
-class AgentRequestBody(BaseModel):
-    query: str
-    history: list[dict[str, str]] = Field(default_factory=list)
-    include_sources: bool = True
-    top_k: int = 8
-    rerank: bool = True
-    strategy: str = "hybrid"
-    mode: str | None = None
-
-
-@protected_router.post("/v1/projects/{project_id}/retrieve")
-async def retrieve_documents(
-    project_id: str,
-    body: RetrieveRequest,
-    user: UserCreds = Depends(authenticated),
-    settings: Settings = Depends(get_settings),
-    project_db: ProjectDB = Depends(get_project_db),
-    client: httpx.AsyncClient = Depends(get_http_client),
-):
-    effective_project_id = _effective_project_id(project_id, settings)
-    await _resolve_project(
-        user=user,
-        requested_project_id=effective_project_id,
-        settings=settings,
-        project_db=project_db,
-    )
-
-    resp = await client.post(
-        f"{settings.retrieval_url}/retrieve",
-        json={
-            "project_id": effective_project_id,
-            "query": body.query,
-            "top_k": body.top_k,
-            "rerank": body.rerank,
-            "strategy": body.strategy,
-        },
-    )
-
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail="Retrieval service error")
-
-    return resp.json()
-
-
-@protected_router.post("/v1/projects/{project_id}/chat")
+@protected_router.post("/v1/chat")
 async def chat_with_documents(
-    project_id: str,
-    body: ChatRequestBody,
+    body: AgentRequest,
     user: UserCreds = Depends(authenticated),
-    settings: Settings = Depends(get_settings),
     project_db: ProjectDB = Depends(get_project_db),
+    settings: Settings = Depends(get_settings),
     client: httpx.AsyncClient = Depends(get_http_client),
 ):
-    effective_project_id = _effective_project_id(project_id, settings)
-    await _resolve_project(
-        user=user,
-        requested_project_id=effective_project_id,
-        settings=settings,
-        project_db=project_db,
-    )
+    """Full agent pipeline: plan, expand, retrieve, generate, evaluate."""
+    await authorize_project(user, body.project_id, project_db)
 
+    payload = body.model_dump()
     resp = await client.post(
-        f"{settings.generator_url}/chat",
-        json={
-            "project_id": effective_project_id,
-            "query": body.query,
-            "top_k": body.top_k,
-            "rerank": body.rerank,
-            "strategy": body.strategy,
-            "max_retries": body.max_retries,
-            "reflection_enabled": body.reflection_enabled,
-        },
+        f"{settings.generator_url}/agent",
+        json=payload,
     )
 
     if resp.status_code != 200:
         raise HTTPException(status_code=502, detail="Generator service error")
 
-    return resp.json()
+    return AgentResponse.model_validate(resp.json())
 
 
-@protected_router.post("/v1/projects/{project_id}/agent")
-async def agent_with_documents(
-    project_id: str,
-    body: AgentRequestBody,
+@protected_router.post("/v1/chat/stream")
+async def chat_stream(
+    body: AgentRequest,
     user: UserCreds = Depends(authenticated),
     project_db: ProjectDB = Depends(get_project_db),
     settings: Settings = Depends(get_settings),
     client: httpx.AsyncClient = Depends(get_http_client),
 ):
-    await authorize_project(project_db, project_id, user.user_id)
+    """Streaming agent pipeline via SSE passthrough."""
+    await authorize_project(user, body.project_id, project_db)
 
-    resp = await client.post(
-        f"{settings.generator_url}/agent",
-        json={
-            "project_id": project_id,
-            "query": body.query,
-            "history": body.history,
-            "include_sources": body.include_sources,
-            "top_k": body.top_k,
-            "rerank": body.rerank,
-            "strategy": body.strategy,
-            "mode": body.mode,
-        },
-    )
-
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail="Agent service error")
-
-    return resp.json()
-
-
-@protected_router.post("/v1/projects/{project_id}/agent/stream")
-async def agent_with_documents_stream(
-    project_id: str,
-    body: AgentRequestBody,
-    user: UserCreds = Depends(authenticated),
-    project_db: ProjectDB = Depends(get_project_db),
-    settings: Settings = Depends(get_settings),
-    client: httpx.AsyncClient = Depends(get_http_client),
-):
-    await authorize_project(project_db, project_id, user.user_id)
-
-    async def _proxy_stream():
-        try:
-            async with client.stream(
-                "POST",
-                f"{settings.generator_url}/agent/stream",
-                json={
-                    "project_id": project_id,
-                    "query": body.query,
-                    "history": body.history,
-                    "include_sources": body.include_sources,
-                    "top_k": body.top_k,
-                    "rerank": body.rerank,
-                    "strategy": body.strategy,
-                    "mode": body.mode,
-                },
-            ) as upstream:
-                if upstream.status_code != 200:
-                    detail = await upstream.aread()
-                    raise HTTPException(status_code=502, detail=f"Agent stream error: {detail.decode('utf-8', errors='ignore')}")
-                async for chunk in upstream.aiter_text():
-                    if chunk:
-                        yield chunk
-        except HTTPException:
-            raise
-        except Exception as exc:
-            err = {"type": "error", "error": f"Agent stream proxy failed: {exc!s}"}
-            yield f"data: {json.dumps(err)}\n\n"
+    payload = body.model_dump()
+    async def event_proxy():
+        async with client.stream(
+            "POST",
+            f"{settings.generator_url}/agent/stream",
+            json=payload,
+            timeout=120.0,
+        ) as upstream:
+            if upstream.status_code != 200:
+                yield f"data: {{\"type\": \"error\", \"error\": \"generator returned {upstream.status_code}\"}}\n\n"
+                return
+            async for line in upstream.aiter_lines():
+                yield line + "\n"
 
     return StreamingResponse(
-        _proxy_stream(),
+        event_proxy(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -789,6 +743,66 @@ async def agent_with_documents_stream(
         },
     )
 
+
+@protected_router.post("/v1/simple-chat")
+async def simple_chat(
+    body: SimpleChatRequest,
+    user: UserCreds = Depends(authenticated),
+    project_db: ProjectDB = Depends(get_project_db),
+    settings: Settings = Depends(get_settings),
+    client: httpx.AsyncClient = Depends(get_http_client),
+):
+    """Simple chat: retrieve + generate, with optional reflection."""
+    await authorize_project(user, body.project_id, project_db)
+
+    payload = body.model_dump()
+    resp = await client.post(
+        f"{settings.generator_url}/chat",
+        json=payload,
+    )
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail="Generator service error")
+
+    return SimpleChatResponse.model_validate(resp.json())
+
+
+@protected_router.post("/v1/simple-chat/stream")
+async def simple_chat_stream(
+    # project_id: str,
+    body: SimpleChatRequest,
+    user: UserCreds = Depends(authenticated),
+    project_db: ProjectDB = Depends(get_project_db),
+    settings: Settings = Depends(get_settings),
+    client: httpx.AsyncClient = Depends(get_http_client),
+):
+    """Streaming simple chat via SSE passthrough."""
+    await authorize_project(user, body.project_id, project_db)
+
+    payload = body.model_dump()
+
+    async def event_proxy():
+        async with client.stream(
+            "POST",
+            f"{settings.generator_url}/chat/stream",
+            json=payload,
+            timeout=120.0,
+        ) as upstream:
+            if upstream.status_code != 200:
+                yield f"data: {{\"type\": \"error\", \"error\": \"generator returned {upstream.status_code}\"}}\n\n"
+                return
+            async for line in upstream.aiter_lines():
+                yield line + "\n"
+
+    return StreamingResponse(
+        event_proxy(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 
@@ -806,11 +820,10 @@ async def agent_with_documents_stream(
 # App Initialization
 # ----------------------------
 
-app = FastAPI(lifespan=lifecycle, title="S3 Presign API")
+app = FastAPI(lifespan=lifecycle, title="RAGcircle Gateway")
 # register_exception_handlers(app)
 app.include_router(public_router)
 app.include_router(protected_router)
 
 
-if __name__ == "__main__":
-    uvicorn.run(app=app, port=8912, host="0.0.0.0")
+uvicorn.run(app=app, port=8917, host="localhost")

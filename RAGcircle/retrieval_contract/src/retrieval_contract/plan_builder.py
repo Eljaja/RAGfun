@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from models import (
+from retrieval_contract.steps import (
     AdaptiveKStep,
     BM25SearchStep,
     ExecutionPlan,
@@ -77,20 +77,16 @@ def from_llm_plan(
     top_k_min: int = 5,
     top_k_max: int = 24,
 ) -> ExecutionPlan:
-    """Translate LLM planner JSON into a validated ExecutionPlan."""
-    mode = str(plan_dict.get("retrieval_mode") or "hybrid").lower()
+    """Translate LLM planner JSON into a validated ExecutionPlan.
+
+    The LLM may request bm25/vector/hybrid modes, but the retrieval
+    service doesn't support standalone bm25-only search, so we always
+    use hybrid with the LLM's top_k and rerank preferences.
+    """
     raw_k = int(plan_dict.get("top_k") or 10)
     top_k = max(top_k_min, min(top_k_max, raw_k))
     rerank = bool(plan_dict.get("rerank", True))
-
-    if mode == "bm25":
-        return from_preset("hybrid", top_k=top_k, rerank=rerank)
-
-    if mode == "vector":
-        if rerank:
-            return from_preset("hybrid", top_k=top_k, rerank=True)
-        return from_preset("fast", top_k=top_k)
-
+    # TODO: change the misleading method cause this is very bad actually
     return from_preset("hybrid", top_k=top_k, rerank=rerank)
 
 

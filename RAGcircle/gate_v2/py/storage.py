@@ -12,6 +12,8 @@ from dataclasses import dataclass
 import uuid
 
 
+
+
 @dataclass
 class UploadPart:
     etag: str
@@ -104,7 +106,7 @@ async def validated_stream(
     """
     hasher = hashlib.sha256()
     total = 0
-
+    print(f"{max_bytes} this is max bytes")
     async for chunk in stream:
         total += len(chunk)
         if total > max_bytes:

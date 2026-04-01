@@ -1102,6 +1102,7 @@ dependencies = [
     { name = "opensearch-py", extra = ["async"] },
     { name = "pydantic-settings" },
     { name = "qdrant-client" },
+    { name = "retrieval-contract" },
     { name = "tenacity" },
     { name = "uvicorn" },
 ]
@@ -1113,9 +1114,21 @@ requires-dist = [
     { name = "opensearch-py", extras = ["async"], specifier = ">=3.1.0" },
     { name = "pydantic-settings", specifier = ">=2.12.0" },
     { name = "qdrant-client", specifier = ">=1.16.2" },
+    { name = "retrieval-contract", directory = "../retrieval_contract" },
     { name = "tenacity", specifier = ">=9.1.4" },
     { name = "uvicorn", specifier = ">=0.40.0" },
 ]
+
+[[package]]
+name = "retrieval-contract"
+version = "0.1.0"
+source = { directory = "../retrieval_contract" }
+dependencies = [
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "pydantic", specifier = ">=2.0" }]
 
 [[package]]
 name = "six"

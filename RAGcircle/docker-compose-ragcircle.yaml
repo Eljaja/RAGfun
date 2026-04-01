@@ -1,3 +1,13 @@
+# Profiles:
+#   infra     - Storage, messaging, search (rustfs, postgres, rabbitmq, qdrant, opensearch)
+#   inference - ML embedding model (infinity)
+#   apps      - Applications (gate, doc-processor, retrieval, generator, nginx-gate)
+#
+# Examples:
+#   docker compose --profile infra up
+#   docker compose --profile infra --profile inference up
+#   docker compose --profile infra --profile inference --profile apps up  # full stack
+name: ragcircle-dev-11
 services:
 
   # ── Storage ──────────────────────────────────────────────
@@ -7,15 +17,15 @@ services:
     command: /data
     user: "0:0"
     ports:
-      - "127.0.0.1:9004:9000"
-      - "127.0.0.1:9005:9001"
+      - "127.0.0.1:11000:9000"
+      - "127.0.0.1:11001:9001"
     environment:
       RUSTFS_ACCESS_KEY: rustfs
       RUSTFS_SECRET_KEY: password
       RUSTFS_REGION: eu-central
       # MQTT notifications → RabbitMQ
       RUSTFS_NOTIFY_MQTT_ENABLE_primary: "on"
-      RUSTFS_NOTIFY_MQTT_BROKER_primary: "tcp://rabbitmqq:1883"
+      RUSTFS_NOTIFY_MQTT_BROKER_primary: "tcp://rabbitmqq1:1883"
       RUSTFS_NOTIFY_MQTT_TOPIC_primary: "rustfs/events"
       RUSTFS_NOTIFY_MQTT_QOS_primary: "1"
       RUSTFS_NOTIFY_MQTT_USERNAME_primary: "admin"
@@ -25,12 +35,13 @@ services:
         condition: service_healthy
     networks:
       - rustfs-net
+    profiles: [infra]
     restart: unless-stopped
 
   postgres:
     image: postgres:16-alpine
     ports:
-      - "127.0.0.1:${RAGCIRCLE_PG_PORT:-5439}:5432"
+      - "127.0.0.1:11002:5432"
     environment:
       POSTGRES_USER: user
       POSTGRES_PASSWORD: pass
@@ -42,18 +53,19 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    profiles: [infra]
     restart: unless-stopped
 
   # ── Messaging ────────────────────────────────────────────
 
   rabbitmq:
     image: rabbitmq:3-management
-    container_name: rabbitmqq
+    container_name: rabbitmqq1
     ports:
-      - "127.0.0.1:5676:5672"   # AMQP
-      - "127.0.0.1:15676:15672"            # Management UI
-      - "127.0.0.1:1883:1883"              # MQTT (used by RustFS)
-      - "127.0.0.1:15675:15675"            # Web MQTT
+      - "127.0.0.1:11003:5672"   # AMQP
+      - "127.0.0.1:11004:15672"  # Management UI
+      - "127.0.0.1:11005:1883"   # MQTT (used by RustFS)
+      - "127.0.0.1:11006:15675"  # Web MQTT
     command: >
       bash -lc "rabbitmq-plugins enable --offline rabbitmq_mqtt rabbitmq_web_mqtt &&
                 exec rabbitmq-server"
@@ -67,6 +79,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    profiles: [infra]
     restart: unless-stopped
 
   # ── Search ───────────────────────────────────────────────
@@ -74,28 +87,31 @@ services:
   qdrant:
     image: qdrant/qdrant:latest
     ports:
-      - "127.0.0.1:8903:6333"
+      - "127.0.0.1:11007:6333"
     volumes:
       - qdrant-data:/qdrant/storage
+    profiles: [infra]
     restart: unless-stopped
 
   opensearch:
     image: opensearchproject/opensearch:2
     ports:
-      - "127.0.0.1:8905:9200"
+      - "127.0.0.1:11008:9200"
     environment:
       - discovery.type=single-node
       - plugins.security.disabled=true
       - OPENSEARCH_INITIAL_ADMIN_PASSWORD=5a5d5sSS!!13423g!d23s!g2
     volumes:
       - opensearch-data:/usr/share/opensearch/data
+    profiles: [infra]
     restart: unless-stopped
 
   # ── Applications ─────────────────────────────────────────
 
   gate:
     build:
-      context: ./gate_v2
+      context: .
+      dockerfile: gate_v2/Dockerfile
     env_file:
       - ./gate_v2/.env
     network_mode: host
@@ -106,7 +122,9 @@ services:
       rustfs:
         condition: service_started
     restart: unless-stopped
-
+#
+#deploy:
+#  replicas: 3
   doc-processor:
     build:
       context: ./doc_processor_v2
@@ -121,13 +139,12 @@ services:
         condition: service_healthy
       rustfs:
         condition: service_started
-      infinity:
-        condition: service_started
     restart: unless-stopped
 
   retrieval:
     build:
-      context: ./retrieval_v2
+      context: .
+      dockerfile: retrieval_v2/Dockerfile
     env_file:
       - ./retrieval_v2/.env
     network_mode: host
@@ -136,7 +153,8 @@ services:
 
   generator:
     build:
-      context: ./generator_v2
+      context: .
+      dockerfile: generator_v2/Dockerfile
     env_file:
       - ./generator_v2/.env
     network_mode: host
@@ -145,50 +163,79 @@ services:
       - retrieval
     restart: unless-stopped
 
-  # ── Reverse Proxy ───────────────────────────────────────
-  nginx-gate:
-    image: nginx:alpine
-    network_mode: host
-    profiles: [apps]
-    depends_on:
-      - gate
-    restart: unless-stopped
+  # # ── Reverse Proxy ───────────────────────────────────────
+  # nginx-gate:
+  #   image: nginx:alpine
+  #   network_mode: host
+  #   profiles: [apps]
+  #   depends_on:
+  #     - gate
+  #   restart: unless-stopped
+  #   command:
+  #     - sh
+  #     - -c
+  #     - |
+  #       cat > /etc/nginx/conf.d/default.conf <<'EOF'
+  #       server {
+  #           listen 8916;
+  #           location / {
+  #               proxy_pass http://localhost:8912;
+  #               proxy_set_header Host $$host;
+  #               proxy_set_header X-Real-IP $$remote_addr;
+  #               proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
+  #               proxy_set_header X-Forwarded-Proto $$scheme;
+  #           }
+  #       }
+  #       EOF
+  #       nginx -g 'daemon off;'
+
+  # # ── ML ───────────────────────────────────────────────────
+
+  # infinity:
+  #   image: michaelf34/infinity:latest
+  #   command: v2 --model-id ${EMBEDDING_MODEL:-intfloat/multilingual-e5-base}
+  #   ports:
+  #     - "127.0.0.1:8902:7997"
+  #   environment:
+  #     - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1}
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             device_ids: ["${GPU_ID:-1}"]
+  #             capabilities: [gpu]
+  #   volumes:
+  #     - infinity-cache:/app/.cache
+  #   profiles: [inference]
+  #   restart: unless-stopped
+
+  vllm-docling:
+    image: vllm/vllm-openai:latest
     command:
-      - sh
-      - -c
-      - |
-        cat > /etc/nginx/conf.d/default.conf <<'EOF'
-        server {
-            listen 8916;
-            location / {
-                proxy_pass http://localhost:8912;
-                proxy_set_header Host $$host;
-                proxy_set_header X-Real-IP $$remote_addr;
-                proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
-                proxy_set_header X-Forwarded-Proto $$scheme;
-            }
-        }
-        EOF
-        nginx -g 'daemon off;'
-
-  # ── ML ───────────────────────────────────────────────────
-
-  infinity:
-    image: michaelf34/infinity:latest
-    command: v2 --model-id ${EMBEDDING_MODEL:-intfloat/multilingual-e5-base}
+      - "--model"
+      - "ibm-granite/granite-docling-258M"
+      - "--port"
+      - "8123"
+      - "--gpu-memory-utilization"
+      - "${VLLM_DOCLING_GPU_UTIL:-0.82}"
+      - "--max-model-len"
+      - "${VLLM_DOCLING_MAX_MODEL_LEN:-4096}"
     ports:
-      - "127.0.0.1:8902:7997"
+      - "127.0.0.1:8124:8123"
     environment:
-      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1}
+      - HF_HOME=/root/.cache/huggingface
+      - NVIDIA_VISIBLE_DEVICES=0
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ["${GPU_ID:-1}"]
+              device_ids: ["0"]
               capabilities: [gpu]
-    volumes:
-      - infinity-cache:/app/.cache
+    profiles: [inference]
     restart: unless-stopped
 
 volumes:

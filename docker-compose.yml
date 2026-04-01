@@ -192,14 +192,16 @@ services:
       # Optional auth:
       # - RAG_OS_USERNAME=...
       # - RAG_OS_PASSWORD=...
-      - RAG_OS_INDEX_ALIAS=${STUB_PROJECT_ID:-default}
-      - RAG_OS_INDEX_PREFIX=${STUB_PROJECT_ID:-default}_v
+      - RAG_OS_INDEX_ALIAS=rag_chunks
+      - RAG_OS_INDEX_PREFIX=rag_chunks_v
       # Qdrant (Vector)
       - RAG_QDRANT_URL=${RAG_QDRANT_URL:-http://qdrant:6333}
       # Optional auth:
       # - RAG_QDRANT_API_KEY=...
-      # Single stub project collection shared with gate_v2/doc_processor_v2 ingestion.
-      - RAG_QDRANT_COLLECTION=${STUB_PROJECT_ID:-default}
+      # Use a separate collection because the host Infinity embedding model is 512-dim
+      # (existing 'rag_chunks' may already be created with a different vector size).
+      # BAAI/bge-m3 is 1024-dim -> use a separate collection to avoid dimension mismatch.
+      - RAG_QDRANT_COLLECTION=rag_chunks_bge_m3_1024
       - RAG_VECTOR_DISTANCE=cosine
       # Embeddings (Infinity inside docker network)
       - RAG_EMBEDDING_PROVIDER=http
@@ -245,8 +247,8 @@ services:
       - RAG_RERANK_AUTO_MIN_QUERY_TOKENS=6
       - RAG_RERANK_AUTO_MIN_INTERSECTION=2
       # Page-level improvements (QUALITY)
-      - RAG_ENABLE_PAGE_DEDUPLICATION=false
-      - RAG_ENABLE_PARENT_PAGE_RETRIEVAL=false
+      - RAG_ENABLE_PAGE_DEDUPLICATION=true
+      - RAG_ENABLE_PARENT_PAGE_RETRIEVAL=true
       # Observability (optional)
       - RAG_OTEL_ENABLED=false
       - RAG_OTEL_SERVICE_NAME=hybrid-retrieval
@@ -262,12 +264,6 @@ services:
       #   condition: service_started
       # infinity-rerank:
       #   condition: service_started
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8080/v1/readyz || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 20
-      start_period: 30s
     networks:
       - rag-network
       # Optional: attach to rag_fun stack network for shared infinity-embed/rerank
@@ -292,7 +288,7 @@ services:
       - STORAGE_S3_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
       - STORAGE_S3_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfsadmin}
       - STORAGE_S3_REGION=${STORAGE_S3_REGION:-us-east-1}
-      - STORAGE_DB_URL=postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/document_storage
+      - STORAGE_DB_URL=postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@pgbouncer:5432/document_storage
       - STORAGE_DB_POOL_MIN=${STORAGE_DB_POOL_MIN:-1}
       - STORAGE_DB_POOL_MAX=${STORAGE_DB_POOL_MAX:-${POSTGRES_MAX_CONNECTIONS:-1000}}
       - STORAGE_MAX_FILE_SIZE_MB=100
@@ -311,10 +307,10 @@ services:
       - rag-network
       - presign_rustfs-net
 
-  # vLLM (OpenAI-compatible) hosting Granite-Docling. Single GPU: 0; multi-GPU: 0 or 1
+  # vLLM (OpenAI-compatible) hosting Granite-Docling VLM. Single GPU: 0; multi-GPU: 0 or 1
   vllm-docling:
     image: vllm/vllm-openai:latest
-    command: ["--model", "ibm-granite/granite-docling-258M", "--port", "8123"]
+    command: ["--model", "ibm-granite/granite-docling-258M", "--port", "8123", "--gpu-memory-utilization", "${VLLM_DOCLING_GPU_UTIL:-0.82}", "--max-model-len", "${VLLM_DOCLING_MAX_MODEL_LEN:-4096}"]
     ports:
       - "8124:8123"
     volumes:
@@ -332,7 +328,7 @@ services:
               device_ids: ["${NVIDIA_DEVICE_VLLM:-0}"]
               capabilities: [gpu]
 
-  # Document Processor Service (pulls files from document-storage, prefers PDF text layers and falls back to OCR)
+  # Document Processor Service (pulls files from document-storage, uses Granite-Docling via vLLM, indexes into retrieval)
   doc-processor:
     build:
       context: ./doc-processor
@@ -345,7 +341,6 @@ services:
       - PROCESSOR_SERVICE_NAME=doc-processor
       - PROCESSOR_ENVIRONMENT=dev
       - PROCESSOR_LOG_LEVEL=INFO
-      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_DEVICE_DOC_PROCESSOR:-0}
       - PROCESSOR_STORAGE_URL=http://document-storage:8081
       - PROCESSOR_STORAGE_TIMEOUT_S=60
       - PROCESSOR_RETRIEVAL_URL=http://retrieval:8080
@@ -354,14 +349,6 @@ services:
       # Optional auth (if your VLM endpoint needs it):
       # - PROCESSOR_VLM_API_KEY=...
       - PROCESSOR_VLM_MODEL=ibm-granite/granite-docling-258M
-      - PROCESSOR_OCR_ENABLED=true
-      - PROCESSOR_OCR_LANG=${PROCESSOR_OCR_LANG:-ru,en}
-      - PROCESSOR_OCR_DEVICE=${PROCESSOR_OCR_DEVICE:-gpu:0}
-      - PROCESSOR_OCR_USE_DOC_ORIENTATION_CLASSIFY=${PROCESSOR_OCR_USE_DOC_ORIENTATION_CLASSIFY:-true}
-      - PROCESSOR_OCR_USE_DOC_UNWARPING=${PROCESSOR_OCR_USE_DOC_UNWARPING:-true}
-      - PROCESSOR_OCR_USE_TEXTLINE_ORIENTATION=${PROCESSOR_OCR_USE_TEXTLINE_ORIENTATION:-true}
-      - PROCESSOR_PDF_TEXT_MIN_CHARS=80
-      - PROCESSOR_OCR_MAX_CONCURRENCY=4
       # Extraction quality knobs (QUALITY)
       - PROCESSOR_VLM_TIMEOUT_S=180
       - PROCESSOR_MAX_PAGES=35
@@ -374,19 +361,12 @@ services:
       document-storage:
         condition: service_started
       retrieval:
-        condition: service_healthy
+        condition: service_started
       # vllm-docling optional for .txt (doc-processor uses extract_text_non_vlm). For PDF/DOCX start vllm-docling or add condition: service_started
       # vllm-docling:
       #   condition: service_started
     networks:
       - rag-network
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["${NVIDIA_DEVICE_DOC_PROCESSOR:-0}"]
-              capabilities: [gpu]
 
   ingestion-worker:
     build:
@@ -414,7 +394,7 @@ services:
       document-storage:
         condition: service_started
       retrieval:
-        condition: service_healthy
+        condition: service_started
       doc-processor:
         condition: service_started
     networks:
@@ -469,8 +449,8 @@ services:
       - GATE_RABBIT_QUEUE=ingestion.tasks
       # LLM (OpenAI-compatible). Keep mock as default to avoid requiring a key by default.
       - GATE_LLM_PROVIDER=${GATE_LLM_PROVIDER:-mock}
-      - GATE_LLM_BASE_URL=${GATE_LLM_BASE_URL:-https://llm.c.singularitynet.io/v1}
-      - GATE_LLM_MODEL=${GATE_LLM_MODEL:-minimax/minimax-m2.1}
+      - GATE_LLM_BASE_URL=${GATE_LLM_BASE_URL:-https://inference.asicloud.cudos.org/v1}
+      - GATE_LLM_MODEL=${GATE_LLM_MODEL:-openai/gpt-oss-120bt}
       - GATE_LLM_API_KEY=${GATE_LLM_API_KEY:-}
       - GATE_LLM_TIMEOUT_S=60
       # ODS tenant enforcement (\"full ODS\")
@@ -502,20 +482,54 @@ services:
       - "${RUGFUNSOTA_AGENT_PORT:-8093}:8091"
     environment:
       - AGENT_GATE_URL=http://rag-gate:8090
-      - AGENT_GATE_USE_V2=false
-      - AGENT_GATE_PROJECT_ID=default
       - AGENT_GATE_TIMEOUT_S=60
       - AGENT_MAX_LLM_CALLS=${AGENT_MAX_LLM_CALLS:-12}
       - AGENT_MAX_FACT_QUERIES=${AGENT_MAX_FACT_QUERIES:-2}
-      - AGENT_LLM_BASE_URL=${GATE_LLM_BASE_URL:-https://llm.c.singularitynet.io/v1}
-      - AGENT_LLM_MODEL=${GATE_LLM_MODEL:-minimax/minimax-m2.1}
+      - AGENT_LLM_BASE_URL=${GATE_LLM_BASE_URL:-https://inference.asicloud.cudos.org/v1}
+      - AGENT_LLM_MODEL=${GATE_LLM_MODEL:-openai/gpt-oss-120bt}
       - AGENT_LLM_API_KEY=${GATE_LLM_API_KEY:-}
       - AGENT_LLM_TIMEOUT_S=60
       - AGENT_USE_HYDE=${AGENT_USE_HYDE:-}
       - AGENT_USE_FACT_QUERIES=${AGENT_USE_FACT_QUERIES:-true}
       - AGENT_USE_RETRY=${AGENT_USE_RETRY:-true}
     depends_on:
-      retrieval:
+      rag-gate:
+        condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - rag-network
+
+  # Deep research service (langgraph + gate MCP). Profile: not started if ./deep-research missing.
+  deep-research:
+    profiles:
+      - deep-research
+    build:
+      context: .
+      dockerfile: deep-research/Dockerfile
+    ports:
+      - "${RUGFUNSOTA_DEEP_PORT:-8094}:8092"
+    environment:
+      - DEEP_LLM_PROVIDER=${GATE_LLM_PROVIDER:-mock}
+      - DEEP_LLM_BASE_URL=${GATE_LLM_BASE_URL:-https://inference.asicloud.cudos.org/v1}
+      - DEEP_LLM_API_KEY=${GATE_LLM_API_KEY:-}
+      - DEEP_LLM_MODEL=${GATE_LLM_MODEL:-meta-llama/llama-3.3-70b-instruct}
+      - DEEP_GATE_URL=http://rag-gate:8090
+      - DEEP_GATE_TIMEOUT_S=60
+      - DEEP_LLM_TEMPERATURE=0
+      - DEEP_MAX_ITERATIONS=2
+      - DEEP_RETRIEVAL_MODE=hybrid
+      - DEEP_TOP_K=8
+      - DEEP_RERANK=true
+      - DEEP_USE_WEB_SEARCH=${DEEP_USE_WEB_SEARCH:-false}
+      - WEB_SEARCH_PROVIDER=${WEB_SEARCH_PROVIDER:-}
+      - WEB_SEARCH_API_KEY=${WEB_SEARCH_API_KEY:-}
+      - SERPER_API_KEY=${SERPER_API_KEY:-}
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
+      - WEB_SEARCH_NUM=${WEB_SEARCH_NUM:-5}
+      - WEB_SEARCH_TIMEOUT_S=${WEB_SEARCH_TIMEOUT_S:-15}
+    depends_on:
+      rag-gate:
         condition: service_started
     extra_hosts:
       - "host.docker.internal:host-gateway"

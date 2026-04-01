@@ -6,6 +6,10 @@ Stripping out anything that's indexing-time or brain-layer, here's what's left -
 
 **Metadata filtering** on existing search steps. Push filters into Qdrant/OpenSearch queries so you search a narrower candidate set. Tags, language, source document, ACL -- all already indexed by the doc processor. Not a separate step, just a `filters` field on `VectorSearchStep` and `BM25SearchStep`.
 
+> **Priority consumer: generator_v2 factoid expand.** The old gate's factoid expansion searched *within* the top-scoring source documents (`doc_ids` filter) rather than doing a blind corpus-wide query. This is a meaningful quality regression in the current generator -- factoid sub-questions like "what was the exact date?" retrieve much better when scoped to the 1-2 documents that already scored highest. Once metadata filtering lands here, the generator's `retrieval_client.py` needs a `filters: dict | None` parameter, and `steps/enrich.py` (`FactoidExpandStep`) passes `{"source_id": [top_chunk.source_id for ...]}`. ~15 lines on the generator side once this service exposes the capability.
+
+> **Shared SDK client.** Both `generator_v2` and `gate_v2` maintain their own HTTP retrieval wrappers. A thin shared client package (or at minimum a shared schema/types module) would make rolling out new retrieval features (like filters) a single-point change instead of updating N callers independently.
+
 **Phrase search.** Exact phrase matching via OpenSearch `match_phrase`. Different from BM25's fuzzy term matching. When the user searches for "error code 5042", you want exact string match, not BM25's term-frequency weighting across "error" and "code" and "5042" separately.
 
 ## New Fusion Methods

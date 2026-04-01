@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 
+import fitz
 from lxml import etree
 from pdf2image import convert_from_bytes
 from PIL import Image
@@ -202,22 +203,35 @@ def _convert_office_to_pdf(raw: bytes, ext: str) -> bytes:
             return f.read()
 
 
-def pdf_to_page_pngs(pdf_bytes: bytes, *, max_pages: int, max_side_px: int) -> list[bytes]:
+def get_pdf_page_count(pdf_bytes: bytes) -> int:
+    """Return total page count without rendering anything (PyMuPDF)."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    count = len(doc)
+    doc.close()
+    return count
+
+
+def pdf_to_page_pngs(
+    pdf_bytes: bytes,
+    *,
+    first_page: int = 1,
+    last_page: int,
+    max_side_px: int,
+) -> list[bytes]:
     """
-    Render PDF pages to PNG bytes using pdf2image (Poppler).
+    Render a page range of a PDF to PNG bytes using pdf2image (Poppler).
+    `first_page` and `last_page` are 1-indexed and inclusive.
     """
-    # Convert PDF to PIL images
-    # Use a reasonable DPI to start, then resize to max_side_px
     images = convert_from_bytes(
         pdf_bytes,
         dpi=150,
-        last_page=max_pages,
-        fmt="png"
+        first_page=first_page,
+        last_page=last_page,
+        fmt="png",
     )
-    
+
     out: list[bytes] = []
     for img in images:
-        # Scale so the largest side is max_side_px
         width, height = img.size
         max_side = max(width, height)
         if max_side > max_side_px:
@@ -225,12 +239,11 @@ def pdf_to_page_pngs(pdf_bytes: bytes, *, max_pages: int, max_side_px: int) -> l
             new_width = int(width * scale)
             new_height = int(height * scale)
             img = img.resize((new_width, new_height), Image.LANCZOS)
-        
-        # Convert to PNG bytes
+
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         out.append(buf.getvalue())
-    
+
     return out
 
 
