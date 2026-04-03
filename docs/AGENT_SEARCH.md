@@ -2,7 +2,7 @@
 
 Service: agent-search (port 8093 by default). Profile: `agent-search`.
 
-Flow: **plan** → optional HyDE → **Gate.chat** → quality check → optional **fact queries** → **answer** (with citation [1], [2]).
+Flow: **plan** → optional HyDE → **retrieval.search** → quality check → optional **fact queries** → **answer** (with citation [1], [2]).
 
 ## Endpoints
 
@@ -20,7 +20,7 @@ Server-Sent Events (SSE). Event types: `init`, `trace`, `retrieval`, `token`, `d
 |-------|------|-------------|
 | `query` | string | User question (required) |
 | `history` | array | Conversation history `[{role, content}]` (optional) |
-| `filters` | object | Gate filters (e.g. `project_id`, `source`) |
+| `filters` | object | Retrieval filters (e.g. `project_id`, `source`) |
 | `include_sources` | bool | Include sources in response (default `true`) |
 | `top_k` | int | Override retrieval top_k (5..24); else from plan |
 | `use_adaptive_k` | bool | Adaptive-k cutoff (override env) |
@@ -43,8 +43,8 @@ Server-Sent Events (SSE). Event types: `init`, `trace`, `retrieval`, `token`, `d
 
 | Variable | Description |
 |----------|-------------|
-| `AGENT_GATE_URL` | Gate base URL (e.g. http://rag-gate:8090) |
-| `AGENT_GATE_TIMEOUT_S` | Timeout for Gate calls |
+| `AGENT_RETRIEVAL_URL` | Retrieval base URL (e.g. http://retrieval:8080) |
+| `AGENT_RETRIEVAL_TIMEOUT_S` | Timeout for retrieval calls |
 | `AGENT_MAX_LLM_CALLS` | Default max LLM calls per request |
 | `AGENT_MAX_FACT_QUERIES` | Default max fact queries |
 | `AGENT_USE_HYDE` | Enable HyDE by default |

@@ -58,3 +58,40 @@ ANSWER_USER = (
     "{history}Question:\n{query}\n\nContext:\n{context}\n\n"
     "Answer in the same language as the question."
 )
+ANSWER_SYSTEM_FACTOID = (
+    "You answer using the provided context only. "
+    "Return the shortest exact answer span copied from the context that fully answers the question. "
+    "Prefer a bare entity, number, date, amount, or short noun phrase instead of a full sentence. "
+    "Do not paraphrase, translate, explain, or add extra details beyond the answer span. "
+    "When you use information from a context block, cite it with [N] where N is the block number (e.g. [1], [2]). "
+    "If the context is insufficient, say exactly: Insufficient context. "
+    "Reply in {lang}. Do not output <think> or chain-of-thought; give only the final answer with citations."
+)
+ANSWER_SYSTEM_WITH_TOOLS_FACTOID = (
+    "You answer using the provided context only. "
+    "ALWAYS use the calculator tool for any numeric computation (arithmetic, sqrt, log, etc). "
+    "Use execute_code for code that must run (e.g. list comprehensions, data transforms). "
+    "Return the shortest exact answer span copied from the context that fully answers the question. "
+    "Prefer a bare entity, number, date, amount, or short noun phrase instead of a full sentence. "
+    "Do not paraphrase, translate, explain, or add extra details beyond the answer span. "
+    "Cite context with [N] when you use it. "
+    "If the context is insufficient, say exactly: Insufficient context. "
+    "Reply in {lang}. Do not output <think> or chain-of-thought; give only the final answer with citations."
+)
+ANSWER_USER_FACTOID = (
+    "{history}Question:\n{query}\n\nContext:\n{context}\n\n"
+    "Return only the shortest exact answer span plus citation."
+)
+FACTOID_REWRITE_SYSTEM = (
+    "Rewrite the draft answer into the shortest exact answer span copied from the context. "
+    "Keep the same language as the question. "
+    "Do not paraphrase, translate, explain, or add details. "
+    "Return only the final short answer plus citation like [1]. "
+    "If the context is insufficient, say exactly: Insufficient context."
+)
+FACTOID_REWRITE_USER = (
+    "Question:\n{query}\n\n"
+    "Draft answer:\n{draft}\n\n"
+    "Context:\n{context}\n\n"
+    "Return the shortest exact answer span from the context plus citation."
+)

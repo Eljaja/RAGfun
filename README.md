@@ -150,13 +150,13 @@ The system consists of **8 microservices** organized into application, ML, and i
 
 ### Agent-Search
 
-LLM-driven search (profile `agent-search`): plan → Gate.chat → quality check → fact queries → answer, with optional web search.
+LLM-driven search (profile `agent-search`): plan → retrieval.search → quality check → fact queries → answer.
 
 | Service | Port | Description |
 |---------|------|-------------|
-| **agent-search** | 8093 | Plan → Gate.chat → quality check → fact queries → answer (optional web search, citation [1][2]) |
+| **agent-search** | 8093 | Plan → retrieval.search → quality check → fact queries → answer with citations [1][2] |
 
-**Features:** Web search (Serper/Tavily), per-request limits (`max_llm_calls`, `max_fact_queries`), feature flags (`use_hyde`, `use_fact_queries`, `use_retry`), mode presets (`minimal`/`conservative`/`aggressive`), Prometheus metrics.
+**Features:** Per-request limits (`max_llm_calls`, `max_fact_queries`), feature flags (`use_hyde`, `use_fact_queries`, `use_retry`), mode presets (`minimal`/`conservative`/`aggressive`), Prometheus metrics.
 
 See **[docs/AGENT_SEARCH.md](./docs/AGENT_SEARCH.md)** for API reference and configuration.
 

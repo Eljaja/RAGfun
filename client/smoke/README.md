@@ -32,3 +32,32 @@ python -m client.smoke.run_smoke --upload-file /path/to/doc.txt
 # keep created projects for inspection
 python -m client.smoke.run_smoke --keep-projects
 ```
+
+## Agent Benchmark
+
+Compare the old and new `agent-search` stacks on a sampled SQuAD v1.1 benchmark:
+
+```bash
+python -m client.smoke.compare_agents_squad --sample-size 40 --output /tmp/agent_compare.json
+```
+
+Default targets:
+
+- old retrieval: `http://127.0.0.1:8085`
+- old agent: `http://127.0.0.1:8093`
+- new retrieval: `http://127.0.0.1:18085`
+- new agent: `http://127.0.0.1:18093`
+
+The script reports:
+
+- `exact_match_rate`
+- `contains_gold_rate`
+- `gold_in_context_rate`
+- `mean_f1`
+- `citation_rate`
+- `partial_rate`
+- `latency`
+- `mean_llm_calls`
+- `mean_retrieval_calls`
+- `retry_rate`
+- `error_count`
