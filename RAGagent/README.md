@@ -1,11 +1,11 @@
 # RAGagent
 
-Services and shared code for **agent-search** and **deep-research**.
+Code and shared libraries for **agent-search**.
 
 ## Layout
 
-- `agent-search/` — FastAPI agent: plan → `retrieval.search` → quality → fact queries → answer (optional **factoid** style). See [docs/AGENT_SEARCH.md](../docs/AGENT_SEARCH.md).
-- `agent_common/` — Shared prompts, retrieval helpers, **`AsyncRetrievalClient`** (agent-search), **`AsyncGateClient`** (deep-research + legacy), tools.
+- `agent-search/` — FastAPI agent: plan → `retrieval.search` → quality checks → fact queries → answer, with optional **factoid** answer style. See [docs/AGENT_SEARCH.md](../docs/AGENT_SEARCH.md).
+- `agent_common/` — Shared prompts, retrieval helpers, **`AsyncRetrievalClient`**, tools, and other modules consumed by agent-search.
 
 ## Docker (agent-search)
 
@@ -16,4 +16,4 @@ cd RAGagent
 docker build -f agent-search/Dockerfile -t ragagent-agent-search .
 ```
 
-Configure **`AGENT_RETRIEVAL_URL`** (e.g. `http://retrieval:8080`) and LLM variables per [docs/AGENT_SEARCH.md](../docs/AGENT_SEARCH.md).
+Configure **`AGENT_RETRIEVAL_URL`** (for example `http://retrieval:8080`) and LLM variables as described in [docs/AGENT_SEARCH.md](../docs/AGENT_SEARCH.md).

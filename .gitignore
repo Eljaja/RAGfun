@@ -218,6 +218,5 @@ results/
 scripts/
 tmp_upload/
 
-# Local docs (chunking comparison, tuning guides)
-docs/BRIGHT_CHUNKING_COMPARISON.md
+# Local docs (tuning guides)
 docs/USER_GUIDE_TUNING_AND_FEATURES.md

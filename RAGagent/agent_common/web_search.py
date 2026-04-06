@@ -1,8 +1,8 @@
 """
-Web search client for agent-search and deep-research.
+Optional HTTP client for third-party search JSON APIs.
 
-Supports Serper (Google Search API) and Tavily. Set WEB_SEARCH_PROVIDER=serper|tavily
-and the corresponding API key. When unset or empty key, web search is disabled.
+Set WEB_SEARCH_PROVIDER and the matching API key environment variables.
+When unset or the key is empty, calls return no results.
 """
 
 from __future__ import annotations

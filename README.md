@@ -10,7 +10,7 @@ This repository implements a full-featured RAG system with:
 - **VLM-Powered Document Processing**: Uses Vision-Language Models (Granite-Docling) for accurate document-to-text extraction
 - **Stateless Microservices**: Horizontally scalable services with clear separation of concerns
 - **Agent-Search**: LLM-driven retrieval (plan, HyDE, fact queries, retry)
-- **Full ODS Tenant Isolation**: API key based tenant enforcement in Gate, agent-search, deep-research, and UI
+- **Full ODS Tenant Isolation**: API key based tenant enforcement in Gate, agent-search, and UI
 - **Advanced Features**: Multi-query expansion, two-pass retrieval, reranking, segment stitching, auto-tuning
 - **Full Observability**: Prometheus metrics, Grafana dashboards, structured logging
 - **Async Processing**: RabbitMQ-based ingestion pipeline with retry/DLQ
@@ -59,10 +59,9 @@ The default `docker-compose.yml` includes the Infinity embeddings service (BAAI/
    ```bash
    docker compose up -d --build
    ```
-   With agent-search and/or deep-research:
+   With agent-search:
    ```bash
    docker compose --profile agent-search up -d --build
-   docker compose --profile deep-research up -d --build   # optional: iterative research reports
    ```
 
 4. **Wait for services to be ready** (typically 2-3 minutes):
@@ -115,7 +114,7 @@ curl -X POST http://localhost:8092/v1/chat \
 
 ### System Components
 
-The system consists of **8 microservices** organized into application, ML, and infrastructure layers:
+The system consists of **application, ML, and infrastructure layers** with these main components:
 
 #### Application Services
 - **rag-gate** (`:8092`) - FastAPI gateway; orchestrates uploads, chat, and streaming responses (internal port `:8090`)
@@ -123,7 +122,6 @@ The system consists of **8 microservices** organized into application, ML, and i
 - **document-storage** (`:8081`) - Stores document bytes (S3-compatible) and metadata (Postgres)
 - **doc-processor** (`:8082`) - Async worker for document extraction, chunking, and indexing
 - **agent-search** (`:8093`, profile `agent-search`) - LLM-driven search: plan, HyDE, fact queries, retry
-- **deep-research** (`:8094`, profile `deep-research`) - LangGraph-based iterative research: plan → scope → research loop → streaming report
 - **ui** (`:3301`) - Nginx-served SPA with SSE streaming support
 
 ### Full ODS (Tenant Isolation)
@@ -132,7 +130,7 @@ The system consists of **8 microservices** organized into application, ML, and i
 - Client sends `X-ODS-API-KEY` (or `Authorization: Bearer ...`)
 - Gate resolves `tenant_id` via `document-storage /v1/auth/resolve`
 - Any client-provided `tenant_id` is overridden by the resolved tenant
-- UI forwards API key to chat, documents, collections, agent-search, and deep-research
+- UI forwards API key to chat, documents, collections, and agent-search
 
 #### ML/Embedding Services
 - **infinity** (`:7997`) - BAAI/bge-m3 multilingual embeddings (1024-dim, 100+ languages)
@@ -475,7 +473,6 @@ Services that scale horizontally:
 ## Documentation
 
 - **[docs/AGENT_SEARCH.md](./docs/AGENT_SEARCH.md)** — Agent-search API
-- **[docs/DEEP_RESEARCH_SETUP_AND_ODS_GAPS.md](./docs/DEEP_RESEARCH_SETUP_AND_ODS_GAPS.md)** — Deep-research and ODS integration notes
 - **[docs/ENDPOINTS_EXAMPLES.md](./docs/ENDPOINTS_EXAMPLES.md)** — Retrieval API examples
 - **[docs/gate/GATE_API.md](./docs/gate/GATE_API.md)** — Gate API
 
