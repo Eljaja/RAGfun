@@ -15,6 +15,7 @@ import httpx
 from config import Settings
 from lib.context import merge_chunks, stitch_segments
 from engine.brain_budget import BudgetCounter
+from engine.trace_collector import TraceCollector
 from clients.llm import LLMClient
 from retrieval_contract import ChunkResult, ExecutionPlan, ScoreSource
 from retrieval_contract import from_preset
@@ -41,6 +42,7 @@ from steps.expand import (
     query_variants_expand,
     two_pass_expand,
 )
+from steps.query_heuristics import unique_source_count
 from steps.retrieve import fetch_all
 
 logger = logging.getLogger(__name__)
@@ -68,9 +70,9 @@ async def run_retrieval(
     budget: BudgetCounter,
     llm: LLMClient,
     model: str,
+    collector: TraceCollector,
 ) -> RetrievalResult:
     """Run the full retrieval pipeline, return chunks + traces."""
-    traces: list[dict[str, Any]] = []
 
     # TODO: think about this one 
     # I think we should be able to merge plans if they are the same 
@@ -83,7 +85,7 @@ async def run_retrieval(
 
     # -- Initial expand: original query + expand-step queries
     requests = [RetrievalRequest(query=query)]
-    expand_reqs, expand_traces = await _initial_expand(
+    expand_reqs = await _initial_expand(
         initial_expand_steps,
         query=query,
         meta=meta,
@@ -91,9 +93,9 @@ async def run_retrieval(
         budget=budget,
         llm=llm,
         model=model,
+        collector=collector,
     )
     requests.extend(expand_reqs)
-    traces.extend(expand_traces)
 
     # -- First fetch
     chunks = await fetch_all(
@@ -105,21 +107,21 @@ async def run_retrieval(
     )
 
     if not chunks:
-        return RetrievalResult(chunks=[], traces=traces)
+        return RetrievalResult(chunks=[], traces=list(collector.entries))
 
     # -- Loop: check -> expand -> fetch
     for round_idx in range(max_rounds - 1):
         if not _should_continue(loop_check_steps, chunks=chunks):
             break
 
-        loop_reqs, loop_traces = _loop_expand(
+        loop_reqs = _loop_expand(
             loop_expand_steps,
             query=query,
             chunks=chunks,
             is_factoid=meta.is_factoid,
             retrieval_plan=meta.retrieval_plan,
+            collector=collector,
         )
-        traces.extend(loop_traces)
 
         if not loop_reqs:
             break
@@ -132,16 +134,15 @@ async def run_retrieval(
             settings=settings,
         )
         chunks = merge_chunks([chunks, extra])
-        traces.append({
+        collector._entries.append({
             "kind": "action", "label": "RetrievalLoop",
             "content": f"Round {round_idx + 2}: fetched {len(extra)} extra chunks",
         })
 
     # -- Finalize
-    chunks, finalize_traces = _finalize(finalize_steps, chunks=chunks)
-    traces.extend(finalize_traces)
+    chunks = _finalize(finalize_steps, chunks=chunks, collector=collector)
 
-    return RetrievalResult(chunks=chunks, traces=traces)
+    return RetrievalResult(chunks=chunks, traces=list(collector.entries))
 
 
 # ── Initial expand ───────────────────────────────────────
@@ -156,52 +157,61 @@ async def _initial_expand(
     budget: BudgetCounter,
     llm: LLMClient,
     model: str,
-) -> tuple[list[RetrievalRequest], list[dict[str, Any]]]:
+    collector: TraceCollector,
+) -> list[RetrievalRequest]:
     """Dispatch expand steps to leaf functions, collect retrieval requests."""
     requests: list[RetrievalRequest] = []
-    traces: list[dict[str, Any]] = []
 
     for step in steps:
         match step:
             case HyDEStep(num_passages=num_passages):
-                queries, t = await hyde(
+                queries = await hyde(
                     query=query, lang=meta.lang, budget=budget,
                     llm=llm, model=model, num_passages=num_passages,
+                    collector=collector,
                 )
                 requests.extend(RetrievalRequest(query=q) for q in queries)
-                traces.extend(t)
 
             case FactQueryStep(max_queries=max_q):
-                queries, t = await fact_queries(
+                queries = await fact_queries(
                     query=query, history_text=history_text,
                     max_queries=max_q, budget=budget,
                     retrieval_plan=meta.retrieval_plan,
                     llm=llm, model=model,
+                    collector=collector,
                 )
-                logger.warning(f" this is a raw JSON SEemingly {queries} {t}")
+                logger.warning(f" this is a raw JSON SEemingly {queries}")
                 requests.extend(RetrievalRequest(query=q) for q in queries)
-                traces.extend(t)
 
             case KeywordStep():
-                queries, t = await keywords(
+                queries = await keywords(
                     query=query, history_text=history_text,
                     budget=budget, retrieval_plan=meta.retrieval_plan,
                     llm=llm, model=model,
+                    collector=collector,
                 )
                 requests.extend(RetrievalRequest(query=q) for q in queries)
-                traces.extend(t)
 
             case QueryVariantsStep():
-                reqs, t = query_variants_expand(query=query)
+                reqs = query_variants_expand(query=query)
+                if reqs:
+                    await collector.emit({
+                        "kind": "action", "label": "QueryVariants",
+                        "content": f"Generated {len(reqs)} variants",
+                    })
                 requests.extend(reqs)
-                traces.extend(t)
 
             case BM25AnchorStep(top_k=anchor_k):
-                reqs, t = bm25_anchor_expand(query=query, top_k=anchor_k)
+                reqs = bm25_anchor_expand(query=query, top_k=anchor_k)
+                if reqs:
+                    kw = reqs[0].query
+                    await collector.emit({
+                        "kind": "action", "label": "BM25Anchor",
+                        "content": f"kw={kw[:60]}",
+                    })
                 requests.extend(reqs)
-                traces.extend(t)
 
-    return requests, traces
+    return requests
 
 
 # ── Loop helpers ─────────────────────────────────────────
@@ -227,37 +237,46 @@ def _should_continue(
     return False
 
 
-def _loop_expand(
+async def _loop_expand(
     steps: list[LoopExpandStep],
     *,
     query: str,
     chunks: list[ChunkResult],
     is_factoid: bool,
     retrieval_plan: ExecutionPlan | None,
-) -> tuple[list[RetrievalRequest], list[dict[str, Any]]]:
+    collector: TraceCollector,
+) -> list[RetrievalRequest]:
     """Dispatch loop-expand steps to leaf functions, collect requests."""
     requests: list[RetrievalRequest] = []
-    traces: list[dict[str, Any]] = []
 
     for step in steps:
         match step:
             case TwoPassStep(min_unique_sources=min_src):
-                reqs, t = two_pass_expand(
+                reqs = two_pass_expand(
                     query=query, chunks=chunks,
                     min_unique_sources=min_src,
                     retrieval_plan=retrieval_plan,
                 )
+                if reqs:
+                    n_unique = unique_source_count(chunks)
+                    await collector.emit({
+                        "kind": "action", "label": "TwoPass",
+                        "content": f"Only {n_unique} unique sources, follow-up query queued",
+                    })
                 requests.extend(reqs)
-                traces.extend(t)
 
             case FactoidExpandStep():
-                reqs, t = factoid_expand(
+                reqs = factoid_expand(
                     query=query, chunks=chunks, is_factoid=is_factoid,
                 )
+                if reqs:
+                    await collector.emit({
+                        "kind": "action", "label": "FactoidExpand",
+                        "content": "Expanding within top sources",
+                    })
                 requests.extend(reqs)
-                traces.extend(t)
 
-    return requests, traces
+    return requests
 
 
 # ── Finalize ─────────────────────────────────────────────
@@ -267,18 +286,18 @@ def _finalize(
     steps: list[StitchStep],
     *,
     chunks: list[ChunkResult],
-) -> tuple[list[ChunkResult], list[dict[str, Any]]]:
+    collector: TraceCollector,
+) -> list[ChunkResult]:
     """Run finalize steps (stitching, etc.) on the final chunk set."""
-    traces: list[dict[str, Any]] = []
 
     for step in steps:
         before = len(chunks)
         chunks = stitch_segments(chunks, max_per_segment=step.max_per_segment)
         after = len(chunks)
         if before != after:
-            traces.append({
+            collector._entries.append({
                 "kind": "action", "label": "Stitch",
                 "content": f"Stitched {before} chunks into {after} segments",
             })
 
-    return chunks, traces
+    return chunks

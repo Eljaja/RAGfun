@@ -10,8 +10,10 @@ import asyncio
 import logging
 from typing import Any
 
+
 from config import Settings
 from engine.brain_budget import BudgetCounter
+from engine.trace_collector import TraceCollector
 from clients.llm import LLMClient, LLMParseError, LLMTransportError
 from models.plan import ConfigMeta
 from retrieval_contract import ExecutionPlan
@@ -46,37 +48,35 @@ async def configure(
     llm: LLMClient,
     model: str,
     settings: Settings,
+    collector: TraceCollector,
 ) -> ConfigMeta:
     """Run all configure steps, return metadata for downstream phases."""
     lang = "English"
     is_factoid = False
     retrieval_plan: ExecutionPlan | None = None
     retrieval_mode = "hybrid"
-    traces: list[dict[str, Any]] = []
 
     for step in steps:
         match step:
             case PlanLLMStep():
-                rp, rm, t = await _plan_retrieval(
+                rp, rm = await _plan_retrieval(
                     query=query, history_text=history_text, budget=budget,
-                    llm=llm, model=model, settings=settings,
+                    llm=llm, model=model, settings=settings, collector=collector,
                 )
                 retrieval_plan = rp
                 retrieval_mode = rm
-                traces.extend(t)
 
             case DetectLangStep():
-                lang, is_factoid, t = await _detect_lang(
+                lang, is_factoid = await _detect_lang(
                     query=query, budget=budget, llm=llm, model=model,
+                    collector=collector,
                 )
-                traces.extend(t)
 
     return ConfigMeta(
         lang=lang,
         is_factoid=is_factoid,
         retrieval_plan=retrieval_plan,
         retrieval_mode=retrieval_mode,
-        traces=traces,
     )
 
 
@@ -84,14 +84,27 @@ async def configure(
 
 
 async def _plan_retrieval(
-    *, query: str, history_text: str, budget: BudgetCounter,
-    llm: LLMClient, model: str, settings: Settings,
-) -> tuple[ExecutionPlan, str, list[dict[str, Any]]]:
-    traces: list[dict[str, Any]] = [{"kind": "tool", "name": "llm.plan", "payload": {"query": query}}]
+    *,
+    query: str,
+    history_text: str,
+    budget: BudgetCounter,
+    llm: LLMClient,
+    model: str,
+    settings: Settings,
+    collector: TraceCollector,
+) -> tuple[ExecutionPlan, str]:
     fallback_mode, fallback_plan = _FALLBACK
 
+    await collector.emit(
+        {"kind": "tool", "name": "llm.plan", "payload": {"query": query}},
+    )
+
+    # TODO: I do not like this method at all 
+    # And I did not like that it created a bug when it was not executed
+    # but some basic config was provided
+    # Oh and it should definetly return the actual plan 
     if not budget.try_consume():
-        return fallback_plan, fallback_mode, traces
+        return fallback_plan, fallback_mode
 
     try:
         raw = await asyncio.wait_for(
@@ -99,9 +112,13 @@ async def _plan_retrieval(
                 model,
                 [
                     {"role": "system", "content": PLAN_SYSTEM},
-                    {"role": "user", "content": PLAN_USER.format(
-                        history=history_text, query=query,
-                    )},
+                    {
+                        "role": "user",
+                        "content": PLAN_USER.format(
+                            history=history_text,
+                            query=query,
+                        ),
+                    },
                 ],
                 temperature=0.0,
             ),
@@ -109,13 +126,17 @@ async def _plan_retrieval(
         )
     except LLMTransportError as exc:
         logger.warning("Plan LLM unavailable: %s", exc)
-        return fallback_plan, fallback_mode, traces
+        return fallback_plan, fallback_mode
     except LLMParseError as exc:
-        logger.warning("Plan LLM parse failed: %s — raw: %s", exc, exc.raw[:300])
-        return fallback_plan, fallback_mode, traces
+        logger.warning(
+            "Plan LLM parse failed: %s — raw: %s",
+            exc,
+            exc.raw[:300],
+        )
+        return fallback_plan, fallback_mode
     except asyncio.TimeoutError:
         logger.warning("Plan LLM timed out")
-        return fallback_plan, fallback_mode, traces
+        return fallback_plan, fallback_mode
 
     retrieval_mode = str(raw.get("retrieval_mode") or "hybrid")
     reason = str(raw.get("reason") or "")
@@ -124,18 +145,36 @@ async def _plan_retrieval(
         top_k_min=settings.agent_top_k_min,
         top_k_max=settings.agent_top_k_max,
     )
-    traces.append({
-        "kind": "thought", "label": "Plan",
-        "content": f"mode={retrieval_mode}. Reason: {reason}",
-    })
-    return plan, retrieval_mode, traces
+    await collector.emit(
+        {
+            "kind": "thought",
+            "label": "Plan",
+            "content": f"mode={retrieval_mode}. Reason: {reason}",
+        },
+    )
+    return plan, retrieval_mode
 
 
 async def _detect_lang(
-    *, query: str, budget: BudgetCounter, llm: LLMClient, model: str,
-) -> tuple[str, bool, list[dict[str, Any]]]:
+    *,
+    query: str,
+    budget: BudgetCounter,
+    llm: LLMClient,
+    model: str,
+    collector: TraceCollector,
+) -> tuple[str, bool]:
     lang = "English"
-    if budget.try_consume():
+    used_llm = False
+    attempted_llm = budget.try_consume()
+
+    if attempted_llm:
+        await collector.emit(
+            {
+                "kind": "tool",
+                "name": "llm.detect_lang",
+                "payload": {"query_preview": query[:240]},
+            },
+        )
         try:
             raw = await llm.complete(
                 model,
@@ -146,7 +185,31 @@ async def _detect_lang(
                 temperature=0.0,
             )
             lang = (raw or "").strip() or "English"
+            used_llm = True
         except LLMTransportError as exc:
             logger.warning("detect_lang LLM unavailable: %s", exc)
+
     is_factoid = is_factoid_question(query)
-    return lang, is_factoid, []
+
+    if used_llm:
+        note = ""
+    elif attempted_llm:
+        note = " [lang default after LLM failure]"
+    else:
+        note = " [lang default: no LLM budget]"
+
+    logger.info(
+        "detect_lang: lang=%r is_factoid=%s via_llm=%s",
+        lang,
+        is_factoid,
+        used_llm,
+    )
+    await collector.emit(
+        {
+            "kind": "thought",
+            "label": "DetectLang",
+            "content": f"lang={lang}, is_factoid={is_factoid}{note}",
+        },
+    )
+
+    return lang, is_factoid

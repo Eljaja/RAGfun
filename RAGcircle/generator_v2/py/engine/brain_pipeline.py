@@ -21,6 +21,8 @@ from steps.configure import configure
 from steps.evaluate import evaluate
 from steps.generate import generate
 
+from engine.trace_collector import TraceCollector
+
 logger = logging.getLogger(__name__)
 
 
@@ -40,15 +42,18 @@ async def run_pipeline(
     history_text = history_summary(raw_history)
     model = settings.agent_llm_model or settings.llm_model
     budget = BudgetCounter(plan.max_llm_calls)
-    traces: list[dict[str, Any]] = []
+    
+    trace_collector = TraceCollector()
 
     # 1. Configure
     meta = await configure(
         plan.configure,
         query=query, history_text=history_text, budget=budget,
         llm=llm, model=model, settings=settings,
+        collector=trace_collector,
     )
-    traces.extend(meta.traces)
+    logger.critical(trace_collector.entries)
+    await trace_collector.emit_many(meta.traces)
 
     # 2. Retrieve
     ret = await run_retrieval(
@@ -69,14 +74,17 @@ async def run_pipeline(
         budget=budget,
         llm=llm,
         model=model,
+        collector=trace_collector,
     )
-    traces.extend(ret.traces)
+    logger.critical("FULL pipeline")
+    logger.critical(trace_collector.entries)
+    await trace_collector.emit_many(ret.traces)
 
     if not ret.chunks:
         return PipelineResult(
             answer="", chunks=[], sources=[],
             mode=meta.retrieval_mode, lang=meta.lang,
-            is_factoid=meta.is_factoid, traces=traces,
+            is_factoid=meta.is_factoid, traces=trace_collector.entries,
         )
 
     # 3. Generate
@@ -98,7 +106,7 @@ async def run_pipeline(
         budget=budget, llm=llm, model=model,
         settings=settings,
     )
-    traces.extend(verdict.traces)
+    await trace_collector.emit_many(verdict.traces)
 
     final_answer = verdict.answer if verdict.answer is not None else answer
     final_chunks = verdict.chunks if verdict.chunks is not None else ret.chunks
@@ -117,5 +125,5 @@ async def run_pipeline(
         needs_retry=verdict.needs_retry,
         missing_terms=verdict.missing_terms,
         requery=verdict.requery,
-        traces=traces,
+        traces=trace_collector.entries,
     )

@@ -242,7 +242,7 @@ async def consume_rabbitmq(*, s3_client, deps: PipelineDeps, cfg: AppConfig) -> 
         try:
             connection = await aio_pika.connect_robust(cfg.rabbitmq_url, heartbeat=30)
             channel = await connection.channel()
-            await channel.set_qos(prefetch_count=10)
+            await channel.set_qos(prefetch_count=1)
 
             # DLQ wiring (parking lot)
             dlx = await channel.declare_exchange(cfg.amqp_dlx_exchange, aio_pika.ExchangeType.DIRECT, durable=True)
