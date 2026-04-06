@@ -1,8 +1,0 @@
-# Override: semantic chunking 512/50 (use: docker compose -f docker-compose.yml -f docker-compose-semantic.yml up)
-services:
-  retrieval:
-    environment:
-      - RAG_CHUNK_STRATEGY=semantic
-      - RAG_CHUNK_MAX_TOKENS=512
-      - RAG_CHUNK_OVERLAP_TOKENS=50
-      - RAG_CHUNK_ENCODING=cl100k_base

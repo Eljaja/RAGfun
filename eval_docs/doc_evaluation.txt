@@ -1,1 +1,0 @@
-Оценка качества RAG: ручная (human-in-the-loop) — эксперты по 5-балльной шкале: relevance, correctness, completeness, citation quality. LLM-as-judge: faithfulness, relevance, citation accuracy. Фреймворки: RAGAS, ARES, TruLens. Метрики retrieval: precision@k, recall@k. В RAGfun: quality_is_poor триггерит fact_queries; retry при неполном ответе.
