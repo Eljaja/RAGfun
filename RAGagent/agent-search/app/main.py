@@ -1174,6 +1174,24 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncI
                     temperature=0.2,
                     timeout_s=llm_timeout,
                 )
+            full_answer = strip_thinking(full_answer or "").strip()
+            if _looks_like_language_only_answer(full_answer) and _can_llm():
+                AGENT_LLM_CALLS.labels(stage="answer_retry_recover").inc()
+                yield {
+                    "type": "trace",
+                    "kind": "thought",
+                    "label": "Recover",
+                    "content": "Retry answer looked truncated (language-only). Regenerating once.",
+                }
+                recovered_retry = await _llm_chat(
+                    client,
+                    llm_base,
+                    llm_model,
+                    llm_key,
+                    [system, user],
+                    temperature=0.2,
+                    timeout_s=llm_timeout,
+                )
                 recovered_retry = strip_thinking(recovered_retry or "").strip()
                 if recovered_retry:
                     full_answer = recovered_retry
