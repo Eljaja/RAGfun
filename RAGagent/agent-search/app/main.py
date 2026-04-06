@@ -1,7 +1,7 @@
 """
 Agent-search service: LLM-driven retrieval with plan, HyDE, fact queries, retry.
 
-Flow: plan → HyDE (opt) → gate.chat → quality check → fact_queries (if poor/always) → answer → assess → retry if incomplete.
+Flow: plan → retrieval.search → quality check → optional fact queries → answer → assess → retry if incomplete.
 Endpoints: POST /v1/agent/stream (SSE), POST /v1/agent (JSON).
 """
 from __future__ import annotations
@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 import uuid
 from typing import Any, AsyncIterator
@@ -24,14 +25,19 @@ from fastapi.responses import Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from pydantic import BaseModel, Field
 
+from agent_common.retrieval_client import AsyncRetrievalClient
 from agent_common import (
     ANSWER_SYSTEM,
+    ANSWER_SYSTEM_FACTOID,
     ANSWER_SYSTEM_WITH_TOOLS,
+    ANSWER_SYSTEM_WITH_TOOLS_FACTOID,
     ANSWER_USER,
-    AsyncGateClient,
+    ANSWER_USER_FACTOID,
     strip_thinking,
     FACT_QUERIES_SYSTEM,
     FACT_QUERIES_USER,
+    FACTOID_REWRITE_SYSTEM,
+    FACTOID_REWRITE_USER,
     HYDE_SYSTEM,
     HYDE_USER,
     run_calculator,
@@ -60,8 +66,17 @@ AGENT_LAT = Histogram(
     buckets=(0.5, 1, 2, 5, 10, 20, 30, 60, 90, 120),
 )
 AGENT_LLM_CALLS = Counter("agent_llm_calls_total", "LLM calls per request", ["stage"])
-AGENT_GATE_CALLS = Counter("agent_gate_calls_total", "Gate chat calls per request")
+AGENT_RETRIEVAL_CALLS = Counter("agent_retrieval_calls_total", "Retrieval calls per request")
 AGENT_RETRY = Counter("agent_retry_total", "Retry triggered (incomplete answer)")
+
+_TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9]+")
+_FACTOID_LEAD_RE = re.compile(
+    r"^\s*(who|what|which|where|when|how many|how much|кто|что|какой|какая|какие|где|когда|сколько)\b",
+    re.IGNORECASE,
+)
+_CITATION_RE = re.compile(r"\[\d+\]")
+_LEADING_ANSWER_RE = re.compile(r"^\s*(answer|final answer)\s*:\s*", re.IGNORECASE)
+_SENTENCE_BREAK_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9А-ЯЁ\"\[])")
 
 
 def _history_summary(history: list[dict[str, str]], max_turns: int = 3) -> str:
@@ -91,7 +106,7 @@ MEME_GRUMPS = [
 ]
 
 
-class GateFilters(BaseModel):
+class RetrievalFilters(BaseModel):
     source: str | None = None
     tags: list[str] | None = None
     lang: str | None = None
@@ -102,11 +117,11 @@ class GateFilters(BaseModel):
 
 
 class AgentRequest(BaseModel):
-    """Request body for agent search (plan → Gate → quality check → fact queries → answer)."""
+    """Request body for agent search (plan → retrieval → quality check → fact queries → answer)."""
 
     query: str = Field(..., description="User question")
     history: list[dict[str, str]] = Field(default_factory=list, description="Conversation history (role, content)")
-    filters: GateFilters | None = Field(None, description="Gate filters")
+    filters: RetrievalFilters | None = Field(None, description="Retrieval filters")
     include_sources: bool = Field(True, description="Include sources in response")
     top_k: int | None = Field(None, description="Override retrieval top_k (5..24), else use plan")
     use_adaptive_k: bool | None = Field(None, description="Cut at steepest score drop (adaptive-k)")
@@ -118,6 +133,7 @@ class AgentRequest(BaseModel):
     use_retry: bool | None = Field(None, description="Enable retry on incomplete (override env)")
     use_tools: bool | None = Field(None, description="Enable calculator & code execution tools")
     mode: str | None = Field(None, description="Preset: minimal | conservative | aggressive")
+    answer_style: str | None = Field(None, description="Answer style: default | factoid | auto")
 
 
 AGENT_MODE_PRESETS = {
@@ -130,7 +146,7 @@ AGENT_MODE_PRESETS = {
 app = FastAPI(
     title="Agent Search",
     version="0.1.0",
-    description="LLM-driven retrieval: plan → Gate.chat → quality check → fact queries → answer. Supports web search, feature flags, and mode presets.",
+    description="LLM-driven retrieval: plan → retrieval.search → quality check → fact queries → answer. Supports feature flags and mode presets.",
     openapi_url="/v1/openapi.json",
     docs_url="/v1/docs",
 )
@@ -473,19 +489,95 @@ def _with_trace_id(event: dict[str, Any], trace_id: str) -> dict[str, Any]:
     return {**event, "trace_id": trace_id}
 
 
-def _forward_auth_headers(request: Request) -> dict[str, str] | None:
-    """Forward ODS auth headers to Gate (X-ODS-API-KEY preferred)."""
-    k = (request.headers.get("X-ODS-API-KEY") or "").strip()
-    if k:
-        return {"X-ODS-API-KEY": k}
-    a = (request.headers.get("authorization") or request.headers.get("Authorization") or "").strip()
-    if a:
-        return {"Authorization": a}
-    return None
+def _is_factoid_like_question(query: str) -> bool:
+    text = (query or "").strip()
+    if not text:
+        return False
+    if len(_TOKEN_RE.findall(text)) > 14:
+        return False
+    if "?" in text:
+        return True
+    return bool(_FACTOID_LEAD_RE.search(text))
 
 
-async def _gate_chat_once(
-    gate: "AsyncGateClient",
+def _resolve_answer_style(payload: AgentRequest) -> str:
+    style = (payload.answer_style or "").strip().lower()
+    if style in {"default", "factoid"}:
+        return style
+    if style not in {"", "auto"}:
+        return "default"
+    if not payload.history and _is_factoid_like_question(payload.query):
+        return "factoid"
+    return "default"
+
+
+def _postprocess_factoid_answer(text: str) -> str:
+    answer = strip_thinking(text or "").strip()
+    if not answer:
+        return ""
+    citations = _CITATION_RE.findall(answer)
+    answer = _LEADING_ANSWER_RE.sub("", answer)
+    answer = answer.splitlines()[0].strip()
+    parts = _SENTENCE_BREAK_RE.split(answer, maxsplit=1)
+    if parts:
+        answer = parts[0].strip()
+    if citations and not _CITATION_RE.search(answer):
+        answer = answer.rstrip(" .,:;") + f" {citations[0]}"
+    return answer.strip()
+
+
+def _build_answer_messages(
+    *,
+    answer_style: str,
+    use_tools: bool,
+    answer_lang: str,
+    history_text: str,
+    query: str,
+    context_text: str,
+) -> tuple[dict[str, str], dict[str, str]]:
+    if answer_style == "factoid":
+        system_content = (
+            ANSWER_SYSTEM_WITH_TOOLS_FACTOID.format(lang=answer_lang)
+            if use_tools
+            else ANSWER_SYSTEM_FACTOID.format(lang=answer_lang)
+        )
+        user_content = ANSWER_USER_FACTOID.format(history=history_text, query=query, context=context_text)
+    else:
+        system_content = ANSWER_SYSTEM_WITH_TOOLS.format(lang=answer_lang) if use_tools else ANSWER_SYSTEM.format(lang=answer_lang)
+        user_content = ANSWER_USER.format(history=history_text, query=query, context=context_text)
+    return {"role": "system", "content": system_content}, {"role": "user", "content": user_content}
+
+
+async def _rewrite_factoid_answer(
+    client: httpx.AsyncClient,
+    llm_base: str,
+    llm_model: str,
+    llm_key: str | None,
+    query: str,
+    draft_answer: str,
+    context_text: str,
+    timeout_s: float,
+) -> str:
+    rewritten = await _llm_chat(
+        client,
+        llm_base,
+        llm_model,
+        llm_key,
+        [
+            {"role": "system", "content": FACTOID_REWRITE_SYSTEM},
+            {
+                "role": "user",
+                "content": FACTOID_REWRITE_USER.format(query=query, draft=draft_answer, context=context_text),
+            },
+        ],
+        temperature=0.0,
+        timeout_s=timeout_s,
+    )
+    return _postprocess_factoid_answer(rewritten or draft_answer)
+
+
+async def _retrieval_search_once(
+    retrieval: "AsyncRetrievalClient",
     client: httpx.AsyncClient,
     search_query: str,
     *,
@@ -495,35 +587,31 @@ async def _gate_chat_once(
     use_adaptive_k: bool | None,
     filters: dict | None,
     include_sources: bool,
-    history: list | None,
     timeout_s: float,
-    headers: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Returns (result, None) or (None, error_event)."""
     try:
         result = await asyncio.wait_for(
-            gate.chat(
+            retrieval.search(
                 client,
                 search_query,
-                history=history,
                 retrieval_mode=mode,
                 top_k=top_k,
                 rerank=rerank,
                 use_adaptive_k=use_adaptive_k,
                 filters=filters,
                 include_sources=include_sources,
-                headers=headers,
             ),
             timeout=timeout_s,
         )
         return (result, None)
     except asyncio.TimeoutError:
-        return (None, {"type": "error", "error": "Gate (retrieval) timeout. Check rag-gate and retrieval."})
+        return (None, {"type": "error", "error": "Retrieval timeout. Check AGENT_RETRIEVAL_URL and retrieval service."})
     except Exception as e:
-        return (None, {"type": "error", "error": f"Gate error: {e!s}"})
+        return (None, {"type": "error", "error": f"Retrieval error: {e!s}"})
 
 
-async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient, *, gate_headers: dict[str, str] | None = None) -> AsyncIterator[dict[str, Any]]:
+async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient) -> AsyncIterator[dict[str, Any]]:
     # Apply mode preset (conservative/aggressive/minimal) — explicit payload fields override
     preset = AGENT_MODE_PRESETS.get((payload.mode or "").lower()) if payload.mode else {}
     max_llm_calls = payload.max_llm_calls if payload.max_llm_calls is not None else preset.get("max_llm_calls")
@@ -535,12 +623,15 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient, *, gate_h
     max_fact_queries = payload.max_fact_queries if payload.max_fact_queries is not None else preset.get("max_fact_queries")
     max_fact_queries = max_fact_queries if max_fact_queries is not None else int(_env_get("AGENT_MAX_FACT_QUERIES", "2"))
 
-    gate_url = _env_get("AGENT_GATE_URL", _env_get("GATE_URL", "http://rag-gate:8090"))
+    retrieval_url = _env_get(
+        "AGENT_RETRIEVAL_URL",
+        _env_get("GATE_RETRIEVAL_URL", _env_get("PROCESSOR_RETRIEVAL_URL", "http://retrieval:8080")),
+    )
     llm_base = _env_get("AGENT_LLM_BASE_URL", _env_get("GATE_LLM_BASE_URL", "http://localhost:8000/v1"))
     llm_model = _env_get("AGENT_LLM_MODEL", _env_get("GATE_LLM_MODEL", "gpt-4o-mini"))
     llm_key = os.environ.get("AGENT_LLM_API_KEY") or os.environ.get("GATE_LLM_API_KEY")
     llm_timeout = float(_env_get("AGENT_LLM_TIMEOUT_S", "60"))
-    gate_timeout = float(_env_get("AGENT_GATE_TIMEOUT_S", "60"))
+    retrieval_timeout = float(_env_get("AGENT_RETRIEVAL_TIMEOUT_S", "60"))
     llm_calls = [0]
 
     def _can_llm() -> bool:
@@ -548,9 +639,10 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient, *, gate_h
         return llm_calls[0] <= max_llm_calls
 
     filters = payload.filters.model_dump(exclude_none=True) if payload.filters else None
-    gate = AsyncGateClient(gate_url, timeout_s=gate_timeout)
+    retrieval = AsyncRetrievalClient(retrieval_url, timeout_s=retrieval_timeout)
 
     hist = [m for m in payload.history] if payload.history else None
+    answer_style = _resolve_answer_style(payload)
     logger.info("agent yielding mood then plan tool")
     yield {"type": "trace", "kind": "mood", "content": random.choice(MEME_GRUMPS)}
     yield {"type": "trace", "kind": "tool", "name": "llm.plan", "payload": {"model": llm_model, "query": payload.query}}
@@ -594,7 +686,7 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient, *, gate_h
         "type": "trace",
         "kind": "thought",
         "label": "Plan",
-        "content": f"mode={mode}, top_k={top_k}, rerank={rerank}, hyde={use_hyde}. Reason: {reason}",
+        "content": f"mode={mode}, top_k={top_k}, rerank={rerank}, hyde={use_hyde}, answer_style={answer_style}. Reason: {reason}",
     }
 
     if _can_llm():
@@ -623,23 +715,21 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient, *, gate_h
             if not search_queries:
                 search_queries = [payload.query]
             yield {"type": "trace", "kind": "tool", "name": "llm.hyde", "payload": {"model": llm_model, "query": payload.query, "lang": answer_lang, "num": len(search_queries)}}
-            gate_tasks = [
-                gate.chat(
+            retrieval_tasks = [
+                retrieval.search(
                     client,
                     q,
-                    history=[m for m in payload.history] if payload.history else None,
                     retrieval_mode=mode,
                     top_k=top_k,
                     rerank=rerank,
                     use_adaptive_k=use_adaptive_k,
                     filters=filters,
                     include_sources=payload.include_sources,
-                    headers=gate_headers,
                 )
                 for q in search_queries
             ]
-            hyde_responses = await asyncio.gather(*gate_tasks)
-            AGENT_GATE_CALLS.inc(len(hyde_responses))
+            hyde_responses = await asyncio.gather(*retrieval_tasks)
+            AGENT_RETRIEVAL_CALLS.inc(len(hyde_responses))
             merged_hits = merge_hits(hyde_responses, cap=max(12, top_k))
             all_ctx = []
             for r in hyde_responses:
@@ -658,42 +748,26 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient, *, gate_h
             yield {"type": "trace", "kind": "tool", "name": "llm.hyde", "payload": {"model": llm_model, "query": payload.query, "lang": answer_lang}}
             hyde = await _make_hyde(client, llm_base, llm_model, llm_key, payload.query, timeout_s=llm_timeout, lang_hint=answer_lang)
             search_query = hyde.strip() or payload.query
-            yield {"type": "trace", "kind": "tool", "name": "gate.chat", "payload": {"query": search_query, "retrieval_mode": mode, "top_k": top_k, "rerank": rerank}}
-            AGENT_GATE_CALLS.inc()
-            primary, err = await _gate_chat_once(
-                gate,
-                client,
-                search_query,
-                mode=mode,
-                top_k=top_k,
-                rerank=rerank,
-                use_adaptive_k=use_adaptive_k,
-                filters=filters,
-                include_sources=payload.include_sources,
-                history=[m for m in payload.history] if payload.history else None,
-                timeout_s=gate_timeout + 15,
-                headers=gate_headers,
+            yield {"type": "trace", "kind": "tool", "name": "retrieval.search", "payload": {"query": search_query, "retrieval_mode": mode, "top_k": top_k, "rerank": rerank}}
+            AGENT_RETRIEVAL_CALLS.inc()
+            primary, err = await _retrieval_search_once(
+                retrieval, client, search_query,
+                mode=mode, top_k=top_k, rerank=rerank, use_adaptive_k=use_adaptive_k,
+                filters=filters, include_sources=payload.include_sources,
+                timeout_s=retrieval_timeout + 15,
             )
             if err:
                 yield err
                 return
     else:
         search_query = payload.query
-        yield {"type": "trace", "kind": "tool", "name": "gate.chat", "payload": {"query": search_query, "retrieval_mode": mode, "top_k": top_k, "rerank": rerank}}
-        AGENT_GATE_CALLS.inc()
-        primary, err = await _gate_chat_once(
-            gate,
-            client,
-            search_query,
-            mode=mode,
-            top_k=top_k,
-            rerank=rerank,
-            use_adaptive_k=use_adaptive_k,
-            filters=filters,
-            include_sources=payload.include_sources,
-            history=[m for m in payload.history] if payload.history else None,
-            timeout_s=gate_timeout + 15,
-            headers=gate_headers,
+        yield {"type": "trace", "kind": "tool", "name": "retrieval.search", "payload": {"query": search_query, "retrieval_mode": mode, "top_k": top_k, "rerank": rerank}}
+        AGENT_RETRIEVAL_CALLS.inc()
+        primary, err = await _retrieval_search_once(
+            retrieval, client, search_query,
+            mode=mode, top_k=top_k, rerank=rerank, use_adaptive_k=use_adaptive_k,
+            filters=filters, include_sources=payload.include_sources,
+            timeout_s=retrieval_timeout + 15,
         )
         if err:
             yield err
@@ -724,12 +798,11 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient, *, gate_h
         if fact_qs:
             for fq in fact_qs:
                 yield {"type": "trace", "kind": "action", "content": f"Fact query: {fq}"}
-                yield {"type": "trace", "kind": "tool", "name": "gate.chat", "payload": {"query": fq, "retrieval_mode": mode, "top_k": max(4, top_k // 2), "rerank": rerank}}
+                yield {"type": "trace", "kind": "tool", "name": "retrieval.search", "payload": {"query": fq, "retrieval_mode": mode, "top_k": max(4, top_k // 2), "rerank": rerank}}
             fact_tasks = [
-                gate.chat(
+                retrieval.search(
                     client,
                     fq,
-                    history=hist,
                     retrieval_mode=mode,
                     top_k=max(4, top_k // 2),
                     rerank=rerank,
@@ -740,7 +813,7 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient, *, gate_h
                 for fq in fact_qs
             ]
             fact_responses = await asyncio.gather(*fact_tasks)
-            AGENT_GATE_CALLS.inc(len(fact_responses))
+            AGENT_RETRIEVAL_CALLS.inc(len(fact_responses))
             responses.extend(fact_responses)
             for r2 in fact_responses:
                 degraded.update(r2.get("degraded") or [])
@@ -779,9 +852,15 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient, *, gate_h
             return
 
     hist_ctx = _history_summary(hist) if hist else ""
-    system_content = ANSWER_SYSTEM_WITH_TOOLS.format(lang=answer_lang) if use_tools else ANSWER_SYSTEM.format(lang=answer_lang)
-    system = {"role": "system", "content": system_content}
-    user = {"role": "user", "content": ANSWER_USER.format(history=hist_ctx, query=payload.query, context=context_text)}
+    system, user = _build_answer_messages(
+        answer_style=answer_style,
+        use_tools=use_tools,
+        answer_lang=answer_lang,
+        history_text=hist_ctx,
+        query=payload.query,
+        context_text=context_text,
+    )
+    answer_temperature = 0.0 if answer_style == "factoid" else 0.2
 
     AGENT_LLM_CALLS.labels(stage="answer").inc()
     if use_tools:
@@ -793,38 +872,64 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient, *, gate_h
             llm_key,
             [system, user],
             AGENT_TOOLS,
-            temperature=0.2,
+            temperature=answer_temperature,
             timeout_s=llm_timeout,
         )
         full_answer = strip_thinking(full_answer)
         for ch in full_answer:
             yield {"type": "token", "content": ch}
     else:
-        yield {"type": "trace", "kind": "tool", "name": "llm.answer", "payload": {"model": llm_model, "stream": True}}
-        answer_parts: list[str] = []
-        answer_stream_deadline = time.monotonic() + min(
-            ANSWER_STREAM_CAP_S,
-            max(llm_timeout * ANSWER_STREAM_LLM_MULTIPLIER, ANSWER_STREAM_MIN_S),
-        )
-        try:
-            async for chunk in _llm_chat_stream(
+        stream_answer = answer_style != "factoid"
+        yield {"type": "trace", "kind": "tool", "name": "llm.answer", "payload": {"model": llm_model, "stream": stream_answer}}
+        if stream_answer:
+            answer_parts: list[str] = []
+            answer_stream_deadline = time.monotonic() + min(
+                ANSWER_STREAM_CAP_S,
+                max(llm_timeout * ANSWER_STREAM_LLM_MULTIPLIER, ANSWER_STREAM_MIN_S),
+            )
+            try:
+                async for chunk in _llm_chat_stream(
+                    client,
+                    llm_base,
+                    llm_model,
+                    llm_key,
+                    [system, user],
+                    temperature=answer_temperature,
+                    timeout_s=llm_timeout,
+                ):
+                    if time.monotonic() > answer_stream_deadline:
+                        break
+                    answer_parts.append(chunk)
+                    yield {"type": "token", "content": chunk}
+            except (asyncio.TimeoutError, httpx.TimeoutException):
+                pass
+            full_answer = strip_thinking("".join(answer_parts))
+        else:
+            full_answer = await _llm_chat(
                 client,
                 llm_base,
                 llm_model,
                 llm_key,
                 [system, user],
-                temperature=0.2,
+                temperature=answer_temperature,
                 timeout_s=llm_timeout,
-            ):
-                if time.monotonic() > answer_stream_deadline:
-                    break
-                answer_parts.append(chunk)
-                yield {"type": "token", "content": chunk}
-        except (asyncio.TimeoutError, httpx.TimeoutException):
-            pass
-        full_answer = strip_thinking("".join(answer_parts))
+            )
         if not full_answer.strip():
             full_answer = "[Answer generation timed out or produced no text. Try a shorter query or check the LLM endpoint.]"
+    if answer_style == "factoid":
+        full_answer = _postprocess_factoid_answer(full_answer)
+        if full_answer and full_answer != "Insufficient context." and _can_llm():
+            AGENT_LLM_CALLS.labels(stage="answer_rewrite").inc()
+            full_answer = await _rewrite_factoid_answer(
+                client,
+                llm_base,
+                llm_model,
+                llm_key,
+                payload.query,
+                full_answer,
+                context_text,
+                timeout_s=llm_timeout,
+            )
     sources = sources_from_context(context_chunks) if context_chunks else (primary.get("sources") or [])
 
     if _can_llm():
@@ -887,24 +992,22 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient, *, gate_h
                 queries.append(kw)
 
         for q in queries:
-            yield {"type": "trace", "kind": "tool", "name": "gate.chat", "payload": {"query": q, "retrieval_mode": retry_mode, "top_k": retry_top_k, "rerank": retry_rerank}}
+            yield {"type": "trace", "kind": "tool", "name": "retrieval.search", "payload": {"query": q, "retrieval_mode": retry_mode, "top_k": retry_top_k, "rerank": retry_rerank}}
         retry_tasks = [
-            gate.chat(
+            retrieval.search(
                 client,
                 q,
-                history=hist,
                 retrieval_mode=retry_mode,
                 top_k=retry_top_k,
                 rerank=retry_rerank,
                 use_adaptive_k=use_adaptive_k,
                 filters=filters,
                 include_sources=payload.include_sources,
-                headers=gate_headers,
             )
             for q in queries
         ]
         retry_responses = await asyncio.gather(*retry_tasks)
-        AGENT_GATE_CALLS.inc(len(retry_responses))
+        AGENT_RETRIEVAL_CALLS.inc(len(retry_responses))
 
         retry_resp = retry_responses[0] if retry_responses else {}
         retry_hits = list(retry_resp.get("hits") or [])
@@ -921,24 +1024,22 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient, *, gate_h
         if fact_qs:
             for fq in fact_qs:
                 yield {"type": "trace", "kind": "action", "content": f"Fact query: {fq}"}
-                yield {"type": "trace", "kind": "tool", "name": "gate.chat", "payload": {"query": fq, "retrieval_mode": retry_mode, "top_k": max(4, retry_top_k // 2), "rerank": retry_rerank}}
+                yield {"type": "trace", "kind": "tool", "name": "retrieval.search", "payload": {"query": fq, "retrieval_mode": retry_mode, "top_k": max(4, retry_top_k // 2), "rerank": retry_rerank}}
             fact_retry_tasks = [
-                gate.chat(
+                retrieval.search(
                     client,
                     fq,
-                    history=hist,
                     retrieval_mode=retry_mode,
                     top_k=max(4, retry_top_k // 2),
                     rerank=retry_rerank,
                     use_adaptive_k=use_adaptive_k,
                     filters=filters,
                     include_sources=payload.include_sources,
-                    headers=gate_headers,
                 )
                 for fq in fact_qs
             ]
             fact_retry_responses = await asyncio.gather(*fact_retry_tasks)
-            AGENT_GATE_CALLS.inc(len(fact_retry_responses))
+            AGENT_RETRIEVAL_CALLS.inc(len(fact_retry_responses))
             responses = [retry_resp] + list(fact_retry_responses)
             for r2 in fact_retry_responses:
                 retry_degraded.update(r2.get("degraded") or [])
@@ -969,9 +1070,15 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient, *, gate_h
 
         if retry_context_text:
             hist_ctx = _history_summary(hist) if hist else ""
-            system_content = ANSWER_SYSTEM_WITH_TOOLS.format(lang=answer_lang) if use_tools else ANSWER_SYSTEM.format(lang=answer_lang)
-            system = {"role": "system", "content": system_content}
-            user = {"role": "user", "content": ANSWER_USER.format(history=hist_ctx, query=payload.query, context=retry_context_text)}
+            system, user = _build_answer_messages(
+                answer_style=answer_style,
+                use_tools=use_tools,
+                answer_lang=answer_lang,
+                history_text=hist_ctx,
+                query=payload.query,
+                context_text=retry_context_text,
+            )
+            answer_temperature = 0.0 if answer_style == "factoid" else 0.2
             AGENT_LLM_CALLS.labels(stage="answer_retry").inc()
             if use_tools:
                 yield {"type": "trace", "kind": "tool", "name": "llm.answer", "payload": {"model": llm_model, "stream": False, "tools": True}}
@@ -982,7 +1089,7 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient, *, gate_h
                     llm_key,
                     [system, user],
                     AGENT_TOOLS,
-                    temperature=0.2,
+                    temperature=answer_temperature,
                     timeout_s=llm_timeout,
                 )
             else:
@@ -993,9 +1100,23 @@ async def _run_agent(payload: AgentRequest, client: httpx.AsyncClient, *, gate_h
                     llm_model,
                     llm_key,
                     [system, user],
-                    temperature=0.2,
+                    temperature=answer_temperature,
                     timeout_s=llm_timeout,
                 )
+            if answer_style == "factoid":
+                full_answer = _postprocess_factoid_answer(full_answer)
+                if full_answer and full_answer != "Insufficient context." and _can_llm():
+                    AGENT_LLM_CALLS.labels(stage="answer_rewrite_retry").inc()
+                    full_answer = await _rewrite_factoid_answer(
+                        client,
+                        llm_base,
+                        llm_model,
+                        llm_key,
+                        payload.query,
+                        full_answer,
+                        retry_context_text,
+                        timeout_s=llm_timeout,
+                    )
             sources = sources_from_context(retry_context) if retry_context else (retry_resp.get("sources") or [])
             context_chunks = retry_context
             degraded = retry_degraded
@@ -1019,12 +1140,12 @@ async def readyz():
 
 @app.get("/v1/metrics", tags=["metrics"])
 async def metrics():
-    """Prometheus metrics (requests, latency, LLM/gate calls)."""
+    """Prometheus metrics (requests, latency, LLM/retrieval calls)."""
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.post("/v1/agent", tags=["agent"])
-async def agent_non_streaming(payload: AgentRequest, request: Request):
+async def agent_non_streaming(payload: AgentRequest):
     """Non-streaming: collect events and return full response as JSON. Use mode=minimal|conservative|aggressive for presets."""
     t0 = time.perf_counter()
     trace_id = uuid.uuid4().hex
@@ -1040,8 +1161,7 @@ async def agent_non_streaming(payload: AgentRequest, request: Request):
     async def _collect() -> None:
         nonlocal answer, sources, context, mode, partial, degraded, error
         async with httpx.AsyncClient() as client:
-            gate_headers = _forward_auth_headers(request)
-            async for event in _run_agent(payload, client, gate_headers=gate_headers):
+            async for event in _run_agent(payload, client):
                 if event.get("type") == "retrieval":
                     context = list(event.get("context") or [])
                 elif event.get("type") == "token":
@@ -1095,8 +1215,7 @@ async def agent_stream(request: Request, payload: AgentRequest):
             await asyncio.sleep(0)
             async with httpx.AsyncClient() as client:
                 try:
-                    gate_headers = _forward_auth_headers(request)
-                    agent_it = _run_agent(payload, client, gate_headers=gate_headers)
+                    agent_it = _run_agent(payload, client)
                     next_timeout_s = float(_env_get("AGENT_STREAM_NEXT_TIMEOUT_S", "65"))
                     while True:
                         try:

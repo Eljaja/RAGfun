@@ -7,7 +7,7 @@ Both services start with profile `agent-search`:
 
 ## Agent-Search (port 8093)
 
-LLM-driven search: **plan** → optional HyDE → **Gate.chat** → quality check → optional **fact queries** → **answer** with citations [1], [2].
+LLM-driven search: **plan** → optional HyDE → **retrieval.search** → quality check → optional **fact queries** → **answer** with citations [1], [2].
 
 ### Endpoints
 
@@ -22,7 +22,7 @@ LLM-driven search: **plan** → optional HyDE → **Gate.chat** → quality chec
 |-------|------|-------------|
 | `query` | string | User question (required) |
 | `history` | array | Chat history `[{role, content}]` |
-| `filters` | object | Gate filters (`project_id`, `source`, etc.) |
+| `filters` | object | Retrieval filters (`project_id`, `source`, etc.) |
 | `include_sources` | bool | Include sources (default true) |
 | `top_k` | int | Override top_k (5..24) |
 | `use_adaptive_k` | bool | Adaptive-k (overrides env) |
@@ -33,13 +33,14 @@ LLM-driven search: **plan** → optional HyDE → **Gate.chat** → quality chec
 | `use_retry` | bool | Retry on incomplete answer |
 | `use_tools` | bool | Calculator and code execution |
 | `mode` | string | Preset: `minimal` \| `conservative` \| `aggressive` |
+| `answer_style` | string | `default` \| `factoid` \| `auto` |
 
 Presets: **minimal** (no HyDE/fact/retry, 4 LLM), **conservative** (6 LLM), **aggressive** (HyDE, fact, retry, 16 LLM, 4 fact queries).
 
 ### Environment (agent-search)
 
-- `AGENT_GATE_URL` — Gate URL (e.g. http://rag-gate:8090)
-- `AGENT_GATE_TIMEOUT_S` — Gate call timeout
+- `AGENT_RETRIEVAL_URL` — Retrieval URL (e.g. http://retrieval:8080)
+- `AGENT_RETRIEVAL_TIMEOUT_S` — Retrieval call timeout
 - `AGENT_MAX_LLM_CALLS`, `AGENT_MAX_FACT_QUERIES`
 - `AGENT_USE_HYDE`, `AGENT_USE_FACT_QUERIES`, `AGENT_USE_RETRY`
 - `AGENT_LLM_BASE_URL`, `AGENT_LLM_MODEL`, `AGENT_LLM_API_KEY` (fallback: GATE_*)
