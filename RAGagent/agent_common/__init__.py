@@ -7,9 +7,6 @@ from agent_common.prompts import (
     ANSWER_SYSTEM_WITH_TOOLS_FACTOID,
     ANSWER_USER,
     ANSWER_USER_FACTOID,
-    DEEP_FACT_QUERIES,
-    DEEP_HYDE,
-    DEEP_KEYWORD_QUERIES,
     FACT_QUERIES_SYSTEM,
     FACT_QUERIES_USER,
     FACTOID_REWRITE_SYSTEM,
@@ -30,7 +27,6 @@ from agent_common.retrieval import (
     sources_from_context,
     strip_thinking,
 )
-from agent_common.gate_client import AsyncGateClient
 from agent_common.events import EventType
 from agent_common.tools import run_calculator, run_execute_code
 
@@ -41,9 +37,6 @@ __all__ = [
     "ANSWER_SYSTEM_WITH_TOOLS_FACTOID",
     "ANSWER_USER",
     "ANSWER_USER_FACTOID",
-    "DEEP_FACT_QUERIES",
-    "DEEP_HYDE",
-    "DEEP_KEYWORD_QUERIES",
     "FACT_QUERIES_SYSTEM",
     "FACT_QUERIES_USER",
     "FACTOID_REWRITE_SYSTEM",
@@ -61,7 +54,6 @@ __all__ = [
     "context_from_hits",
     "sources_from_context",
     "strip_thinking",
-    "AsyncGateClient",
     "EventType",
     "run_calculator",
     "run_execute_code",
