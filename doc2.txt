@@ -1,1 +1,0 @@
-ODS (Operational Data Store) provides tenant isolation: each API key maps to one tenant. All documents and collections belong to that tenant.

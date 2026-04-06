@@ -178,7 +178,13 @@ async def handle_incoming_message(
     # Main pipeline
     logger.debug("Processing event: %s/%s", info.bucket, info.key)
     try:
-        await handle_s3_event(info=info, s3_client=s3_client, deps=deps)
+        await handle_s3_event(
+            info=info,
+            s3_client=s3_client,
+            deps=deps,
+            attempt=retry_count,
+            max_attempts=len(retry_levels),
+        )
         await message.ack()
         return
     except NonRetryableError as e:
@@ -236,7 +242,7 @@ async def consume_rabbitmq(*, s3_client, deps: PipelineDeps, cfg: AppConfig) -> 
         try:
             connection = await aio_pika.connect_robust(cfg.rabbitmq_url, heartbeat=30)
             channel = await connection.channel()
-            await channel.set_qos(prefetch_count=10)
+            await channel.set_qos(prefetch_count=1)
 
             # DLQ wiring (parking lot)
             dlx = await channel.declare_exchange(cfg.amqp_dlx_exchange, aio_pika.ExchangeType.DIRECT, durable=True)

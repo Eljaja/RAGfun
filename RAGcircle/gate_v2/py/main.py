@@ -3,6 +3,7 @@ import uvicorn
 import uuid
 import re
 import httpx
+from datetime import datetime
 from storage import UploadMeta, upload_with_content_addressing, detect_content_type, download_from_s3
 from collectors import QdrantStore, BM25Store
 from collectors import BM25Store, QdrantStore, create_bm25_store, create_qdrant_store
@@ -23,11 +24,25 @@ from inspect import Parameter, Signature
 from pydantic import BaseModel
 
 
-from database_ops import DocumentEventDB, create_db, ProjectDB, DocumentDB
+from database_ops import (
+    DocumentEvent,
+    DocumentEventDB,
+    DocumentEventType,
+    create_db,
+    ProjectDB,
+    DocumentDB,
+)
 from auth import UserCreds, authenticated
 from projects import authorize_project
 from settings import Constants
 
+from retrieval_contract import RetrieveRequest as RetrievalServiceRequest, RetrieveResponse
+from generator_contract import (
+    AgentRequest,
+    AgentResponse,
+    ChatRequest as SimpleChatRequest,
+    ChatResponse as SimpleChatResponse,
+)
 
 from ops_bucket import create_collection
 
@@ -42,12 +57,16 @@ class ProjectCreate(BaseModel):
     name: str
     description: str | None = None
     # Immutable after creation — changing these requires re-indexing all docs
-    embedding_model: str = "intfloat/multilingual-e5-base"
+    embedding_model: str = "BAAI/bge-m3"
     chunk_size: int = 512
     chunk_overlap: int = 64
     language: str = "ru"
     # Mutable — can be changed freely
-    llm_model: str = "gemma-3-12b"
+    llm_model: str = "openai/gpt-oss-120b"
+
+class ProjectCreateTemp(BaseModel):
+    name: str
+    description: str | None = None
 
 
 class ProjectUpdate(BaseModel):
@@ -223,16 +242,43 @@ async def health_check():
 # ----------------------------
 # Project Endpoints
 # ----------------------------
+"""
+## Bug: Project-level chunk_size never reaches doc_processor
+
+### Problem
+The `ProjectCreate` API accepts `chunk_size` and `chunk_overlap`, and they are stored in the DB.
+However, the `Project` dataclass in `gate_v2/py/database_ops.py` does not include these fields.
+`to_dict()` therefore never serializes them, so they are never written into S3 object metadata.
+
+In `doc_processor_v2/py/pipeline.py:38`:
+    chunk_size = int(project.get("chunk_size", settings.chunk_size_chars))
+
+`project.get("chunk_size")` is always None, so it always falls back to `settings.chunk_size_chars`,
+which comes from the .env `CHUNK_SIZE_CHARS` (currently 5000).
+
+### Fix
+1. Add chunk_size, chunk_overlap, embedding_model, language, llm_model to:
+   - Project dataclass fields (database_ops.py)
+   - Project.from_row()
+   - Project.to_dict()
+2. Set CHUNK_SIZE_CHARS in doc_processor .env to a sensible fallback (e.g. 1024 or 1500).
+
+### Impact
+All documents processed so far used chunk_size=5000 regardless of project settings.
+Re-indexing may be needed after the fix.
+"""
 
 @protected_router.post("/v1/projects")
 async def create_project(
-    payload: ProjectCreate,
+    payload: ProjectCreateTemp,
     user: UserCreds = Depends(authenticated),
     settings: Settings = Depends(get_settings),
     project_db: ProjectDB = Depends(get_project_db),
     qdrant: QdrantStore = Depends(get_qdrant),
     opensearch: BM25Store = Depends(get_opensearch)
 ):
+
+    payload = ProjectCreate(**payload.model_dump())
     """Create a new project (enforces max limit per user)."""
     if settings.stub_auth_enabled:
         project = await project_db.ensure_project(
@@ -430,6 +476,7 @@ async def upload(
     s3_client=Depends(get_s3),
     project_db: ProjectDB = Depends(get_project_db),
     document_db: DocumentDB = Depends(get_document_db),
+    event_db: DocumentEventDB = Depends(get_event_db),
     settings: Settings = Depends(get_settings),
 ):
     doc_id = uuid.uuid4().hex
@@ -474,14 +521,17 @@ async def upload(
         bucket=settings.bucket_name,
         request_stream=file_stream(),
         content_type=content_type,
-        max_bytes=1 * 1024 * 1024,
+        max_bytes=20 * 1024 * 1024, # TODO add an .env var
         storage_prefix=storage_prefix,
         doc_id=doc_id,
         # TODO: fix mixed up pydantic and dataclasses
         doc_attrs = all_attrs, 
     )
     if upload_result.duplicate:
-        raise HTTPException(status_code=409)
+        raise HTTPException(
+            status_code=409,
+            detail="duplicate_upload_attempted",
+        )
 
     # Do I like that option?
     # Not really but we can merge results and hide info about doc contents in a way
@@ -490,7 +540,14 @@ async def upload(
     # shi x3
     # whatever, we do not handle millions of docs, maybe we will scale later
     
-    await document_db.persist_document(doc_id, effective_project_id, upload_result, meta)
+    await document_db.persist_document(doc_id, project_id, upload_result, meta)
+    await event_db.log_event(
+        doc_id=upload_result.storage_id,
+        project_id=project_id,
+        event_type=DocumentEventType.UPLOADED,
+        service_name="gateway",
+        metadata={"external_doc_id": doc_id},
+    )
 
     return {
         "doc_id": doc_id,
@@ -610,7 +667,7 @@ async def get_document_info(
 
 
 @protected_router.get("/v1/documents/{doc_id}/status")
-async def get_document_info(
+async def get_document_status(
     # project_id: str,
     doc_id: str,
     user: UserCreds = Depends(authenticated),
@@ -620,7 +677,7 @@ async def get_document_info(
     # settings=Depends(get_settings),
     event_db=Depends(get_event_db),
 ):
-    """Delete a document (with ownership check via project)."""
+    """Return latest document status event (with ownership check via project)."""
     # Get document to find its project
     doc = await document_db.get(doc_id)
     if not doc:
@@ -633,113 +690,168 @@ async def get_document_info(
     storage_id = doc_obj.get("storage_id")
 
     ev = await event_db.get_latest_event(doc_id=storage_id, project_id=doc_obj.get("project_id"))
-    
-    # this is truly meh on large scale 
-    # blaaaaaaaaat 
-    # blaaaaaaaaat
-    # this is really bad 
-    # nonononoo
-    # nonononononono
-    # shit 
-    # no nono nonononono
-    # what is the point? 
-    # this is bad you cannot ship this 
-    # no no no no no no no
-    # 
 
-    # well here is another idea -> we track prev event for all of the methods except ingestion
-    # is this shit? 
-    # maybe
-    if getattr(ev, "doc_id"): 
+    if ev is None:
+        return DocumentEvent(
+            event_id=f"synthetic-uploaded-{doc_id}-{uuid.uuid4().hex}",
+            doc_id=doc_id,
+            project_id=doc_obj["project_id"],
+            event_type=DocumentEventType.UPLOADED,
+            service_name="gateway",
+            metadata={
+                "source": "status_fallback",
+                "external_doc_id": doc_id,
+                "storage_id": storage_id,
+            },
+            created_at=datetime.utcnow(),
+        )
+
+    if ev.doc_id == storage_id:
         ev.doc_id = doc_id
     return ev
 
 
-class RetrieveRequest(BaseModel):
-    query: str
-    top_k: int = 5
-    rerank: bool = True
-    strategy: str = "hybrid"
+# @protected_router.post("/v1/projects/{project_id}/retrieve")
+# async def retrieve_documents(
+#     project_id: str,
+#     body: RetrievalServiceRequest,
+#     user: UserCreds = Depends(authenticated),
+#     project_db: ProjectDB = Depends(get_project_db),
+#     settings: Settings = Depends(get_settings),
+#     client: httpx.AsyncClient = Depends(get_http_client),
+# ):
+#     await authorize_project(user, project_id, project_db)
+
+#     request = RetrievalServiceRequest(project_id=project_id, **body.model_dump(exclude={"project_id"}))
+#     resp = await client.post(
+#         f"{settings.retrieval_url}/retrieve",
+#         json=request.model_dump(),
+#     )
+
+#     if resp.status_code != 200:
+#         raise HTTPException(status_code=502, detail="Retrieval service error")
+
+#     return RetrieveResponse.model_validate(resp.json())
 
 
-class ChatRequestBody(BaseModel):
-    query: str
-    top_k: int = 5
-    rerank: bool = True
-    strategy: str = "hybrid"
-    max_retries: int = 1
-    reflection_enabled: bool = True
-
-
-@protected_router.post("/v1/projects/{project_id}/retrieve")
-async def retrieve_documents(
-    project_id: str,
-    body: RetrieveRequest,
-    user: UserCreds = Depends(authenticated),
-    settings: Settings = Depends(get_settings),
-    project_db: ProjectDB = Depends(get_project_db),
-    client: httpx.AsyncClient = Depends(get_http_client),
-):
-    effective_project_id = _effective_project_id(project_id, settings)
-    await _resolve_project(
-        user=user,
-        requested_project_id=effective_project_id,
-        settings=settings,
-        project_db=project_db,
-    )
-
-    resp = await client.post(
-        f"{settings.retrieval_url}/retrieve",
-        json={
-            "project_id": effective_project_id,
-            "query": body.query,
-            "top_k": body.top_k,
-            "rerank": body.rerank,
-            "strategy": body.strategy,
-        },
-    )
-
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail="Retrieval service error")
-
-    return resp.json()
-
-
-@protected_router.post("/v1/projects/{project_id}/chat")
+@protected_router.post("/v1/chat")
 async def chat_with_documents(
-    project_id: str,
-    body: ChatRequestBody,
+    body: AgentRequest,
     user: UserCreds = Depends(authenticated),
     settings: Settings = Depends(get_settings),
     project_db: ProjectDB = Depends(get_project_db),
     client: httpx.AsyncClient = Depends(get_http_client),
 ):
-    effective_project_id = _effective_project_id(project_id, settings)
-    await _resolve_project(
-        user=user,
-        requested_project_id=effective_project_id,
-        settings=settings,
-        project_db=project_db,
-    )
+    """Full agent pipeline: plan, expand, retrieve, generate, evaluate."""
+    await authorize_project(user, body.project_id, project_db)
 
+    payload = body.model_dump()
     resp = await client.post(
-        f"{settings.generator_url}/chat",
-        json={
-            "project_id": effective_project_id,
-            "query": body.query,
-            "top_k": body.top_k,
-            "rerank": body.rerank,
-            "strategy": body.strategy,
-            "max_retries": body.max_retries,
-            "reflection_enabled": body.reflection_enabled,
-        },
+        f"{settings.generator_url}/agent",
+        json=payload,
     )
 
     if resp.status_code != 200:
         raise HTTPException(status_code=502, detail="Generator service error")
 
-    return resp.json()
+    return AgentResponse.model_validate(resp.json())
 
+
+@protected_router.post("/v1/chat/stream")
+async def chat_stream(
+    body: AgentRequest,
+    user: UserCreds = Depends(authenticated),
+    project_db: ProjectDB = Depends(get_project_db),
+    settings: Settings = Depends(get_settings),
+    client: httpx.AsyncClient = Depends(get_http_client),
+):
+    """Streaming agent pipeline via SSE passthrough."""
+    await authorize_project(user, body.project_id, project_db)
+
+    payload = body.model_dump()
+    async def event_proxy():
+        async with client.stream(
+            "POST",
+            f"{settings.generator_url}/agent/stream",
+            json=payload,
+            timeout=120.0,
+        ) as upstream:
+            if upstream.status_code != 200:
+                yield f"data: {{\"type\": \"error\", \"error\": \"generator returned {upstream.status_code}\"}}\n\n"
+                return
+            async for line in upstream.aiter_lines():
+                yield line + "\n"
+
+    return StreamingResponse(
+        event_proxy(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@protected_router.post("/v1/simple-chat")
+async def simple_chat(
+    body: SimpleChatRequest,
+    user: UserCreds = Depends(authenticated),
+    project_db: ProjectDB = Depends(get_project_db),
+    settings: Settings = Depends(get_settings),
+    client: httpx.AsyncClient = Depends(get_http_client),
+):
+    """Simple chat: retrieve + generate, with optional reflection."""
+    await authorize_project(user, body.project_id, project_db)
+
+    payload = body.model_dump()
+    resp = await client.post(
+        f"{settings.generator_url}/chat",
+        json=payload,
+    )
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail="Generator service error")
+
+    return SimpleChatResponse.model_validate(resp.json())
+
+
+@protected_router.post("/v1/simple-chat/stream")
+async def simple_chat_stream(
+    # project_id: str,
+    body: SimpleChatRequest,
+    user: UserCreds = Depends(authenticated),
+    project_db: ProjectDB = Depends(get_project_db),
+    settings: Settings = Depends(get_settings),
+    client: httpx.AsyncClient = Depends(get_http_client),
+):
+    """Streaming simple chat via SSE passthrough."""
+    await authorize_project(user, body.project_id, project_db)
+
+    payload = body.model_dump()
+
+    async def event_proxy():
+        async with client.stream(
+            "POST",
+            f"{settings.generator_url}/chat/stream",
+            json=payload,
+            timeout=120.0,
+        ) as upstream:
+            if upstream.status_code != 200:
+                yield f"data: {{\"type\": \"error\", \"error\": \"generator returned {upstream.status_code}\"}}\n\n"
+                return
+            async for line in upstream.aiter_lines():
+                yield line + "\n"
+
+    return StreamingResponse(
+        event_proxy(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 
@@ -757,11 +869,10 @@ async def chat_with_documents(
 # App Initialization
 # ----------------------------
 
-app = FastAPI(lifespan=lifecycle, title="S3 Presign API")
+app = FastAPI(lifespan=lifecycle, title="RAGcircle Gateway")
 # register_exception_handlers(app)
 app.include_router(public_router)
 app.include_router(protected_router)
 
 
-if __name__ == "__main__":
-    uvicorn.run(app=app, port=8912, host="0.0.0.0")
+uvicorn.run(app=app, port=8917, host="localhost")

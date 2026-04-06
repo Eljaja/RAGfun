@@ -1,25 +1,50 @@
+"""Models for the retrieval service.
+
+Shared contract types (plan steps, chunks, API models) are imported from
+the retrieval_contract package. Internal-only types live here.
+"""
+
 from __future__ import annotations
+
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+# Re-export shared contract types so existing `from models import X` keeps working.
+from retrieval_contract import (  # noqa: F401
+    AdaptiveKStep,
+    BM25SearchStep,
+    ChunkResult,
+    ExecuteRequest,
+    ExecuteResponse,
+    ExecutionPlan,
+    FinalizeStep,
+    FuseStep,
+    PlanRound,
+    QueryStepBase,
+    RankStep,
+    RerankStep,
+    RetrievalStep,
+    RetrieveRequest,
+    RetrieveResponse,
+    ScoreSource,
+    StepBase,
+    TrimStep,
+    VectorSearchStep,
+)
 
-class ChunkResult(BaseModel):
-    text: str
-    source_id: str
-    chunk_index: int
-    score: float
+
+# ── Internal types (not part of the shared contract) ─────
 
 
-class RetrieveRequest(BaseModel):
-    project_id: str
-    query: str
-    top_k: int = Field(default=5, ge=1, le=50)
-    rerank: bool = True
-    rerank_top_n: int = Field(default=5, ge=1, le=50)
-    strategy: str = Field(default="hybrid", pattern="^(hybrid|vector|bm25)$")
+class EmbeddingResponseData(BaseModel):
+    embedding: list[float]
+    index: int
+    object: Literal["embedding"] = Field(...)
 
 
-class RetrieveResponse(BaseModel):
-    chunks: list[ChunkResult]
-    strategy: str
-    query: str
+class EmbeddingResponse(BaseModel):
+    data: list[EmbeddingResponseData]
+    model: str
+    object: Literal["list"] = Field(...)
+    usage: dict[str, Any] | None = None
