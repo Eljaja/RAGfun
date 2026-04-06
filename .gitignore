@@ -218,5 +218,3 @@ results/
 scripts/
 tmp_upload/
 
-# Local docs (tuning guides)
-docs/USER_GUIDE_TUNING_AND_FEATURES.md
