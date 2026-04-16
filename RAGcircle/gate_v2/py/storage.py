@@ -110,6 +110,7 @@ async def validated_stream(
     async for chunk in stream:
         total += len(chunk)
         if total > max_bytes:
+            print(f"THIS IS CURRENT BYTES {total}")
             # TODO: switch to domain exceptions + exception handlers
             raise HTTPException(
                 413, f"File exceeds {max_bytes // (1024*1024)}MB")

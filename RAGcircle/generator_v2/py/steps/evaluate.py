@@ -1,12 +1,13 @@
 """Evaluate phase: answer + chunks in, verdict out.
 
-Pure judging: no retrieval, no generation. Returns a Verdict.
+Leaf functions return (dict, traces).  The dict carries partial Verdict
+fields; the caller merges them with merge_partials.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from config import Settings
 from lib.context import build_context
@@ -14,7 +15,6 @@ from engine.brain_budget import BudgetCounter
 from clients.llm import LLMClient, LLMParseError, LLMTransportError
 from models.assessment import AssessmentResult, ReflectionResult
 from retrieval_contract import ChunkResult
-from models.plan import Verdict
 from models.steps import (
     AssessStep,
     EvalStep,
@@ -32,8 +32,7 @@ from steps.query_heuristics import answer_is_grounded
 logger = logging.getLogger(__name__)
 
 
-async def evaluate(
-    steps: list[EvalStep],
+def make_eval_dispatch(
     *,
     answer: str,
     chunks: list[ChunkResult],
@@ -45,48 +44,32 @@ async def evaluate(
     llm: LLMClient,
     model: str,
     settings: Settings,
-) -> Verdict:
-    """Run all evaluate steps. Returns a Verdict — no retrieval, no generation."""
-    traces: list[dict[str, Any]] = []
-    missing_terms: list[str] = []
-    requery: str | None = None
+) -> Callable[[EvalStep], Any]:
+    """Return a dispatch closure for evaluate steps."""
 
-    for step in steps:
+    def dispatch(step: EvalStep):
         match step:
             case ReflectStep():
-                rq, t = await _reflect(
+                return _reflect(
                     answer=answer, chunks=chunks, query=query,
                     source_meta=source_meta, budget=budget,
                     llm=llm, model=model, settings=settings,
                 )
-                if rq:
-                    requery = rq
-                traces.extend(t)
-
             case AssessStep():
-                mt, t = await _assess(
+                return _assess(
                     answer=answer, query=query, history_text=history_text,
                     budget=budget, llm=llm, model=model,
                 )
-                missing_terms = mt
-                traces.extend(t)
-
             case GroundingCheckStep():
-                grounded, t = await _grounding_check(
+                return _grounding_check(
                     answer=answer, chunks=chunks,
                     is_factoid=is_factoid, source_meta=source_meta,
                     settings=settings,
                 )
-                if not grounded:
-                    missing_terms = ["answer not grounded"]
-                traces.extend(t)
+            case _:
+                raise TypeError(f"unknown eval step: {type(step).__name__}")
 
-    return Verdict(
-        needs_retry=bool(missing_terms) or bool(requery),
-        missing_terms=missing_terms,
-        requery=requery,
-        traces=traces,
-    )
+    return dispatch
 
 
 # ── Individual step implementations ──────────────────────
@@ -97,17 +80,15 @@ async def _reflect(
     source_meta: dict[str, dict[str, Any]],
     budget: BudgetCounter, llm: LLMClient, model: str,
     settings: Settings,
-) -> tuple[str | None, list[dict[str, Any]]]:
-    """Returns (requery_or_None, traces)."""
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     if not budget.try_consume() or not answer:
-        return None, []
+        return {}, []
 
     traces: list[dict[str, Any]] = [{"kind": "tool", "name": "llm.reflect", "payload": {}}]
     context_text = build_context(
         chunks,
         max_chars=settings.max_context_chars,
         max_chunk_chars=settings.max_chunk_chars,
-        # source_meta=source_meta,
     )
 
     try:
@@ -130,30 +111,29 @@ async def _reflect(
         )
     except LLMTransportError as exc:
         logger.warning("Reflection LLM unavailable: %s", exc)
-        return None, traces
+        return {}, traces
     except LLMParseError as exc:
         logger.warning("Reflection parse failed: %s — raw: %s", exc, exc.raw[:300])
-        return None, traces
+        return {}, traces
 
     if not result.complete and result.requery:
         traces.append({
             "kind": "thought", "label": "Reflect",
             "content": f"Incomplete. Requery: {result.requery}",
         })
-        return result.requery, traces
+        return {"requery": result.requery}, traces
 
     if result.complete:
         traces.append({"kind": "thought", "label": "Reflect", "content": "Answer is complete"})
-    return None, traces
+    return {}, traces
 
 
 async def _assess(
     *, answer: str, query: str, history_text: str,
     budget: BudgetCounter, llm: LLMClient, model: str,
-) -> tuple[list[str], list[dict[str, Any]]]:
-    """Returns (missing_terms, traces)."""
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     if not budget.try_consume() or not answer:
-        return [], []
+        return {}, []
 
     traces: list[dict[str, Any]] = [{"kind": "tool", "name": "llm.assess", "payload": {}}]
 
@@ -171,32 +151,32 @@ async def _assess(
         )
     except LLMTransportError as exc:
         logger.warning("Assessment LLM unavailable: %s", exc)
-        return [], traces
+        return {}, traces
     except LLMParseError as exc:
         logger.warning("Assessment parse failed: %s — raw: %s", exc, exc.raw[:300])
-        return [], traces
+        return {}, traces
 
     if not assessment.incomplete:
-        return [], traces
+        return {}, traces
 
     traces.append({
         "kind": "thought", "label": "Assess",
         "content": f"Incomplete: {assessment.reason}. Missing: {assessment.missing_terms}",
     })
-    return assessment.missing_terms, traces
+    return {"missing_terms": assessment.missing_terms}, traces
 
 
-async def _grounding_check(
+def _grounding_check(
     *,
     answer: str,
     chunks: list[ChunkResult],
     is_factoid: bool,
     source_meta: dict[str, dict[str, Any]],
     settings: Settings,
-) -> tuple[bool, list[dict[str, Any]]]:
-    """Check if the answer is grounded in chunks. Returns (grounded, traces)."""
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Check if the answer is grounded in chunks."""
     if not is_factoid or not answer or not chunks:
-        return True, []
+        return {}, []
 
     context_text = build_context(
         chunks,
@@ -206,9 +186,10 @@ async def _grounding_check(
     )
 
     if answer_is_grounded(answer=answer, context_text=context_text):
-        return True, []
+        return {}, []
 
-    return False, [{
-        "kind": "thought", "label": "GroundingCheck",
-        "content": "Answer not grounded in retrieved context",
-    }]
+    return (
+        {"missing_terms": ["answer not grounded"]},
+        [{"kind": "thought", "label": "GroundingCheck",
+          "content": "Answer not grounded in retrieved context"}],
+    )

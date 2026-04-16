@@ -1,22 +1,18 @@
 """Configure phase: detect language, plan retrieval strategy.
 
-Pure functions: (query, history, budget, deps) -> ConfigMeta.
-Runs before retrieval — no chunks yet, no generation.
+Leaf functions return (dict, traces).  The dict carries partial ConfigMeta
+fields; the caller merges them with merge_partials.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
-
+from typing import Any, Callable
 
 from config import Settings
 from engine.brain_budget import BudgetCounter
-from engine.trace_collector import TraceCollector
 from clients.llm import LLMClient, LLMParseError, LLMTransportError
-from models.plan import ConfigMeta
-from retrieval_contract import ExecutionPlan
 from models.steps import ConfigStep, DetectLangStep, PlanLLMStep
 from retrieval_contract import from_llm_plan, from_preset
 from steps.prompts import DETECT_LANG_SYSTEM, DETECT_LANG_USER, PLAN_SYSTEM, PLAN_USER
@@ -24,23 +20,10 @@ from steps.query_heuristics import is_factoid_question
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_PLAN_DICT: dict[str, Any] = {
-    "retrieval_mode": "hybrid",
-    "top_k": 10,
-    "rerank": True,
-    "use_hyde": False,
-    "reason": "fallback",
-}
-
 _FALLBACK = ("hybrid", from_preset("hybrid", top_k=10, rerank=True))
 
 
-# TODO 
-# method is too opinionated in fact
-# so what would be nice is to secure the structure of dsl more and make some steps 
-# compulsory 
-async def configure(
-    steps: list[ConfigStep],
+def make_config_dispatch(
     *,
     query: str,
     history_text: str,
@@ -48,36 +31,24 @@ async def configure(
     llm: LLMClient,
     model: str,
     settings: Settings,
-    collector: TraceCollector,
-) -> ConfigMeta:
-    """Run all configure steps, return metadata for downstream phases."""
-    lang = "English"
-    is_factoid = False
-    retrieval_plan: ExecutionPlan | None = None
-    retrieval_mode = "hybrid"
+) -> Callable[[ConfigStep], Any]:
+    """Return a dispatch closure for configure steps."""
 
-    for step in steps:
+    def dispatch(step: ConfigStep):
         match step:
             case PlanLLMStep():
-                rp, rm = await _plan_retrieval(
+                return _plan_retrieval(
                     query=query, history_text=history_text, budget=budget,
-                    llm=llm, model=model, settings=settings, collector=collector,
+                    llm=llm, model=model, settings=settings,
                 )
-                retrieval_plan = rp
-                retrieval_mode = rm
-
             case DetectLangStep():
-                lang, is_factoid = await _detect_lang(
+                return _detect_lang(
                     query=query, budget=budget, llm=llm, model=model,
-                    collector=collector,
                 )
+            case _:
+                raise TypeError(f"unknown config step: {type(step).__name__}")
 
-    return ConfigMeta(
-        lang=lang,
-        is_factoid=is_factoid,
-        retrieval_plan=retrieval_plan,
-        retrieval_mode=retrieval_mode,
-    )
+    return dispatch
 
 
 # ── Individual step implementations ──────────────────────
@@ -91,20 +62,17 @@ async def _plan_retrieval(
     llm: LLMClient,
     model: str,
     settings: Settings,
-    collector: TraceCollector,
-) -> tuple[ExecutionPlan, str]:
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    traces: list[dict[str, Any]] = [
+        {"kind": "tool", "name": "llm.plan", "payload": {"query": query}},
+    ]
     fallback_mode, fallback_plan = _FALLBACK
 
-    await collector.emit(
-        {"kind": "tool", "name": "llm.plan", "payload": {"query": query}},
-    )
-
-    # TODO: I do not like this method at all 
-    # And I did not like that it created a bug when it was not executed
-    # but some basic config was provided
-    # Oh and it should definetly return the actual plan 
     if not budget.try_consume():
-        return fallback_plan, fallback_mode
+        return (
+            {"retrieval_plan": fallback_plan, "retrieval_mode": fallback_mode},
+            traces,
+        )
 
     try:
         raw = await asyncio.wait_for(
@@ -115,8 +83,7 @@ async def _plan_retrieval(
                     {
                         "role": "user",
                         "content": PLAN_USER.format(
-                            history=history_text,
-                            query=query,
+                            history=history_text, query=query,
                         ),
                     },
                 ],
@@ -126,17 +93,22 @@ async def _plan_retrieval(
         )
     except LLMTransportError as exc:
         logger.warning("Plan LLM unavailable: %s", exc)
-        return fallback_plan, fallback_mode
-    except LLMParseError as exc:
-        logger.warning(
-            "Plan LLM parse failed: %s — raw: %s",
-            exc,
-            exc.raw[:300],
+        return (
+            {"retrieval_plan": fallback_plan, "retrieval_mode": fallback_mode},
+            traces,
         )
-        return fallback_plan, fallback_mode
+    except LLMParseError as exc:
+        logger.warning("Plan LLM parse failed: %s — raw: %s", exc, exc.raw[:300])
+        return (
+            {"retrieval_plan": fallback_plan, "retrieval_mode": fallback_mode},
+            traces,
+        )
     except asyncio.TimeoutError:
         logger.warning("Plan LLM timed out")
-        return fallback_plan, fallback_mode
+        return (
+            {"retrieval_plan": fallback_plan, "retrieval_mode": fallback_mode},
+            traces,
+        )
 
     retrieval_mode = str(raw.get("retrieval_mode") or "hybrid")
     reason = str(raw.get("reason") or "")
@@ -145,14 +117,12 @@ async def _plan_retrieval(
         top_k_min=settings.agent_top_k_min,
         top_k_max=settings.agent_top_k_max,
     )
-    await collector.emit(
-        {
-            "kind": "thought",
-            "label": "Plan",
-            "content": f"mode={retrieval_mode}. Reason: {reason}",
-        },
-    )
-    return plan, retrieval_mode
+    traces.append({
+        "kind": "thought",
+        "label": "Plan",
+        "content": f"mode={retrieval_mode}. Reason: {reason}",
+    })
+    return {"retrieval_plan": plan, "retrieval_mode": retrieval_mode}, traces
 
 
 async def _detect_lang(
@@ -161,20 +131,18 @@ async def _detect_lang(
     budget: BudgetCounter,
     llm: LLMClient,
     model: str,
-    collector: TraceCollector,
-) -> tuple[str, bool]:
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    traces: list[dict[str, Any]] = []
     lang = "English"
     used_llm = False
     attempted_llm = budget.try_consume()
 
     if attempted_llm:
-        await collector.emit(
-            {
-                "kind": "tool",
-                "name": "llm.detect_lang",
-                "payload": {"query_preview": query[:240]},
-            },
-        )
+        traces.append({
+            "kind": "tool",
+            "name": "llm.detect_lang",
+            "payload": {"query_preview": query[:240]},
+        })
         try:
             raw = await llm.complete(
                 model,
@@ -199,17 +167,12 @@ async def _detect_lang(
         note = " [lang default: no LLM budget]"
 
     logger.info(
-        "detect_lang: lang=%r is_factoid=%s via_llm=%s",
-        lang,
-        is_factoid,
-        used_llm,
+        "detect_lang: lang=%r is_factoid=%s via_llm=%s", lang, is_factoid, used_llm,
     )
-    await collector.emit(
-        {
-            "kind": "thought",
-            "label": "DetectLang",
-            "content": f"lang={lang}, is_factoid={is_factoid}{note}",
-        },
-    )
+    traces.append({
+        "kind": "thought",
+        "label": "DetectLang",
+        "content": f"lang={lang}, is_factoid={is_factoid}{note}",
+    })
 
-    return lang, is_factoid
+    return {"lang": lang, "is_factoid": is_factoid}, traces

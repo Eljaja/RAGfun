@@ -31,32 +31,24 @@ class AppConfig(BaseSettings):
     amqp_retry_ttls: str = "50,150,450,1200,3000"
 
     # ── S3 ───────────────────────────────────────────────────────────────
-    s3_endpoint: str = "http://localhost:9004"
+    s3_endpoint: str 
     s3_access_key: str = "rustfs"
     s3_secret_key: str = "password"
     s3_region: str = "us-east-1"
 
-    # ── VLM ──────────────────────────────────────────────────────────────
-    vlm_base_url: str = "http://localhost:8123"
+    # ── VLM (infra only — model selection comes from project config) ─────
+    vlm_base_url: str
     vlm_api_key: str | None = None
-    vlm_model: str = "ibm-granite/granite-docling-258M"
     vlm_timeout: float = 120.0
 
-    # ── Processing ───────────────────────────────────────────────────────
-    proc_page_window: int = 50
-    proc_max_px: int = 2048
-    proc_vlm_concurrency: int = 4
-    chunk_size_chars: int = 1500
-    chunk_overlap_chars: int = 200
-
     # ── Embedding ────────────────────────────────────────────────────────
-    embedder_url: str = "http://localhost:8902"
+    embedder_url: str 
     embedder_model: str = "BAAI/bge-m3"
     embedder_dim: int = 1024
     embed_batch_size: int = 32
 
     # ── Stores ───────────────────────────────────────────────────────────
-    qdrant_url: str = "http://localhost:8903"
+    qdrant_url: str
     qdrant_collection: str = "documents"
     opensearch_url: str = "http://localhost:8905"
     opensearch_index: str = "documents"
@@ -65,6 +57,9 @@ class AppConfig(BaseSettings):
         default="postgresql://user:pass@localhost:5439/db",
         validation_alias=AliasChoices("db_addr", "postgre_url"),
     )
+
+    project_crud_url: str = "http://localhost:8918"
+    project_crud_path: str = "/public/v1/internal/projects/{}" # can be used to get the project credentials
 
     # ── Logging ───────────────────────────────────────────────────────
     log_level: str = "DEBUG"

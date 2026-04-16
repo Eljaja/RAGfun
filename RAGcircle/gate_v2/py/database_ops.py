@@ -24,20 +24,49 @@ class Project:
     user_id: str
     name: str
     description: Optional[str] = None
+    embedding_model: str = "BAAI/bge-m3"
+    chunk_size: int = 512
+    chunk_overlap: int = 64
+    language: str = "ru"
+    llm_model: str = "openai/gpt-oss-120b"
+    reranker_model: str = "BAAI/bge-reranker-v2-m3"
+    # CHUNK IT UP IN STAGES LOL
+    # or dev endpoint/user endpoint
+    # like unstructured.io does for user facing stuff
+    # devs should have most flexibility
+    # think whether I should use presets or actually allow configuring this down to the model names
+    vlm_model: str = "Qwen/Qwen3-VL-8B-Instruct"
     status: ProjectStatus = ProjectStatus.ACTIVE
     created_at: float = field(default_factory=float)
     updated_at: float = field(default_factory=float)
+    # Doc processor required fields
+    page_window: int = 50
+    max_px: int = 2048
+    vlm_concurrency: int = 4
 
     @classmethod
+    # TODO
+    # add new fields as I will start to require them
+    # constants are not fine
     def from_row(cls, row: asyncpg.Record) -> "Project":
         return cls(
             project_id=row["project_id"],
             user_id=row["user_id"],
             name=row["name"],
             description=row["description"],
+            embedding_model=row["embedding_model"],
+            chunk_size=int(row["chunk_size"]),
+            chunk_overlap=int(row["chunk_overlap"]),
+            language=row["language"],
+            llm_model=row["llm_model"],
+            vlm_model=row.get("vlm_model", "Qwen/Qwen3-VL-8B-Instruct"),
+            reranker_model=row.get("reranker_model", "BAAI/bge-reranker-v2-m3"),
             status=ProjectStatus(row["status"]),
             created_at=row["created_at"].timestamp(),
             updated_at=row["updated_at"].timestamp(),
+            page_window=row.get("page_window", 50),
+            max_px=row.get("max_px", 2048),
+            vlm_concurrency=row.get("vlm_concurrency", 4),
         )
 
     def to_dict(self) -> dict:
@@ -46,9 +75,19 @@ class Project:
             "user_id": self.user_id,
             "name": self.name,
             "description": self.description,
+            "embedding_model": self.embedding_model,
+            "reranker_model": self.reranker_model,
+            "chunk_size": self.chunk_size,
+            "chunk_overlap": self.chunk_overlap,
+            "language": self.language,
+            "llm_model": self.llm_model,
+            "vlm_model": self.vlm_model,
             "status": self.status.value,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "page_window": self.page_window,
+            "max_px": self.max_px,
+            "vlm_concurrency": self.vlm_concurrency,
         }
 
 

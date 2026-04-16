@@ -27,14 +27,21 @@ async def lifespan(app: FastAPI):
         timeout=settings.llm_timeout,
     )
     http_client = httpx.AsyncClient(timeout=max(settings.agent_gate_timeout, 30.0))
+    gate_http = httpx.AsyncClient(
+        base_url=settings.gate_url.rstrip("/"),
+        timeout=httpx.Timeout(10.0, connect=5.0),
+        limits=httpx.Limits(max_connections=50, max_keepalive_connections=10),
+    )
 
     app.state.llm = llm
     app.state.settings = settings
     app.state.http_client = http_client
+    app.state.gate_http = gate_http
 
     yield
 
     await http_client.aclose()
+    await gate_http.aclose()
     await llm.close()
 
 

@@ -15,11 +15,13 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
+import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from engine.brain_pipeline import run_pipeline
 from models import PipelineResult, PlanRunRequest, PlanRunResponse
+from project_deps import ProjectDeps, fetch_project_deps
 from models.events import DoneEvent, InitEvent, TokenEvent, TraceEvent
 
 logger = logging.getLogger(__name__)
@@ -28,6 +30,10 @@ plan_router = APIRouter(prefix="/plan", tags=["plan"])
 
 
 # ── helpers ───────────────────────────────────────────────
+
+
+def get_gate_client(request: Request) -> httpx.AsyncClient:
+    return request.app.state.gate_http
 
 
 def _pipeline_kwargs(request: Request) -> dict[str, Any]:
@@ -67,8 +73,9 @@ def _build_response(
     )
 
 
-async def _run(body: PlanRunRequest, request: Request) -> PipelineResult:
+async def _run(body: PlanRunRequest, request: Request, project_deps: ProjectDeps) -> PipelineResult:
     kwargs = _pipeline_kwargs(request)
+    kwargs["project_deps"] = project_deps
     return await asyncio.wait_for(
         run_pipeline(
             body.brain_plan,
@@ -87,8 +94,11 @@ async def _run(body: PlanRunRequest, request: Request) -> PipelineResult:
 
 @plan_router.post("/run", response_model=PlanRunResponse)
 async def plan_run(body: PlanRunRequest, request: Request):
+    gate_client = get_gate_client(request)
+    project_deps = await fetch_project_deps(gate_client, body.project_id)
+
     try:
-        result = await _run(body, request)
+        result = await _run(body, request, project_deps)
     except asyncio.TimeoutError:
         raise HTTPException(status_code=500, detail="request_timeout")
     except Exception as exc:
@@ -103,11 +113,14 @@ async def plan_run(body: PlanRunRequest, request: Request):
 
 @plan_router.post("/run/stream")
 async def plan_run_stream(body: PlanRunRequest, request: Request):
+    gate_client = get_gate_client(request)
+    project_deps = await fetch_project_deps(gate_client, body.project_id)
+
     trace_id = uuid.uuid4().hex
 
     async def event_stream() -> AsyncIterator[str]:
         try:
-            result = await _run(body, request)
+            result = await _run(body, request, project_deps)
 
             yield _sse(_event_dict(InitEvent(trace_id=trace_id)))
 

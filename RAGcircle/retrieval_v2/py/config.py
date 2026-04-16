@@ -6,20 +6,21 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(frozen=True, extra="ignore")
 
-    # ── Embedding service (Infinity) ─────────────────────────
-    embedder_url: str = "http://localhost:8902"
-    embedder_model: str = "BAAI/bge-m3"
+    # ── Gate (project CRUD) ──────────────────────────────────
+    gate_url: str = "http://localhost:8918"
+
+    # ── Embedding service (infra only — model comes from project config) ─
+    embedder_url: str = "http://localhost:11008"
     embedder_timeout: float = 30.0
 
     # ── Qdrant (vector search) ───────────────────────────────
-    qdrant_url: str = "http://localhost:8903"
+    qdrant_url: str = "http://localhost:11007"
 
     # ── OpenSearch (BM25 search) ─────────────────────────────
-    opensearch_url: str = "http://localhost:8905"
+    opensearch_url: str = "http://localhost:11011"
 
-    # ── Reranker ─────────────────────────────────────────────
-    reranker_url: str = "http://172.18.0.7:7998"
-    reranker_model: str = "BAAI/bge-reranker-v2-m3"
+    # ── Reranker (infra only — model comes from project config) ─
+    reranker_url: str = "http://localhost:11009"
 
     # ── Server ───────────────────────────────────────────────
     port: int = 8921

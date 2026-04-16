@@ -27,9 +27,11 @@ from amqp_consumer import consume_rabbitmq
 from config import AppConfig
 from embed_caller import Embedder
 from pipeline import PipelineDeps
-from processing import Settings, VLMClient
+from processing import VLMClient
 from store import BM25Store, QdrantStore
 from db_ops import DocumentEventDB
+
+import httpx
 
 
 def _setup_logging(level: str) -> None:
@@ -56,17 +58,10 @@ async def main() -> None:
     vlm = VLMClient(
         base_url=cfg.vlm_base_url,
         api_key=cfg.vlm_api_key,
-        model=cfg.vlm_model,
         timeout_s=cfg.vlm_timeout,
     )
 
-    settings = Settings(
-        page_window=cfg.proc_page_window,
-        max_px=cfg.proc_max_px,
-        vlm_concurrency=cfg.proc_vlm_concurrency,
-        chunk_size_chars=cfg.chunk_size_chars,
-        chunk_overlap_chars=cfg.chunk_overlap_chars,
-    )
+
 
     embedder = Embedder(base_url=cfg.embedder_url, model=cfg.embedder_model)
 
@@ -78,9 +73,10 @@ async def main() -> None:
     document_event_db = DocumentEventDB(pool)
     await document_event_db.ensure_schema()
 
+    http_client = httpx.AsyncClient()
+
     deps = PipelineDeps(
         vlm=vlm,
-        settings=settings,
         embedder=embedder,
         qdrant=qdrant,
         opensearch=opensearch,
@@ -88,6 +84,7 @@ async def main() -> None:
         opensearch_index=cfg.opensearch_index,
         embed_batch_size=cfg.embed_batch_size,
         event_db_docs=document_event_db,
+        http_client=http_client,
     )
 
     stack = AsyncExitStack()
@@ -121,6 +118,7 @@ async def main() -> None:
         await qdrant.close()
         await opensearch.close()
         await pool.close()
+        await http_client.aclose()
 
 
 if __name__ == "__main__":

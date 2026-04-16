@@ -30,12 +30,14 @@ from models import (
     ScoreSource,
     VectorSearchStep,
 )
+from project_deps import ProjectDeps
 from ranking import (
     adaptive_k_cutoff,
     apply_finalize,
     combine_sources,
     dedupe_keep_best,
 )
+from project_deps import ProjectDeps
 
 logger = logging.getLogger(__name__)
 _RETRYABLE_HTTP = (httpx.TransportError, httpx.TimeoutException)
@@ -50,16 +52,12 @@ class HybridRetriever:
         qdrant: AsyncQdrantClient,
         opensearch: AsyncOpenSearch,
         embed_http: httpx.AsyncClient,
-        embed_model: str,
         rerank_http: httpx.AsyncClient | None = None,
-        rerank_model: str = "",
     ):
         self.qdrant = qdrant
         self.opensearch = opensearch
         self.embed_http = embed_http
-        self.embed_model = embed_model
         self.rerank_http = rerank_http
-        self.rerank_model = rerank_model
 
     # ── network helpers ───────────────────────────────────────
 
@@ -76,18 +74,18 @@ class HybridRetriever:
         resp.raise_for_status()
         return resp.json()
 
-    async def _embed(self, text: str) -> list[float]:
+    async def _embed(self, text: str, project_deps: ProjectDeps) -> list[float]:
         data = await self._model_post(
-            self.embed_http, "/embeddings", self.embed_model, {"input": text},
+            self.embed_http, "/embeddings", project_deps.embedding_model, {"input": text},
         )
         parsed = EmbeddingResponse.model_validate(data)
         return parsed.data[0].embedding
 
     async def _rerank(
-        self, query: str, chunks: list[ChunkResult], top_n: int,
+        self, query: str, chunks: list[ChunkResult], top_n: int, project_deps: ProjectDeps,
     ) -> list[ChunkResult]:
         data = await self._model_post(
-            self.rerank_http, "/rerank", self.rerank_model,
+            self.rerank_http, "/rerank", project_deps.reranker_model,
             {"query": query, "documents": [c.text for c in chunks]},
         )
         ranked = sorted(
@@ -158,6 +156,7 @@ class HybridRetriever:
         strategy: str = "hybrid",
         rerank: bool = True,
         rerank_top_n: int = 5,
+        project_deps: ProjectDeps,
     ) -> list[ChunkResult]:
         plan = ExecutionPlan.from_legacy(
             strategy=strategy,
@@ -165,7 +164,7 @@ class HybridRetriever:
             rerank=rerank,
             rerank_top_n=rerank_top_n,
         )
-        chunks = await self.execute_plan(query=query, collection=collection, plan=plan)
+        chunks = await self.execute_plan(query=query, collection=collection, plan=plan, project_deps=project_deps)
         return chunks
 
     def _resolve_step_query(
@@ -182,6 +181,7 @@ class HybridRetriever:
         base_query: str,
         collection: str,
         step: QueryStepBase,
+        project_deps: ProjectDeps,
     ) -> list[ChunkResult]:
         step_query = self._resolve_step_query(
             base_query=base_query, step=step,
@@ -190,7 +190,7 @@ class HybridRetriever:
             case BM25SearchStep():
                 return await self._bm25_search(step_query, collection, step.top_k)
             case VectorSearchStep():
-                vector = await self._embed(step_query)
+                vector = await self._embed(step_query, project_deps)
                 return await self._vector_search(vector, collection, step.top_k)
             case _:
                 raise RuntimeError(f"Unsupported retrieval step: {type(step).__name__}")
@@ -201,9 +201,10 @@ class HybridRetriever:
         query: str,
         collection: str,
         steps: list[RetrievalStep],
+        project_deps: ProjectDeps,
     ) -> list[list[ChunkResult]]:
         return await asyncio.gather(*(
-            self._search_step(base_query=query, collection=collection, step=s)
+            self._search_step(base_query=query, collection=collection, step=s, project_deps=project_deps)
             for s in steps
         ))
 
@@ -213,6 +214,7 @@ class HybridRetriever:
         base_query: str,
         chunks: list[ChunkResult],
         rank_steps: list[RerankStep | AdaptiveKStep],
+        project_deps: ProjectDeps,
     ) -> list[ChunkResult]:
         out = chunks
         for rank_step in rank_steps:
@@ -221,7 +223,7 @@ class HybridRetriever:
                     rerank_query = self._resolve_step_query(
                         base_query=base_query, step=rank_step,
                     )
-                    out = await self._rerank(rerank_query, out, top_n=min(top_n, len(out)))
+                    out = await self._rerank(rerank_query, out, top_n=min(top_n, len(out)), project_deps=project_deps)
                 case AdaptiveKStep(min_k=min_k, max_k=max_k):
                     out = adaptive_k_cutoff(out, min_k=min_k, max_k=max_k)
         return out
@@ -232,15 +234,16 @@ class HybridRetriever:
         query: str,
         collection: str,
         plan: ExecutionPlan,
+        project_deps: ProjectDeps,
     ) -> list[ChunkResult]:
         """Execute a typed retrieval plan. Returns deduped results sorted desc by score."""
         rnd = plan.round
         source_lists = await self._fetch_sources(
-            query=query, collection=collection, steps=rnd.retrieve,
+            query=query, collection=collection, steps=rnd.retrieve, project_deps=project_deps,
         )
         chunks = combine_sources(source_lists, rnd.combine)
         chunks = await self._apply_rank_steps(
-            base_query=query, chunks=chunks, rank_steps=rnd.rank,
+            base_query=query, chunks=chunks, rank_steps=rnd.rank, project_deps=project_deps,
         )
         chunks = apply_finalize(chunks, rnd.finalize)
         return dedupe_keep_best(chunks)

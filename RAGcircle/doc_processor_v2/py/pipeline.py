@@ -5,17 +5,23 @@ import logging
 from dataclasses import dataclass
 from urllib.parse import unquote
 
+
 from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential, retry_if_not_exception_type, before_sleep_log
 
 from chunker import chunk_text_chars
 from embed_caller import Embedder
 from errors import NonRetryableError
+from project_config import DocProcessorConfig, extract_doc_processor_config
+from project_crud import fetch_project
 from s3_events import S3EventInfo
 from ingestion import ingest_chunks
 from models import ChunkMeta, Locator
 from processing import Settings, VLMClient, document_from_bytes, is_windowed
 from store import QdrantStore, BM25Store
 from db_ops import DocumentEventDB, DocumentEventType
+
+
+import httpx
 
 logger = logging.getLogger("data.processing.pipeline")
 
@@ -38,8 +44,8 @@ def create_chunks_from_texts(
     db_id: str,
     doc_id: str,
     texts: list[str],
-    settings: Settings,
-    meta: S3ObjectMeta,
+    project_config: DocProcessorConfig,
+    doc_attrs: dict[str, str],
     *,
     page_offset: int = 0,
     start_chunk_idx: int = 0,
@@ -47,6 +53,10 @@ def create_chunks_from_texts(
 ) -> list[ChunkMeta]:
     """Turn page texts into indexable chunks.
 
+    ``project_config``
+        Typed project configuration fetched from gate.
+    ``doc_attrs``
+        Document-level attributes from S3 metadata (title, tags, etc.).
     ``page_offset``
         0-based offset of the first page in *texts* within the full document.
         Used so that windowed calls produce correct global page numbers.
@@ -56,14 +66,8 @@ def create_chunks_from_texts(
     ``has_pages``
         Explicit override; when ``None`` we infer from ``len(texts) > 1``.
     """
-    doc_meta = meta.doc
-    project = meta.project
-
-    chunk_size = int(project.get("chunk_size", settings.chunk_size_chars))
-    chunk_overlap = int(project.get("chunk_overlap", settings.chunk_overlap_chars))
-
-    tags = [t.strip() for t in doc_meta.get("tags", "").split(",") if t.strip()]
-    acl = [a.strip() for a in doc_meta.get("acl", "").split(",") if a.strip()]
+    tags = [t.strip() for t in doc_attrs.get("tags", "").split(",") if t.strip()]
+    acl = [a.strip() for a in doc_attrs.get("acl", "").split(",") if a.strip()]
 
     if has_pages is None:
         has_pages = len(texts) > 1
@@ -79,8 +83,8 @@ def create_chunks_from_texts(
 
         for part in chunk_text_chars(
             page_text,
-            chunk_size=chunk_size,
-            overlap=chunk_overlap,
+            chunk_size=project_config.chunk_size,
+            overlap=project_config.chunk_overlap,
         ):
             chunks.append(
                 ChunkMeta(
@@ -90,13 +94,13 @@ def create_chunks_from_texts(
                     chunk_index=global_idx,
                     text=part,
                     locator=Locator(page=page_num) if has_pages else None,
-                    title=doc_meta.get("title"),
-                    source=doc_meta.get("source"),
-                    uri=doc_meta.get("uri"),
-                    lang=doc_meta.get("lang") or project.get("language"),
+                    title=doc_attrs.get("title"),
+                    source=doc_attrs.get("source"),
+                    uri=doc_attrs.get("uri"),
+                    lang=doc_attrs.get("lang") or project_config.language,
                     tags=tags,
                     acl=acl,
-                    project_id=project.get("project_id"),
+                    project_id=project_config.project_id,
                 )
             )
             global_idx += 1
@@ -108,8 +112,8 @@ def create_chunks_from_texts(
 
 @dataclass(frozen=True)
 class PipelineDeps:
+    http_client: httpx.AsyncClient
     vlm: VLMClient
-    settings: Settings
     embedder: Embedder
     qdrant: QdrantStore
     opensearch: BM25Store
@@ -124,22 +128,19 @@ class PipelineDeps:
 class S3ObjectMeta:
     """Parsed S3 user-defined metadata, split by prefix."""
     doc: dict[str, str]
-    project: dict[str, str]
     extra: dict[str, str]
 
 
 def parse_s3_metadata(raw: dict[str, str]) -> S3ObjectMeta:
-    """Split flat S3 metadata into doc/project/extra buckets by prefix."""
-    doc, project, extra = {}, {}, {}
+    """Split flat S3 metadata into doc/extra buckets by prefix."""
+    doc, extra = {}, {}
     for k, v in raw.items():
         match k.split("__", 1):
             case ["doc", rest]:
                 doc[rest] = v
-            case ["project", rest]:
-                project[rest] = v
             case _:
                 extra[k] = v
-    return S3ObjectMeta(doc=doc, project=project, extra=extra)
+    return S3ObjectMeta(doc=doc, extra=extra)
 
 
 @dataclass(frozen=True)
@@ -244,7 +245,6 @@ async def download_from_s3(*, bucket: str, key: str, s3_client) -> S3Download:
     file_bytes = await response["Body"].read()
     content_type = response.get("ContentType")
     meta = parse_s3_metadata(response.get("Metadata") or {})
-    # print(meta)
     filename = decoded_key.split("/")[-1] if "/" in decoded_key else decoded_key
     return S3Download(file_bytes=file_bytes, content_type=content_type, filename=filename, meta=meta)
 
@@ -276,6 +276,7 @@ async def _extract_chunk_ingest_simple(
     dl: S3Download,
     doc_id: str,
     project_id: str,
+    project_config: DocProcessorConfig,
     deps: PipelineDeps,
     attempt: int | None,
     max_attempts: int | None,
@@ -292,7 +293,8 @@ async def _extract_chunk_ingest_simple(
     try:
         chunks = create_chunks_from_texts(
             db_id=dl.meta.extra.get("doc-id"), doc_id=doc_id,
-            texts=texts, settings=deps.settings, meta=dl.meta,
+            texts=texts, project_config=project_config,
+            doc_attrs=dl.meta.doc,
         )
     except Exception as e:
         await _log_user_facing_error(deps=deps, doc_id=doc_id, project_id=project_id,
@@ -307,7 +309,7 @@ async def _extract_chunk_ingest_simple(
                     qdrant=deps.qdrant, opensearch=deps.opensearch,
                     qdrant_collection=project_id, opensearch_index=project_id,
                     embed_batch_size=deps.embed_batch_size,
-                    model=dl.meta.project.get("embedding_model"),
+                    model=project_config.embedding_model,
                 )
     except Exception as e:
         await _log_user_facing_error(deps=deps, doc_id=doc_id, project_id=project_id,
@@ -323,6 +325,7 @@ async def _extract_chunk_ingest_windowed(
     dl: S3Download,
     doc_id: str,
     project_id: str,
+    project_config: DocProcessorConfig,
     deps: PipelineDeps,
     attempt: int | None,
     max_attempts: int | None,
@@ -330,7 +333,7 @@ async def _extract_chunk_ingest_windowed(
     """Windowed path for PDFs / Office docs.
 
     Each window: VLM extract -> chunk -> embed+ingest, keeping memory and
-    indexer load bounded by ``settings.page_window`` pages at a time.
+    indexer load bounded by the project's page_window setting.
     Returns total chunks indexed.
     """
     total_chunks = 0
@@ -342,7 +345,8 @@ async def _extract_chunk_ingest_windowed(
             try:
                 chunks = create_chunks_from_texts(
                     db_id=dl.meta.extra.get("doc-id"), doc_id=doc_id,
-                    texts=texts, settings=deps.settings, meta=dl.meta,
+                    texts=texts, project_config=project_config,
+                    doc_attrs=dl.meta.doc,
                     page_offset=page_offset, start_chunk_idx=chunk_idx,
                     has_pages=True,
                 )
@@ -363,7 +367,7 @@ async def _extract_chunk_ingest_windowed(
                             qdrant=deps.qdrant, opensearch=deps.opensearch,
                             qdrant_collection=project_id, opensearch_index=project_id,
                             embed_batch_size=deps.embed_batch_size,
-                            model=dl.meta.project.get("embedding_model"),
+                            model=project_config.embedding_model,
                         )
             except Exception as e:
                 logged_stage = "index"
@@ -386,16 +390,36 @@ async def _extract_chunk_ingest_windowed(
     return total_chunks
 
 
+
+
 async def handle_object_created(
     *,
     info: S3EventInfo,
     s3_client,
     deps: PipelineDeps,
+    cfg,
     attempt: int | None = None,
     max_attempts: int | None = None,
 ) -> None:
 
     project_id, doc_id = _parse_filename(info.key)
+
+    # Fetch project config from gate CRUD
+    try:
+        project_raw = await fetch_project(
+            client=deps.http_client,
+            base_url=cfg.project_crud_url,
+            path_template=cfg.project_crud_path,
+            project_id=project_id,
+        )
+        project_config = extract_doc_processor_config(project_raw)
+    except Exception as e:
+        await _log_user_facing_error(
+            deps=deps, doc_id=doc_id, project_id=project_id,
+            stage="project_fetch", exc=e, attempt=attempt, max_attempts=max_attempts,
+        )
+        raise
+
     started_at = asyncio.get_running_loop().time()
     await deps.event_db_docs.log_ingested(
         doc_id=doc_id,
@@ -414,19 +438,30 @@ async def handle_object_created(
         )
         raise
 
+    settings = Settings(
+        vlm_model=project_config.vlm_model,
+        vlm_concurrency=project_config.vlm_concurrency,
+        page_window=project_config.page_window,
+        max_px=project_config.max_px,
+        chunk_size_chars=project_config.chunk_size,
+        chunk_overlap_chars=project_config.chunk_overlap,
+    )
+
     doc = document_from_bytes(
         dl.file_bytes, dl.content_type, dl.filename,
-        deps.vlm, deps.settings,
+        deps.vlm, settings,
     )
 
     if is_windowed(doc):
         total_chunks = await _extract_chunk_ingest_windowed(
             doc=doc, dl=dl, doc_id=doc_id, project_id=project_id,
+            project_config=project_config,
             deps=deps, attempt=attempt, max_attempts=max_attempts,
         )
     else:
         total_chunks = await _extract_chunk_ingest_simple(
             doc=doc, dl=dl, doc_id=doc_id, project_id=project_id,
+            project_config=project_config,
             deps=deps, attempt=attempt, max_attempts=max_attempts,
         )
 
@@ -487,6 +522,7 @@ async def handle_s3_event(
     info: S3EventInfo,
     s3_client,
     deps: PipelineDeps,
+    cfg,
     attempt: int | None = None,
     max_attempts: int | None = None,
 ) -> None:
@@ -499,6 +535,7 @@ async def handle_s3_event(
                 info=info,
                 s3_client=s3_client,
                 deps=deps,
+                cfg=cfg,
                 attempt=attempt,
                 max_attempts=max_attempts,
             )

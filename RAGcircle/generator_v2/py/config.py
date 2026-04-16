@@ -6,16 +6,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(frozen=True, extra="ignore")
 
+    # ── Gate (project CRUD) ──────────────────────────────────
+    gate_url: str = "http://localhost:8918"
+
     # ── Retrieval service ────────────────────────────────────
     retrieval_url: str = "http://localhost:8921"
 
-    # ── LLM (generation) ────────────────────────────────────
-    #llm_base_url: str = "https://llm.c.singularitynet.io/v1"
+    # ── LLM (infra only — model comes from project config) ──
     llm_base_url: str = "https://llm.k8s.naint.tech/v1"
-    # llm_model: str = "openai/gpt-oss-120b"
-    #llm_api_key: str = ""
     llm_api_key: str = ""
-    llm_model:str =  "qwen/qwen-coder-3b-instruct"
     llm_timeout: float = 60.0
 
     # ── Reflection (simple pipeline) ─────────────────────────
@@ -24,7 +23,6 @@ class Settings(BaseSettings):
     max_retries: int = 1
 
     # ── Agent pipeline ───────────────────────────────────────
-    agent_llm_model: str = ""
     agent_llm_timeout: float = 60.0
     agent_max_llm_calls: int = 12
     agent_max_fact_queries: int = 2

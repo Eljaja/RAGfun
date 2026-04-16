@@ -1,12 +1,14 @@
 # Profiles:
 #   infra     - Storage, messaging, search (rustfs, postgres, rabbitmq, qdrant, opensearch)
-#   inference - ML embedding model (infinity)
+#   inference - infinity embedder + reranker, vLLM VLM (see host ports in comment below)
 #   apps      - Applications (gate, doc-processor, retrieval, generator, nginx-gate)
 #
 # Examples:
 #   docker compose --profile infra up
 #   docker compose --profile infra --profile inference up
 #   docker compose --profile infra --profile inference --profile apps up  # full stack
+#
+# Inference host ports: embedder 11008, rerank 11009, VLM 11010 (OpenSearch → 11011)
 name: ragcircle-dev-11
 services:
 
@@ -96,7 +98,7 @@ services:
   opensearch:
     image: opensearchproject/opensearch:2
     ports:
-      - "127.0.0.1:11008:9200"
+      - "127.0.0.1:11011:9200"
     environment:
       - discovery.type=single-node
       - plugins.security.disabled=true
@@ -122,9 +124,7 @@ services:
       rustfs:
         condition: service_started
     restart: unless-stopped
-#
-#deploy:
-#  replicas: 3
+
   doc-processor:
     build:
       context: ./doc_processor_v2
@@ -148,18 +148,9 @@ services:
       context: .
       dockerfile: retrieval_v2/Dockerfile
     env_file:
-      - ./retrieval_v2/env.example
-    environment:
-      EMBEDDER_URL: "http://localhost:8902"
-      EMBEDDER_MODEL: "${EMBEDDING_MODEL:-BAAI/bge-m3}"
-      QDRANT_URL: "http://localhost:${RUGFUNSOTA_QDRANT_HTTP:-8903}"
-      OPENSEARCH_URL: "http://localhost:${RUGFUNSOTA_OS_PORT:-8905}"
-      PORT: "8920"
+      - ./retrieval_v2/.env
     network_mode: host
     profiles: [apps]
-    depends_on:
-      infinity:
-        condition: service_started
     restart: unless-stopped
 
   generator:
@@ -200,26 +191,90 @@ services:
   #       EOF
   #       nginx -g 'daemon off;'
 
-  # # ── ML ───────────────────────────────────────────────────
+  # ── ML / inference (GPUs: VLM → 0, embedder + rerank → 1) ──
 
-  # infinity:
-  #   image: michaelf34/infinity:latest
-  #   command: v2 --model-id ${EMBEDDING_MODEL:-intfloat/multilingual-e5-base}
-  #   ports:
-  #     - "127.0.0.1:8902:7997"
-  #   environment:
-  #     - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1}
-  #   deploy:
-  #     resources:
-  #       reservations:
-  #         devices:
-  #           - driver: nvidia
-  #             device_ids: ["${GPU_ID:-1}"]
-  #             capabilities: [gpu]
-  #   volumes:
-  #     - infinity-cache:/app/.cache
-  #   profiles: [inference]
-  #   restart: unless-stopped
+  infinity:
+    image: michaelf34/infinity:latest
+    command:
+      - v2
+      - --model-id
+      - ${EMBEDDER_MODEL:-BAAI/bge-m3}
+      - --port
+      - "7997"
+    environment:
+      EMBEDDER_MODEL: ${EMBEDDER_MODEL:-BAAI/bge-m3}
+    ports:
+      - "127.0.0.1:11008:7997"
+    volumes:
+      - infinity-cache:/app/.cache
+    networks:
+      - rag-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+    # Also `apps`: required so `doc-processor.depends_on` resolves when using --profile apps without listing inference only in the model graph.
+    profiles: [inference, apps]
+    restart: unless-stopped
+
+  infinity-rerank:
+    image: michaelf34/infinity:latest
+    command:
+      - v2
+      - --model-id
+      - ${RERANKER_MODEL:-BAAI/bge-reranker-v2-m3}
+      - --port
+      - "7998"
+    environment:
+      RERANKER_MODEL: ${RERANKER_MODEL:-BAAI/bge-reranker-v2-m3}
+    ports:
+      - "127.0.0.1:11009:7998"
+    volumes:
+      - infinity-cache:/app/.cache
+    networks:
+      - rag-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+    profiles: [inference]
+    restart: unless-stopped
+
+  vlm:
+    image: vllm/vllm-openai:latest
+    command:
+      - --model
+      - ${VLM_MODEL:-Qwen/Qwen3-VL-8B-Instruct}
+      - --port
+      - "8000"
+      - --gpu-memory-utilization
+      - ${VLM_GPU_MEMORY_UTIL:-0.82}
+      - --max-model-len
+      - ${VLM_MAX_MODEL_LEN:-4096}
+    environment:
+      VLM_MODEL: ${VLM_MODEL:-Qwen/Qwen3-VL-8B-Instruct}
+      HF_HOME: /root/.cache/huggingface
+    ports:
+      - "127.0.0.1:11010:8000"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    networks:
+      - rag-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    profiles: [inference]
+    restart: unless-stopped
 
 volumes:
   pgdata:
@@ -229,3 +284,4 @@ volumes:
 
 networks:
   rustfs-net:
+  rag-network:

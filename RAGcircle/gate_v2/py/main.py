@@ -132,7 +132,7 @@ def _effective_project_id(requested_project_id: str, settings: Settings) -> str:
         return settings.stub_project_id
     return requested_project_id
 
-
+# TODO ask the agent to remove the stub project code 
 async def _resolve_project(
     *,
     user: UserCreds,
@@ -242,35 +242,12 @@ async def health_check():
 # ----------------------------
 # Project Endpoints
 # ----------------------------
-"""
-## Bug: Project-level chunk_size never reaches doc_processor
-
-### Problem
-The `ProjectCreate` API accepts `chunk_size` and `chunk_overlap`, and they are stored in the DB.
-However, the `Project` dataclass in `gate_v2/py/database_ops.py` does not include these fields.
-`to_dict()` therefore never serializes them, so they are never written into S3 object metadata.
-
-In `doc_processor_v2/py/pipeline.py:38`:
-    chunk_size = int(project.get("chunk_size", settings.chunk_size_chars))
-
-`project.get("chunk_size")` is always None, so it always falls back to `settings.chunk_size_chars`,
-which comes from the .env `CHUNK_SIZE_CHARS` (currently 5000).
-
-### Fix
-1. Add chunk_size, chunk_overlap, embedding_model, language, llm_model to:
-   - Project dataclass fields (database_ops.py)
-   - Project.from_row()
-   - Project.to_dict()
-2. Set CHUNK_SIZE_CHARS in doc_processor .env to a sensible fallback (e.g. 1024 or 1500).
-
-### Impact
-All documents processed so far used chunk_size=5000 regardless of project settings.
-Re-indexing may be needed after the fix.
-"""
+# Project config is fetched by doc_processor directly from the gate CRUD endpoint;
+# only document-level attributes (title, tags, etc.) are stored in S3 metadata.
 
 @protected_router.post("/v1/projects")
 async def create_project(
-    payload: ProjectCreateTemp,
+    payload: ProjectCreate,
     user: UserCreds = Depends(authenticated),
     settings: Settings = Depends(get_settings),
     project_db: ProjectDB = Depends(get_project_db),
@@ -348,6 +325,18 @@ async def get_project(
         settings=settings,
         project_db=project_db,
     )
+    return {"project": project.to_dict()}
+
+
+
+@public_router.get("/v1/internal/projects/{project_id}")
+async def get_project(
+    project_id: str,
+    # settings: Settings = Depends(get_settings),
+    project_db: ProjectDB = Depends(get_project_db),
+):
+    """Get a single project (with ownership check)."""
+    project = await project_db.get(project_id)
     return {"project": project.to_dict()}
 
 
@@ -513,15 +502,14 @@ async def upload(
 
 
     all_attrs = {
-        **{f"doc__{k}": str(v) for k, v in attrs.model_dump().items() if v is not None},
-        **{f"project__{k}": str(v) for k, v in project.to_dict().items() if v is not None},
+        f"doc__{k}": str(v) for k, v in attrs.model_dump().items() if v is not None
     }
     upload_result = await upload_with_content_addressing(
         s3=s3_client,
         bucket=settings.bucket_name,
         request_stream=file_stream(),
         content_type=content_type,
-        max_bytes=20 * 1024 * 1024, # TODO add an .env var
+        max_bytes=settings.max_file_size_bytes, # TODO add an .env var
         storage_prefix=storage_prefix,
         doc_id=doc_id,
         # TODO: fix mixed up pydantic and dataclasses
@@ -875,4 +863,4 @@ app.include_router(public_router)
 app.include_router(protected_router)
 
 
-uvicorn.run(app=app, port=8917, host="localhost")
+uvicorn.run(app=app, port=8918, host="localhost")

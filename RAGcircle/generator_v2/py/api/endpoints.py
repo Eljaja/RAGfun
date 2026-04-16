@@ -16,7 +16,8 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 import tiktoken
 
@@ -33,6 +34,7 @@ from models import (
     ExecuteRequest,
     PipelineResult,
 )
+from project_deps import ProjectDeps, fetch_project_deps
 from models.events import DoneEvent, ErrorEvent, Event, InitEvent, TokenEvent, TraceEvent
 
 logger = logging.getLogger(__name__)
@@ -58,6 +60,10 @@ def _pipeline_kwargs(request: Request) -> dict[str, Any]:
         http_client=request.app.state.http_client,
         settings=request.app.state.settings,
     )
+
+
+def get_gate_client(request: Request) -> httpx.AsyncClient:
+    return request.app.state.gate_http
 
 
 def _done_event(result: PipelineResult, *, trace_id: str = "") -> DoneEvent:
@@ -121,6 +127,9 @@ def _stream_answer(
 @chat_router.post("/chat", response_model=ChatResponse)
 async def chat(body: ChatRequest, request: Request):
     settings: Settings = request.app.state.settings
+    gate_client = get_gate_client(request)
+    project_deps = await fetch_project_deps(gate_client, body.project_id)
+
     plan = simple(
         preset=body.preset,
         top_k=body.top_k,
@@ -128,6 +137,7 @@ async def chat(body: ChatRequest, request: Request):
         reflection_enabled=body.reflection_enabled and settings.reflection_enabled,
     )
     kwargs = _pipeline_kwargs(request)
+    kwargs["project_deps"] = project_deps
 
     result: PipelineResult | None = None
     retries_used = 0
@@ -163,6 +173,9 @@ async def chat(body: ChatRequest, request: Request):
 @chat_router.post("/chat/stream")
 async def chat_stream(body: ChatRequest, request: Request):
     settings: Settings = request.app.state.settings
+    gate_client = get_gate_client(request)
+    project_deps = await fetch_project_deps(gate_client, body.project_id)
+
     trace_id = uuid.uuid4().hex
     plan = simple(
         preset=body.preset,
@@ -171,6 +184,7 @@ async def chat_stream(body: ChatRequest, request: Request):
         reflection_enabled=body.reflection_enabled and settings.reflection_enabled,
     )
     kwargs = _pipeline_kwargs(request)
+    kwargs["project_deps"] = project_deps
 
     async def event_stream() -> AsyncIterator[str]:
         try:
@@ -243,9 +257,13 @@ def _build_agent_plan(body: AgentRequest, settings: Settings) -> BrainRound:
 @agent_router.post("/agent", response_model=AgentResponse)
 async def agent_non_streaming(body: AgentRequest, request: Request):
     settings: Settings = request.app.state.settings
+    gate_client = get_gate_client(request)
+    project_deps = await fetch_project_deps(gate_client, body.project_id)
+
     trace_id = uuid.uuid4().hex
     plan = _build_agent_plan(body, settings)
     kwargs = _pipeline_kwargs(request)
+    kwargs["project_deps"] = project_deps
 
     try:
         result = await asyncio.wait_for(
@@ -300,9 +318,13 @@ async def agent_non_streaming(body: AgentRequest, request: Request):
 @agent_router.post("/agent/stream")
 async def agent_stream(body: AgentRequest, request: Request):
     settings: Settings = request.app.state.settings
+    gate_client = get_gate_client(request)
+    project_deps = await fetch_project_deps(gate_client, body.project_id)
+
     trace_id = uuid.uuid4().hex
     plan = _build_agent_plan(body, settings)
     kwargs = _pipeline_kwargs(request)
+    kwargs["project_deps"] = project_deps
 
     async def event_stream() -> AsyncIterator[str]:
         try:
@@ -365,8 +387,12 @@ async def agent_stream(body: AgentRequest, request: Request):
 
 @execute_router.post("/execute")
 async def execute_plan(body: ExecuteRequest, request: Request):
+    gate_client = get_gate_client(request)
+    project_deps = await fetch_project_deps(gate_client, body.project_id)
+
     trace_id = uuid.uuid4().hex
     kwargs = _pipeline_kwargs(request)
+    kwargs["project_deps"] = project_deps
 
     async def event_stream() -> AsyncIterator[str]:
         try:

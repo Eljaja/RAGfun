@@ -72,7 +72,6 @@ class ConfigMeta:
     is_factoid: bool = False
     retrieval_plan: ExecutionPlan | None = None
     retrieval_mode: str = "hybrid"
-    traces: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -88,19 +87,20 @@ class RetrievalResult:
     """Output of the retrieval pipeline."""
 
     chunks: list[ChunkResult]
-    traces: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
 class Verdict:
     """Output of the evaluate phase."""
 
-    needs_retry: bool = False
     missing_terms: list[str] = field(default_factory=list)
     requery: str | None = None
     answer: str | None = None
     chunks: list[ChunkResult] | None = None
-    traces: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def needs_retry(self) -> bool:
+        return bool(self.missing_terms) or bool(self.requery)
 
 
 @dataclass

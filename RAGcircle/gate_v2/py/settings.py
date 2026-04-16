@@ -56,6 +56,12 @@ class Settings(BaseSettings):
     stub_project_chunk_overlap: int = 64
     stub_project_language: str = "ru"
     stub_project_llm_model: str = "openai/gpt-oss-120b"
+    stub_project_reranker_model: str = "BAAI/bge-reranker-v2-m3"
+    stub_project_vlm_model: str = "Qwen/Qwen3-VL-8B-Instruct"
+    stub_project_page_window: int = 50
+    stub_project_max_px: int = 2048
+    stub_project_vlm_concurrency: int = 4
+    stub_project_ocr_mode: str = "expensive"
 
     aws_region: str = "us-east-1"
     aws_access_key_id: str = "rustfs"
@@ -78,6 +84,9 @@ class Settings(BaseSettings):
     generator_url: str = "http://localhost:8930"
 
     max_file_size_bytes: int = 209_715_200 # 200mb
+
+    # HTTP bind (host-mode stack: must match doc_processor GATE_INTERNAL_BASE port)
+    gate_port: int = 8918
 
 
 # can we automate this?

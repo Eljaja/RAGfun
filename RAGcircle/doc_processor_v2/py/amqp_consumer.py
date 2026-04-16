@@ -182,6 +182,7 @@ async def handle_incoming_message(
             info=info,
             s3_client=s3_client,
             deps=deps,
+            cfg=cfg,
             attempt=retry_count,
             max_attempts=len(retry_levels),
         )

@@ -6,10 +6,17 @@ the step-registry dispatch in engine/registry.py.
 
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Any
 
 from pydantic import BaseModel, ConfigDict, Field
+# from pydantic.types import T
 
+
+
+
+class StepResult(BaseModel):
+    result: Any 
+    traces: list[dict[str, Any]] = []
 
 class PlanLLMStep(BaseModel):
     model_config = ConfigDict(extra="forbid")

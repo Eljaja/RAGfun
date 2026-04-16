@@ -30,12 +30,17 @@ XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 @dataclass
 class Settings:
-    """Processing settings for document conversion and chunking."""
-    page_window: int = 50
-    max_px: int = 2048
-    vlm_concurrency: int = 4
-    chunk_size_chars: int = 1500
-    chunk_overlap_chars: int = 200
+    """Processing settings for document conversion and chunking.
+
+    All fields are required — values must come from the project config
+    fetched from gate, never from hardcoded defaults.
+    """
+    vlm_model: str
+    vlm_concurrency: int
+    page_window: int
+    max_px: int
+    chunk_size_chars: int
+    chunk_overlap_chars: int
 
 
 # ─────────────────────────────────────────────────────────────
@@ -49,11 +54,11 @@ class VLMClient:
     OpenAI-compatible chat completions client for multimodal extraction in vLLM.
 
     Creates a persistent httpx.AsyncClient — call close() on shutdown.
+    The model is specified per-call from the project config.
     """
 
-    def __init__(self, *, base_url: str, api_key: str | None, model: str, timeout_s: float) -> None:
+    def __init__(self, *, base_url: str, api_key: str | None, timeout_s: float) -> None:
         self._base_url = base_url.rstrip("/")
-        self._model = model
         headers = {}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
@@ -63,12 +68,13 @@ class VLMClient:
             timeout=timeout_s,
         )
 
-    async def page_to_text(self, *, png_bytes: bytes) -> str:
+    async def page_to_text(self, *, png_bytes: bytes, model: str) -> str:
+        """Extract text from a page image using the project's VLM model."""
         data_url = "data:image/png;base64," + \
             base64.b64encode(png_bytes).decode("ascii")
 
         payload = {
-            "model": self._model,
+            "model": model,
             "temperature": 0.0,
             "messages": [
                 {
@@ -124,6 +130,7 @@ class PDFDocument:
         self.raw = raw
         self.vlm = vlm
         self.settings = settings
+        self._vlm_model = settings.vlm_model
 
     async def to_text_windowed(self) -> AsyncIterator[tuple[int, list[str]]]:
         """
@@ -169,7 +176,7 @@ class PDFDocument:
 
         async def extract_one(idx: int, png_bytes: bytes) -> tuple[int, str]:
             async with sem:
-                text = await self.vlm.page_to_text(png_bytes=png_bytes)
+                text = await self.vlm.page_to_text(png_bytes=png_bytes, model=self._vlm_model)
                 return (idx, text)
 
         # now this is a thing for guard or some other limiter for requests 
@@ -244,6 +251,7 @@ class PlainTextDocument:
 
 # TODO: Consider registry pattern instead of if/elif chain
 # TODO: Return Result[ToText, UnsupportedFormatError] for unknown types
+# TODO: lol you already have code to handle that in gate, so yeah move it here 
 def document_from_bytes(
     raw: bytes,
     content_type: str | None,
@@ -295,14 +303,11 @@ async def file_to_texts(
     content_type: str | None,
     filename: str | None,
     vlm: VLMClient,
-    settings: Settings | None = None,
+    settings: Settings,
 ) -> list[str]:
     """
     Simple entry point: convert file bytes to a flat list of text segments.
     For windowed pipeline use, call ``document_from_bytes`` + ``is_windowed`` instead.
     """
-    if settings is None:
-        settings = Settings()
-
     document = document_from_bytes(raw, content_type, filename, vlm, settings)
     return await document.to_text()

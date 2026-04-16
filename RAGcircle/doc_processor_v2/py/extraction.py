@@ -6,6 +6,7 @@ import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 
 import fitz
 from lxml import etree
@@ -390,6 +391,18 @@ def normalize_to_pdf(raw: bytes, content_type: str | None, filename: str | None)
     return (None, ct)
 
 
+def extract_pdf_with_kreuzberg(pdf_bytes: bytes) -> ExtractedDocument:
+    """Parse PDF bytes with Kreuzberg; returns one consolidated text segment per document."""
+    try:
+        from kreuzberg import extract_file_sync
+    except Exception as e:  # pragma: no cover - optional dependency
+        raise RuntimeError("kreuzberg_not_installed") from e
 
+    with tempfile.TemporaryDirectory(prefix="docproc_kreuzberg_") as td:
+        pdf_path = Path(td) / "input.pdf"
+        pdf_path.write_bytes(pdf_bytes)
+        result = extract_file_sync(pdf_path)
+        text = str(getattr(result, "content", "") or "").strip()
+        return ExtractedDocument(content_type="application/pdf", pages_text=[text])
 
 

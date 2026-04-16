@@ -39,19 +39,24 @@ async def lifespan(app: FastAPI):
             limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
             http2=True,
         )
+        gate_http = httpx.AsyncClient(
+            base_url=settings.gate_url.rstrip("/"),
+            timeout=httpx.Timeout(10.0, connect=5.0),
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=10),
+        )
 
         stack.push_async_callback(qdrant.close)
         stack.push_async_callback(opensearch.close)
         stack.push_async_callback(embed_http.aclose)
         stack.push_async_callback(rerank_http.aclose)
+        stack.push_async_callback(gate_http.aclose)
 
+        app.state.gate_http = gate_http
         app.state.retriever = HybridRetriever(
             qdrant=qdrant,
             opensearch=opensearch,
             embed_http=embed_http,
-            embed_model=settings.embedder_model,
             rerank_http=rerank_http,
-            rerank_model=settings.reranker_model,
         )
         app.state.settings = settings
 
