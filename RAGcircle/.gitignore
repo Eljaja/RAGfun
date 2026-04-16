@@ -2,3 +2,5 @@
 *dump*
 _TODO.md
 test_data/
+docker-compose.kreuzberg-override.yaml
+docker-compose.ragcircle-*.yaml

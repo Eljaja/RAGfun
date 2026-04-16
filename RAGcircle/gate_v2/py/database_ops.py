@@ -43,6 +43,7 @@ class Project:
     page_window: int = 50
     max_px: int = 2048
     vlm_concurrency: int = 4
+    ocr_mode: str = "expensive"
 
     @classmethod
     # TODO
@@ -67,6 +68,7 @@ class Project:
             page_window=row.get("page_window", 50),
             max_px=row.get("max_px", 2048),
             vlm_concurrency=row.get("vlm_concurrency", 4),
+            ocr_mode=row.get("ocr_mode", "expensive"),
         )
 
     def to_dict(self) -> dict:
@@ -88,6 +90,7 @@ class Project:
             "page_window": self.page_window,
             "max_px": self.max_px,
             "vlm_concurrency": self.vlm_concurrency,
+            "ocr_mode": self.ocr_mode,
         }
 
 
@@ -117,6 +120,24 @@ class ProjectDB:
                 )
             """)
             await conn.execute("""
+                ALTER TABLE projects ADD COLUMN IF NOT EXISTS reranker_model TEXT NOT NULL DEFAULT 'BAAI/bge-reranker-v2-m3'
+            """)
+            await conn.execute("""
+                ALTER TABLE projects ADD COLUMN IF NOT EXISTS vlm_model TEXT NOT NULL DEFAULT 'Qwen/Qwen3-VL-8B-Instruct'
+            """)
+            await conn.execute("""
+                ALTER TABLE projects ADD COLUMN IF NOT EXISTS page_window INT NOT NULL DEFAULT 50
+            """)
+            await conn.execute("""
+                ALTER TABLE projects ADD COLUMN IF NOT EXISTS max_px INT NOT NULL DEFAULT 2048
+            """)
+            await conn.execute("""
+                ALTER TABLE projects ADD COLUMN IF NOT EXISTS vlm_concurrency INT NOT NULL DEFAULT 4
+            """)
+            await conn.execute("""
+                ALTER TABLE projects ADD COLUMN IF NOT EXISTS ocr_mode TEXT NOT NULL DEFAULT 'expensive'
+            """)
+            await conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_projects_user_id 
                 ON projects(user_id) WHERE status = 'active'
             """)
@@ -131,6 +152,12 @@ class ProjectDB:
         chunk_overlap: int = 64,
         language: str = "ru",
         llm_model: str = "gemma-3-12b",
+        reranker_model: str = "BAAI/bge-reranker-v2-m3",
+        vlm_model: str = "Qwen/Qwen3-VL-8B-Instruct",
+        page_window: int = 50,
+        max_px: int = 2048,
+        vlm_concurrency: int = 4,
+        ocr_mode: str = "expensive",
     ) -> Project:
         """Create a new project. Raises 400 if limit reached."""
         async with self.pool.acquire() as conn:
@@ -150,12 +177,14 @@ class ProjectDB:
                 INSERT INTO projects (
                     project_id, user_id, name, description,
                     embedding_model, chunk_size, chunk_overlap, language, llm_model,
+                    reranker_model, vlm_model, page_window, max_px, vlm_concurrency, ocr_mode,
                     status
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'active')
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'active')
                 RETURNING *
             """, project_id, user_id, name, description,
-                embedding_model, chunk_size, chunk_overlap, language, llm_model)
+                embedding_model, chunk_size, chunk_overlap, language, llm_model,
+                reranker_model, vlm_model, page_window, max_px, vlm_concurrency, ocr_mode)
 
             return Project.from_row(row)
 
@@ -171,6 +200,12 @@ class ProjectDB:
         chunk_overlap: int = 64,
         language: str = "ru",
         llm_model: str = "gemma-3-12b",
+        reranker_model: str = "BAAI/bge-reranker-v2-m3",
+        vlm_model: str = "Qwen/Qwen3-VL-8B-Instruct",
+        page_window: int = 50,
+        max_px: int = 2048,
+        vlm_concurrency: int = 4,
+        ocr_mode: str = "expensive",
     ) -> Project:
         """Ensure a project with an explicit ID exists and is active."""
         async with self.pool.acquire() as conn:
@@ -178,9 +213,11 @@ class ProjectDB:
                 """
                 INSERT INTO projects (
                     project_id, user_id, name, description,
-                    embedding_model, chunk_size, chunk_overlap, language, llm_model, status
+                    embedding_model, chunk_size, chunk_overlap, language, llm_model,
+                    reranker_model, vlm_model, page_window, max_px, vlm_concurrency, ocr_mode,
+                    status
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'active')
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'active')
                 ON CONFLICT (project_id) DO UPDATE SET
                     user_id = EXCLUDED.user_id,
                     name = EXCLUDED.name,
@@ -190,6 +227,12 @@ class ProjectDB:
                     chunk_overlap = EXCLUDED.chunk_overlap,
                     language = EXCLUDED.language,
                     llm_model = EXCLUDED.llm_model,
+                    reranker_model = EXCLUDED.reranker_model,
+                    vlm_model = EXCLUDED.vlm_model,
+                    page_window = EXCLUDED.page_window,
+                    max_px = EXCLUDED.max_px,
+                    vlm_concurrency = EXCLUDED.vlm_concurrency,
+                    ocr_mode = EXCLUDED.ocr_mode,
                     status = 'active',
                     updated_at = NOW()
                 RETURNING *
@@ -203,6 +246,12 @@ class ProjectDB:
                 chunk_overlap,
                 language,
                 llm_model,
+                reranker_model,
+                vlm_model,
+                page_window,
+                max_px,
+                vlm_concurrency,
+                ocr_mode,
             )
             return Project.from_row(row)
 
@@ -230,7 +279,9 @@ class ProjectDB:
         self,
         project_id: str,
         name: Optional[str] = None,
-        description: Optional[str] = None
+        description: Optional[str] = None,
+        llm_model: Optional[str] = None,
+        ocr_mode: Optional[str] = None,
     ) -> Optional[Project]:
         """Update project fields. Returns None if not found."""
         async with self.pool.acquire() as conn:
@@ -238,10 +289,12 @@ class ProjectDB:
                 UPDATE projects SET
                     name = COALESCE($2, name),
                     description = COALESCE($3, description),
+                    llm_model = COALESCE($4, llm_model),
+                    ocr_mode = COALESCE($5, ocr_mode),
                     updated_at = NOW()
                 WHERE project_id = $1 AND status = 'active'
                 RETURNING *
-            """, project_id, name, description)
+            """, project_id, name, description, llm_model, ocr_mode)
             if not row:
                 return None
             return Project.from_row(row)

@@ -40,6 +40,20 @@ class AppConfig(BaseSettings):
     vlm_base_url: str
     vlm_api_key: str | None = None
     vlm_timeout: float = 120.0
+    proc_vlm_model: str = Field(
+        default="Qwen/Qwen3-VL-8B-Instruct",
+        validation_alias=AliasChoices("proc_vlm_model", "vlm_model"),
+    )
+    proc_page_window: int = Field(
+        default=50,
+        validation_alias=AliasChoices("proc_page_window", "proc_max_pages"),
+    )
+    proc_max_px: int = 2048
+    proc_vlm_concurrency: int = 4
+    proc_ocr_mode: str = Field(
+        default="expensive",
+        validation_alias=AliasChoices("proc_ocr_mode", "proc_parser_backend"),
+    )
 
     # ── Embedding ────────────────────────────────────────────────────────
     embedder_url: str 

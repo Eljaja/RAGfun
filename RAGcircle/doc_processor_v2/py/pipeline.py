@@ -34,6 +34,18 @@ _INGEST_RETRY = dict(
 )
 
 
+def resolve_effective_ocr_mode(
+    *,
+    doc_ocr_mode: str | None,
+    project_ocr_mode: str | None,
+    default_ocr_mode: str,
+) -> str:
+    for candidate in (doc_ocr_mode, project_ocr_mode, default_ocr_mode):
+        if candidate and str(candidate).strip():
+            return str(candidate).strip().lower()
+    return "expensive"
+
+
 def generate_doc_id(bucket: str, key: str) -> str:
     """Generate a stable document ID from bucket and key."""
     import hashlib
@@ -412,7 +424,14 @@ async def handle_object_created(
             path_template=cfg.project_crud_path,
             project_id=project_id,
         )
-        project_config = extract_doc_processor_config(project_raw)
+        project_config = extract_doc_processor_config(
+            project_raw,
+            default_vlm_model=cfg.proc_vlm_model,
+            default_vlm_concurrency=cfg.proc_vlm_concurrency,
+            default_page_window=cfg.proc_page_window,
+            default_max_px=cfg.proc_max_px,
+            default_ocr_mode=cfg.proc_ocr_mode,
+        )
     except Exception as e:
         await _log_user_facing_error(
             deps=deps, doc_id=doc_id, project_id=project_id,
@@ -445,6 +464,17 @@ async def handle_object_created(
         max_px=project_config.max_px,
         chunk_size_chars=project_config.chunk_size,
         chunk_overlap_chars=project_config.chunk_overlap,
+        ocr_mode=resolve_effective_ocr_mode(
+            doc_ocr_mode=dl.meta.doc.get("ocr_mode"),
+            project_ocr_mode=project_config.ocr_mode,
+            default_ocr_mode=cfg.proc_ocr_mode,
+        ),
+    )
+    logger.info(
+        "ocr_mode_selected mode=%s doc_override=%s project_default=%s",
+        settings.ocr_mode,
+        dl.meta.doc.get("ocr_mode"),
+        project_config.ocr_mode,
     )
 
     doc = document_from_bytes(

@@ -15,6 +15,7 @@ from PIL import Image
 from lxml import html as lxml_html
 
 logger = logging.getLogger("processor.extraction")
+_KREUZBERG_AVAILABLE = False
 
 
 @dataclass(frozen=True)
@@ -393,10 +394,28 @@ def normalize_to_pdf(raw: bytes, content_type: str | None, filename: str | None)
 
 def extract_pdf_with_kreuzberg(pdf_bytes: bytes) -> ExtractedDocument:
     """Parse PDF bytes with Kreuzberg; returns one consolidated text segment per document."""
+    global _KREUZBERG_AVAILABLE
     try:
         from kreuzberg import extract_file_sync
-    except Exception as e:  # pragma: no cover - optional dependency
-        raise RuntimeError("kreuzberg_not_installed") from e
+        _KREUZBERG_AVAILABLE = True
+    except Exception as first_error:  # pragma: no cover - optional dependency
+        # In some runtime setups `uv run` recreates `.venv` and drops manual pip additions.
+        # Retry once by installing Kreuzberg into the active project venv.
+        if not _KREUZBERG_AVAILABLE:
+            try:
+                subprocess.run(
+                    ["uv", "pip", "install", "--python", ".venv/bin/python", "kreuzberg>=4.2.0"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                from kreuzberg import extract_file_sync
+                _KREUZBERG_AVAILABLE = True
+            except Exception as install_error:
+                logger.error("kreuzberg_install_failed", extra={"error": str(install_error)})
+                raise RuntimeError("kreuzberg_not_installed") from install_error
+        else:
+            raise RuntimeError("kreuzberg_not_installed") from first_error
 
     with tempfile.TemporaryDirectory(prefix="docproc_kreuzberg_") as td:
         pdf_path = Path(td) / "input.pdf"

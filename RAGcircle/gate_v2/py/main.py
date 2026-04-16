@@ -63,6 +63,12 @@ class ProjectCreate(BaseModel):
     language: str = "ru"
     # Mutable — can be changed freely
     llm_model: str = "openai/gpt-oss-120b"
+    reranker_model: str = "BAAI/bge-reranker-v2-m3"
+    vlm_model: str = "Qwen/Qwen3-VL-8B-Instruct"
+    page_window: int = 50
+    max_px: int = 2048
+    vlm_concurrency: int = 4
+    ocr_mode: str = "expensive"
 
 class ProjectCreateTemp(BaseModel):
     name: str
@@ -73,6 +79,7 @@ class ProjectUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
     llm_model: str | None = None
+    ocr_mode: str | None = None
 
 
 EMBEDDING_DIMENSIONS: dict[str, int] = {
@@ -132,6 +139,19 @@ def _effective_project_id(requested_project_id: str, settings: Settings) -> str:
         return settings.stub_project_id
     return requested_project_id
 
+
+def _normalize_ocr_mode(value: str | None) -> str | None:
+    if value is None:
+        return None
+    mode = value.strip().lower()
+    if mode in {"vlm", "expensive"}:
+        return "expensive"
+    if mode in {"kreuzberg", "cheap"}:
+        return "cheap"
+    if mode == "auto":
+        return "auto"
+    raise HTTPException(status_code=400, detail=f"invalid_ocr_mode:{value}")
+
 # TODO ask the agent to remove the stub project code 
 async def _resolve_project(
     *,
@@ -143,6 +163,9 @@ async def _resolve_project(
     """Return the effective project object, enforcing stub mode when enabled."""
     effective_project_id = _effective_project_id(requested_project_id, settings)
     if settings.stub_auth_enabled:
+        existing = await project_db.get(effective_project_id)
+        if existing:
+            return existing
         return await project_db.ensure_project(
             project_id=effective_project_id,
             user_id=settings.stub_user_id,
@@ -152,6 +175,12 @@ async def _resolve_project(
             chunk_overlap=settings.stub_project_chunk_overlap,
             language=settings.stub_project_language,
             llm_model=settings.stub_project_llm_model,
+            reranker_model=settings.stub_project_reranker_model,
+            vlm_model=settings.stub_project_vlm_model,
+            page_window=settings.stub_project_page_window,
+            max_px=settings.stub_project_max_px,
+            vlm_concurrency=settings.stub_project_vlm_concurrency,
+            ocr_mode=settings.stub_project_ocr_mode,
         )
     return await authorize_project(user, effective_project_id, project_db)
 
@@ -201,6 +230,12 @@ async def lifecycle(app: FastAPI):
                 chunk_overlap=settings.stub_project_chunk_overlap,
                 language=settings.stub_project_language,
                 llm_model=settings.stub_project_llm_model,
+                reranker_model=settings.stub_project_reranker_model,
+                vlm_model=settings.stub_project_vlm_model,
+                page_window=settings.stub_project_page_window,
+                max_px=settings.stub_project_max_px,
+                vlm_concurrency=settings.stub_project_vlm_concurrency,
+                ocr_mode=settings.stub_project_ocr_mode,
             )
             await qdrant.ensure_collection(settings.stub_project_id, dimension=stub_dim)
             await opensearch.ensure_index(settings.stub_project_id)
@@ -258,15 +293,11 @@ async def create_project(
     payload = ProjectCreate(**payload.model_dump())
     """Create a new project (enforces max limit per user)."""
     if settings.stub_auth_enabled:
-        project = await project_db.ensure_project(
-            project_id=settings.stub_project_id,
-            user_id=settings.stub_user_id,
-            name=settings.stub_project_name,
-            embedding_model=settings.stub_project_embedding_model,
-            chunk_size=settings.stub_project_chunk_size,
-            chunk_overlap=settings.stub_project_chunk_overlap,
-            language=settings.stub_project_language,
-            llm_model=settings.stub_project_llm_model,
+        project = await _resolve_project(
+            user=user,
+            requested_project_id=settings.stub_project_id,
+            settings=settings,
+            project_db=project_db,
         )
         return {"project": project.to_dict()}
 
@@ -279,6 +310,12 @@ async def create_project(
         chunk_overlap=payload.chunk_overlap,
         language=payload.language,
         llm_model=payload.llm_model,
+        reranker_model=payload.reranker_model,
+        vlm_model=payload.vlm_model,
+        page_window=payload.page_window,
+        max_px=payload.max_px,
+        vlm_concurrency=payload.vlm_concurrency,
+        ocr_mode=_normalize_ocr_mode(payload.ocr_mode) or "expensive",
     )
 
     dimension = EMBEDDING_DIMENSIONS.get(payload.embedding_model, 768)
@@ -295,15 +332,11 @@ async def list_projects(
 ):
     """List all projects owned by the authenticated user."""
     if settings.stub_auth_enabled:
-        project = await project_db.ensure_project(
-            project_id=settings.stub_project_id,
-            user_id=settings.stub_user_id,
-            name=settings.stub_project_name,
-            embedding_model=settings.stub_project_embedding_model,
-            chunk_size=settings.stub_project_chunk_size,
-            chunk_overlap=settings.stub_project_chunk_overlap,
-            language=settings.stub_project_language,
-            llm_model=settings.stub_project_llm_model,
+        project = await _resolve_project(
+            user=user,
+            requested_project_id=settings.stub_project_id,
+            settings=settings,
+            project_db=project_db,
         )
         return {"projects": [project.to_dict()]}
 
@@ -337,7 +370,36 @@ async def get_project(
 ):
     """Get a single project (with ownership check)."""
     project = await project_db.get(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="project_not_found")
     return {"project": project.to_dict()}
+
+
+@protected_router.patch("/v1/projects/{project_id}")
+async def update_project(
+    project_id: str,
+    payload: ProjectUpdate,
+    user: UserCreds = Depends(authenticated),
+    settings: Settings = Depends(get_settings),
+    project_db: ProjectDB = Depends(get_project_db),
+):
+    effective_project_id = _effective_project_id(project_id, settings)
+    await _resolve_project(
+        user=user,
+        requested_project_id=effective_project_id,
+        settings=settings,
+        project_db=project_db,
+    )
+    updated = await project_db.update(
+        effective_project_id,
+        name=payload.name,
+        description=payload.description,
+        llm_model=payload.llm_model,
+        ocr_mode=_normalize_ocr_mode(payload.ocr_mode),
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="project_not_found")
+    return {"project": updated.to_dict()}
 
 
 @protected_router.delete("/v1/projects/{project_id}")
@@ -428,6 +490,7 @@ class DocAttributes(BaseModel):
     lang: str | None = None
     tags: str | None = None  # comma-separated
     acl: str | None = None  # comma-separated
+    ocr_mode: str | None = None
     refresh: bool = False
 
     @classmethod
@@ -501,9 +564,10 @@ async def upload(
     storage_prefix = f"{effective_project_id}_"
 
 
-    all_attrs = {
-        f"doc__{k}": str(v) for k, v in attrs.model_dump().items() if v is not None
-    }
+    ocr_mode = _normalize_ocr_mode(attrs.ocr_mode)
+    all_attrs = {f"doc__{k}": str(v) for k, v in attrs.model_dump().items() if v is not None and k != "ocr_mode"}
+    if ocr_mode:
+        all_attrs["doc__ocr_mode"] = ocr_mode
     upload_result = await upload_with_content_addressing(
         s3=s3_client,
         bucket=settings.bucket_name,
@@ -528,10 +592,10 @@ async def upload(
     # shi x3
     # whatever, we do not handle millions of docs, maybe we will scale later
     
-    await document_db.persist_document(doc_id, project_id, upload_result, meta)
+    await document_db.persist_document(doc_id, effective_project_id, upload_result, meta)
     await event_db.log_event(
         doc_id=upload_result.storage_id,
-        project_id=project_id,
+        project_id=effective_project_id,
         event_type=DocumentEventType.UPLOADED,
         service_name="gateway",
         metadata={"external_doc_id": doc_id},
@@ -863,4 +927,5 @@ app.include_router(public_router)
 app.include_router(protected_router)
 
 
-uvicorn.run(app=app, port=8918, host="localhost")
+if __name__ == "__main__":
+    uvicorn.run(app=app, host="localhost", port=Settings().gate_port)

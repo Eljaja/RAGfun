@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Protocol
@@ -11,6 +12,7 @@ import httpx
 from extraction import (
     get_pdf_page_count,
     pdf_to_page_pngs,
+    extract_pdf_with_kreuzberg,
     _convert_office_to_pdf,
     _html_to_text,
     _xml_to_text,
@@ -22,6 +24,7 @@ from extraction import (
 # ─────────────────────────────────────────────────────────────
 
 XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+logger = logging.getLogger("data.processing.ocr")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -41,6 +44,7 @@ class Settings:
     max_px: int
     chunk_size_chars: int
     chunk_overlap_chars: int
+    ocr_mode: str = "expensive"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -195,6 +199,63 @@ class PDFDocument:
         return pages_text
 
 
+class KreuzbergPDFDocument:
+    """Cheap PDF extraction path using Kreuzberg."""
+
+    def __init__(self, raw: bytes):
+        self.raw = raw
+
+    async def to_text(self) -> list[str]:
+        extracted = extract_pdf_with_kreuzberg(self.raw)
+        return extracted.pages_text
+
+
+def normalize_ocr_mode(value: str | None) -> str:
+    mode = (value or "").strip().lower()
+    if mode in {"cheap", "kreuzberg"}:
+        return "cheap"
+    if mode in {"auto"}:
+        return "auto"
+    return "expensive"
+
+
+def _is_weak_pdf_extraction(texts: list[str], *, page_count: int) -> bool:
+    if not texts:
+        return True
+    merged = "\n".join(t for t in texts if t).strip()
+    if not merged:
+        return True
+
+    char_count = len(merged)
+    min_chars = max(800, page_count * 120)
+    if char_count < min_chars:
+        return True
+
+    alpha_count = sum(1 for ch in merged if ch.isalpha())
+    density = alpha_count / max(char_count, 1)
+    if density < 0.2:
+        return True
+    return False
+
+
+class AutoPDFDocument:
+    """Try cheap OCR first and fallback to VLM when quality is weak."""
+
+    def __init__(self, raw: bytes, vlm: VLMClient, settings: Settings):
+        self.raw = raw
+        self.vlm = vlm
+        self.settings = settings
+
+    async def to_text(self) -> list[str]:
+        cheap = await KreuzbergPDFDocument(self.raw).to_text()
+        page_count = max(get_pdf_page_count(self.raw), 1)
+        if _is_weak_pdf_extraction(cheap, page_count=page_count):
+            logger.info("auto_ocr_fallback_to_expensive page_count=%d", page_count)
+            return await PDFDocument(self.raw, self.vlm, self.settings).to_text()
+        logger.info("auto_ocr_kept_cheap page_count=%d", page_count)
+        return cheap
+
+
 class OfficeDocument:
     """Office docs are converted to PDF first, then processed identically."""
 
@@ -266,6 +327,11 @@ def document_from_bytes(
 
     # PDF
     if ct == "application/pdf" or name.endswith(".pdf"):
+        mode = normalize_ocr_mode(settings.ocr_mode)
+        if mode == "cheap":
+            return KreuzbergPDFDocument(raw)
+        if mode == "auto":
+            return AutoPDFDocument(raw, vlm, settings)
         return PDFDocument(raw, vlm, settings)
 
     # Office

@@ -217,4 +217,6 @@ pipeline-tests/
 results/
 scripts/
 tmp_upload/
+tmp_mode_docs/
+openapi_gate_runtime.json
 
